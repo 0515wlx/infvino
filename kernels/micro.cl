@@ -191,6 +191,52 @@ __kernel void scan_rep(__global const uint *restrict in, __global uint *sink,
 }
 
 // ---------------------------------------------------------------------------
+// H. Work-group barrier cost (Round 12). Each iteration does a real SLM store
+//    + barrier + SLM load (the same shape as the GEMM k-loop's synchronisation),
+//    so this measures the barrier+SLM-round-trip latency per iteration.
+//    WG size is set with -DBWG.
+// ---------------------------------------------------------------------------
+#ifndef BWG
+#define BWG 256
+#endif
+// BMODE 0: SLM store + barrier(LOCAL_FENCE) + SLM load  (GEMM-like)
+// BMODE 1: SLM store + SLM load, NO barrier            (SLM round-trip only)
+// BMODE 2: dependent ALU + barrier(LOCAL_FENCE)        (barrier only)
+// BMODE 3: SLM store + barrier(0) + SLM load           (sync-only, no mem fence)
+// BMODE 4: dependent ALU + barrier(0)
+#ifndef BMODE
+#define BMODE 0
+#endif
+__attribute__((reqd_work_group_size(BWG, 1, 1)))
+__kernel void barrier_cost(__global uint *out, const uint iters) {
+  __local uint lbuf[BWG];
+  const int tid = get_local_id(0);
+  uint acc = get_global_id(0) + 1u;
+#if BMODE == 0
+  for (uint i = 0; i < iters; ++i) {
+    lbuf[tid] = acc; barrier(CLK_LOCAL_MEM_FENCE); acc += lbuf[(tid + 1) & (BWG - 1)];
+  }
+#elif BMODE == 1
+  for (uint i = 0; i < iters; ++i) {
+    lbuf[tid] = acc; acc += lbuf[(tid + 1) & (BWG - 1)];
+  }
+#elif BMODE == 2
+  for (uint i = 0; i < iters; ++i) {
+    acc = acc * 1664525u + 1013904223u; barrier(CLK_LOCAL_MEM_FENCE);
+  }
+#elif BMODE == 3
+  for (uint i = 0; i < iters; ++i) {
+    lbuf[tid] = acc; barrier(0); acc += lbuf[(tid + 1) & (BWG - 1)];
+  }
+#else
+  for (uint i = 0; i < iters; ++i) {
+    acc = acc * 1664525u + 1013904223u; barrier(0);
+  }
+#endif
+  if (acc == 0xdeadbeefu) out[0] = acc;
+}
+
+// ---------------------------------------------------------------------------
 // G. SLM read bandwidth: replay a co-resident __local buffer (the on-die L1
 //    scratchpad) to get its aggregate bandwidth. SLM_KB controls the buffer.
 // ---------------------------------------------------------------------------

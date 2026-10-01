@@ -15,9 +15,9 @@ namespace gk
 struct Tiles
 {
   // Round 8/9 defaults: BM=128,BN=64,TM=8,TN=4,VEC=4 with the double-buffered
-  // pipeline (DBUF=1) at BK=16. Double-buffering needs 2x SLM per workgroup, so
-  // BK had to drop 32->16 to stay inside the ~16 KB SLM/WG budget; that trade is
-  // a net win (~11.8 vs ~6.7 ops/EU/cyc @ 4096x512x512, see docs/kernel.md R9).
+  // pipeline (DBUF=1) at BK=16. Round 12 added SG=16 (force SIMD16) which lifts
+  // this default to ~13.2 ops/EU/cyc @4096x512x512; PlanModel switches to the
+  // BK=32 single-buffer variant (~13.7) for large grids.
   int BM = 128, BN = 64, BK = 16, TM = 8, TN = 4, VEC2 = 0, PAD = 0, DBUF = 1;
   // Round 8: staging vector width (halfs) and async staging toggle.
   int VEC = 4, ASYNC = 0;
@@ -26,6 +26,20 @@ struct Tiles
   // Round 11: store the A tile transposed so a thread's TM values are contiguous
   // and load as half8 (fewer SLM transactions). 0 = row-major A.
   int AT = 0;
+  // Round 12: single-SLM-buffer software pipeline that prefetches the next tile
+  // into registers (lets BK double within the same SLM budget). 1 = on.
+  int PF = 0;
+  // Round 12: no-SLM probe — read A/B straight from global memory (L1/L2),
+  // zero __local and zero barriers. Diagnostic only.
+  int GN = 0;
+  // Round 12: drop the per-k-tile barrier (diagnostic only; wrong results, used
+  // with SKIP_STAGE to isolate the barrier's true cost).
+  int SB = 0;
+  // Round 12: force intel_reqd_sub_group_size(SG). SG is the requested SIMD
+  // width (0 = let IGC decide; 8/16/32 are the useful values). Without it IGC
+  // silently drops the *full* kernel to SIMD8 under staging register pressure.
+  // 16 is the measured sweet spot on Xe-LP (32 spills, 8 starves the FPU).
+  int SG = 16;
 
   std::string options() const
   {
@@ -35,7 +49,8 @@ struct Tiles
       << " -DVEC2=" << VEC2 << " -DPAD=" << PAD << " -DDBUF=" << DBUF
       << " -DVEC=" << VEC << " -DASYNC=" << ASYNC
       << " -DSKIP_STAGE=" << SKIP_STAGE << " -DSKIP_COMPUTE=" << SKIP_COMPUTE
-      << " -DAT=" << AT
+      << " -DAT=" << AT << " -DPF=" << PF << " -DGN=" << GN
+      << " -DSKIP_BARRIER=" << SB << " -DSG=" << SG
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -47,7 +62,7 @@ struct Tiles
       << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF
       << " vec=" << VEC << " async=" << ASYNC
       << (SKIP_STAGE ? " skipstage" : "") << (SKIP_COMPUTE ? " skipcompute" : "")
-      << " at=" << AT;
+      << " at=" << AT << " pf=" << PF << (GN ? " gn" : "") << (SB ? " skipbar" : "");
     return o.str();
   }
 
@@ -76,6 +91,10 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 10) t.SKIP_STAGE = v[10];
   if (v.size() > 11) t.SKIP_COMPUTE = v[11];
   if (v.size() > 12) t.AT = v[12];
+  if (v.size() > 13) t.PF = v[13];
+  if (v.size() > 14) t.GN = v[14];
+  if (v.size() > 15) t.SB = v[15];
+  if (v.size() > 16) t.SG = v[16];
   return t;
 }
 

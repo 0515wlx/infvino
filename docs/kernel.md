@@ -684,6 +684,132 @@ R10.3 假设「inner loop 被 SLM 喂给卡住」——**本轮证伪**：加宽
 > 这两条都指向「**减少 work-group 级同步 + 把复用在寄存器/sub-group 内做**」，而不是继续折腾 SLM 布局。
 > 下一步优先验证 **sub-group tiling**。
 
+## Round 12 —— 突破：IGC 的 SIMD8 悬崖（11.9 → 13.7 ops/EU/cyc，+15%）
+
+本轮本来是冲着「主动突破 SLM 容量↔带宽↔并发耦合」去的：试了寄存器预取（`PF`）和彻底无
+SLM（`GN`）。两者都失败，但在排查 `PF` 为什么失败时**挖出了真正的瓶颈**——不是 SLM，也不
+是 barrier，而是 **IGC 在 staging 的寄存器压力下偷偷把计算降到 SIMD8**。把这个悬崖堵上后，
+整核从 **11.89 抬到 13.70 ops/EU/cyc（+15%）**，且达到该内循环的 compute-only 上限。
+新增开关：`PF` / `GN` / `SKIP_BARRIER`（SB，诊断）/ `SG`（强制子组宽度）。
+
+### 12.1 先量化 barrier，再发现「barrier 成本」其实是 SIMD 假象
+
+用 `DBUF=0` 单缓冲路径分解（`SKIP_STAGE` 只在该路径生效），@4096×512×512：
+
+| 配置 | 时间 | ops/EU/cyc |
+|---|---|---|
+| BK16 DBUF0 full（SG=0）| 3.371 ms | 6.13 |
+| BK16 DBUF0 **skipstage**（SG=0）| 2.327 ms | 8.87 |
+| BK32 DBUF0 full（SG=0）| 1.746 ms | 11.83 |
+| BK32 DBUF0 skipstage（SG=0）| 1.514 ms | 13.64 |
+
+一度以为「BK16 compute-only 只有 8.87」是 barrier 太贵。**反汇编证伪**：BK16 skipstage 在
+有 barrier 时被编译成 **SIMD8**，去掉 barrier 后变回 SIMD16——8.87 是 SIMD8 的产物，不是
+barrier 的代价。用 `SKIP_BARRIER`（SB）直接对照：BK32 skipstage barrier ON=13.66、OFF=13.36，
+**barrier 在 BK32 只占 ~2%**。
+
+`--op barrier` 微基准（依赖链延迟，含 ~20 cyc 循环开销）：
+
+| mode | 内容 | cyc/iter | 推论 |
+|---|---|---|---|
+| 4 | ALU + `barrier(0)` | 179.8 | 纯同步 barrier ≈ 160 |
+| 2 | ALU + `barrier(LOCAL_FENCE)` | 206.5 | 内存 fence +27 |
+| 1 | SLM 存+读，无 barrier | 330.4 | SLM round-trip ≈ 310 |
+| 0 | SLM 存+fence barrier+读 | 389.6 | 组合 |
+
+结论：**barrier 不是剩余瓶颈**；它被多 WG 并发隐藏得差不多。真正的杀手是 SIMD 宽度。
+
+### 12.2 真凶：IGC 的 SIMD 悬崖，用 `SG` 堵上
+
+`intel_reqd_sub_group_size(SG)`（`-DSG=`）强制子组宽度。把它加到**完整** kernel（含 staging）
+后，之前被测到「SIMD8」的配置全部回血：
+
+| 配置 | SG=0 | **SG=16** | 备注 |
+|---|---|---|---|
+| 基线 `DBUF1 BK16` | 11.90 | **13.18** | 默认路径本身就掉过 SIMD8 |
+| `DBUF0 BK16` | 6.13 | **13.08** | 之前一直是 SIMD8 |
+| `DBUF0 BK32` | 11.83 | **13.67** | 本轮的赢家 |
+| `PF BK32` | 7.45 | **13.33** | 预取不再需要 |
+
+子组宽度扫描（`DBUF0 BK32`）：SG=8 → 7.16，**SG=16 → 13.70**，SG=32 → 1.19（溢出/崩）。
+所以 **Xe-LP 上 SG=16 是甜点**；SG=32 会打爆寄存器。
+
+> 修正 R10/R11：之前所谓「compute-only 上限 13.7」以及「inner loop 被卡住」的推断，
+> 都建立在**完整 kernel 已是 SIMD16** 的隐含假设上——实际它常常掉到 SIMD8。把 SIMD
+> 钉死后，单缓冲 BK32 的**整核**（13.70）已经追平当初的 skipstage 上限，staging 被并发
+> 完全藏住。
+
+### 12.3 结果：+15% 来自 `SG=16`，不是来自 BK32
+
+SG=0 → SG=16，各测两次，非常稳定：
+
+| 配置 | SG=0 | **SG=16** | 提升 |
+|---|---|---|---|
+| `DBUF1 BK16`（原默认）| 11.83 / 11.79 | **13.73 / 13.67** | **+15~16%** |
+| `DBUF0 BK32` | 11.89 / 11.78 | **13.72 / 13.64** | **+15~16%** |
+
+**关键更正**：两条流水线在 SG=16 下**打平**（都 ~13.7）。也就是说，SG=16 修好 SIMD 之后，
+R9 引入的「单缓冲 BK32 ⇄ 双缓冲 BK16」取舍**变得无关紧要**——双缓冲不再必要，单缓冲的
+staging 被并发藏住。`PlanModel` 对大 grid 取 `BK=32 DBUF=0` 只是取个边际（在 256×400×512
+略好、128×1600×384 略差，属平局内噪声），真正的收益全部来自 **逼 IGC 用 SIMD16**。
+
+反汇编（`BK32 DBUF0 SG=16`）：1024 条 **SIMD16** `mad`，SLM 读全部 `rd:4`（一次 8 个 half，
+沿 k 自动向量化），`scratch=0`，GRF≤112。数值：非整除（带尾巴）形状 `--verify` 通过
+（mean_rel≈2.2e-3）；`numerical_check.py` 三个模型 **ALL PASS**。
+
+### 12.4 仍然失败的候选（保留为已证伪记录）
+
+| 候选 | 结果 | 原因 |
+|---|---|---|
+| `PF=1` 寄存器预取 | 13.33 | SG=16 后不再需要；且预取寄存器会顶掉 SIMD16（SG=0 时 7.45）|
+| `GN=1` 无 SLM | 1.89 | global 延迟直接压在 mad 依赖链上；SLM 是延迟隐藏载体，不是可绕开的开销 |
+| `TN=8`（128,64,16,8,8）| 7.13 / SG16 4.77 | 寄存器压力 |
+| `AT=1`（转置 A 向量读）| 11.06 | 转置 staging 写太贵；且 IGC 已自动沿 k 向量化 A 读 |
+| `DBUF1 BK32`（24 KB）| 5.53 | occupancy 崩 |
+| `DBUF0 BK64`（24 KB）| 11.01 | 同上 |
+| `ASYNC=1` | 7.32 | 无收益 |
+
+→ 「加大 tile 提升算术强度」「去掉 SLM」「更多缓冲」都不行；12 KB/WG 的容量墙依然是真的，
+只是**它不是本轮的主瓶颈**——主瓶颈是编译器 SIMD 选择。
+
+### 12.5 库 dispatch 与端到端
+
+`PlanModel` 的 gemm dispatch 更新（`Tiles::SG` 默认 16）：
+- `M<=64` → `BM=64, BK=16, DBUF=1, SG=16`；
+- `K>=192 && grid>=64` → `BK=32, DBUF=0, SG=16`（本轮赢家）；
+- 其余 → `BK=8, DBUF=0, SG=16`（小 grid / 中等 K）；
+- `K<32` 时回落 `SG=0`（极小 K 上 SG=16 略负）。
+
+**端到端（kernel_run `--report`，5 iters）**：yolov8n-pose 整网 25.97 → 26.10 ms、
+mobilenetv3-small 6.13 → 6.18 ms，**gemm 部分基本不变**。原因是这两个模型里
+**conv3x3 占 73%（18.97/26.16 ms），gemm 只占 ~14%**，且模型里的 gemm 单节点很小
+（28 节点合计 ~0.75 ms/iter ≈ 27 µs/节点），**是 launch/小 grid 受限而非算力受限**，
+所以 kernel 级 +15% 在整网里被摊平。**收益主要体现在大 GEMM（benchmark/大 batch）**。
+
+### 12.6 结论
+
+1. **本轮最大杠杆是「把编译器钉死在 SIMD16」**：`SG=16` 单独就让整核 **+15~16%**
+   （11.9 → 13.7 ops/EU/cyc），两条流水线（双缓冲 BK16 / 单缓冲 BK32）修好 SIMD 后打平。
+   这是一个此前完全没被注意到的 codegen 悬崖——远端反汇编显示 staging 的寄存器压力会让
+   IGC 把计算体降到 SIMD8。
+2. **SLM 墙（容量↔occupancy）是真的**，但取消 SLM / 换更大 tile 都不能突破它；
+   真正要做的是**降低每 WG 的 SLM 足迹同时保住 SIMD 宽度与 k-tile 摊销**。
+3. barrier 在 BK32 下只占 ~2%，不是瓶颈；R11「barrier 串行是根因」需要下调权重。
+4. 对整网的意义取决于 gemm 占比：本项目两模型被 conv3x3 主导，gemm 优化对端到端近中性。
+
+### 12.7 复现
+
+```bash
+# 关键对照：SG=0 vs SG=16
+./build/kernel_bench --op gemm --shape 4096,512,512 --iters 30 --tiles 128,64,32,8,4,0,0,0,4,0,0,0,0,0,0,0,0
+./build/kernel_bench --op gemm --shape 4096,512,512 --iters 30 --tiles 128,64,32,8,4,0,0,0,4,0,0,0,0,0,0,0,16
+# barrier 分解（--mode 0..4）
+./build/kernel_bench --op barrier --wg 256 --nwg 64 --iters 20000 --mode 0
+# 已证伪的候选
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,16,8,4,0,0,1,4,0,0,0,0,1,0,0,16   # PF
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,16,8,4,0,0,1,4,0,0,0,0,0,0,0,16   # baseline+SG16
+```
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

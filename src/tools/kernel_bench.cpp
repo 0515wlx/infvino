@@ -471,6 +471,28 @@ int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::str
   return 0;
 }
 
+// Work-group barrier + SLM round-trip cost (Round 12).
+int benchBarrier(gk::ClRuntime & rt, int wg, int nwg, int iters, int mode)
+{
+  cl_kernel k;
+  try { k = rt.buildKernel("micro", "barrier_cost",
+      "-DBWG=" + std::to_string(wg) + " -DBMODE=" + std::to_string(mode) + " -cl-mad-enable"); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+  cl_mem out = rt.alloc(4096 * 4, CL_MEM_WRITE_ONLY);
+  const uint it = static_cast<uint>(iters);
+  clSetKernelArg(k, 0, sizeof(out), &out);
+  clSetKernelArg(k, 1, sizeof(it), &it);
+  const size_t lws = static_cast<size_t>(wg), gws = static_cast<size_t>(wg) * static_cast<size_t>(nwg);
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 3);
+  const double total_cyc = med * 1e-3 * rt.info().clock_mhz * 1e6;
+  std::printf("  barrier wg=%-4d nwg=%-3d mode=%d  %8.3f ms  %6.1f cyc/iter\n",
+              wg, nwg, mode, med, total_cyc / iters);
+  clReleaseMemObject(out);
+  clReleaseKernel(k);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -486,7 +508,7 @@ int main(int argc, char ** argv)
   std::string width = "h1";
   int depth = 1;
   std::vector<size_t> sizes_kb;
-  int slm_kb = 16, mode = 0, nwg = 64;
+  int slm_kb = 16, mode = 0, nwg = 64, wg = 256;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -534,6 +556,8 @@ int main(int argc, char ** argv)
       mode = std::atoi(next().c_str());
     } else if (a == "--nwg") {
       nwg = std::atoi(next().c_str());
+    } else if (a == "--wg") {
+      wg = std::atoi(next().c_str());
     } else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       return 2;
@@ -583,6 +607,9 @@ int main(int argc, char ** argv)
   } else if (op == "slmbw") {
     std::printf("[slmbw] SLM read bandwidth\n");
     rc = benchSlmBw(rt, slm_kb, iters, 2, width, mode, nwg);
+  } else if (op == "barrier") {
+    std::printf("[barrier] work-group barrier decomposition (--wg --nwg --mode)\n");
+    rc = benchBarrier(rt, wg, nwg, iters, mode);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

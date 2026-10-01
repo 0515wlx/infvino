@@ -19,7 +19,20 @@
 //     SLM budget; that trade is a net win (6.75 -> 11.8 @ 4096x512x512).
 //   * SKIP_STAGE / SKIP_COMPUTE are bottleneck probes (diagnostic only).
 //
-// Knobs (-D): BM BN BK TM TN PAD VEC ASYNC DBUF SKIP_STAGE SKIP_COMPUTE
+// Round 12: the dominant lever turned out to be a codegen cliff, not SLM.
+//   * IGC silently drops the *full* kernel to SIMD8 mads under the staging
+//     register pressure; forcing SIMD16 with `-DSG=16`
+//     (intel_reqd_sub_group_size) recovers the FPU width. SG is the requested
+//     sub-group size (0 = let IGC decide; 16 is the Xe-LP sweet spot, 32 spills).
+//   * Best config: keep the pipeline you like -- with SG=16 both DBUF=1 BK=16
+//     and DBUF=0 BK=32 hit 13.7 ops/EU/cyc @4096x512x512 (vs 11.9 at SG=0):
+//     one SLM buffer + double the k-tile is enough once the FPU width is fixed.
+//   * PF=1 (prefetch the next tile into registers) is now unnecessary and, at
+//     SG=0, forces SIMD8 -> 7.45. GN=1 (no __local, A/B from global) puts the
+//     global latency on the mad chain -> 1.89. Both kept as negatives (default 0).
+//   * SKIP_BARRIER=1 is a diagnostic (drop the k-loop barrier).
+//
+// Knobs (-D): BM BN BK TM TN PAD VEC ASYNC DBUF AT PF GN SG SKIP_STAGE SKIP_COMPUTE SKIP_BARRIER
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifndef BM
@@ -49,6 +62,15 @@
 #ifndef DBUF
 #define DBUF 1
 #endif
+#ifndef PF
+#define PF 0
+#endif
+#ifndef GN
+#define GN 0
+#endif
+#if PF && GN
+#error "PF and GN are mutually exclusive"
+#endif
 #ifndef AT
 #define AT 0
 #endif
@@ -66,6 +88,13 @@
 #ifndef SKIP_COMPUTE
 #define SKIP_COMPUTE 0
 #endif
+#ifndef SKIP_BARRIER
+#define SKIP_BARRIER 0
+#endif
+// Force the compiler to keep SIMD16 (diagnostic probe for the SIMD8 cliff).
+#ifndef SG
+#define SG 0
+#endif
 
 #define LX (BN / TN)
 #define LY (BM / TM)
@@ -77,6 +106,26 @@
 #define AC_PR (BK / VEC)
 #define BC_PR (BN / VEC)
 
+// Round 12: register-prefetch pipeline (PF=1). The global->SLM staging of the
+// next k-tile is issued into registers *before* the current tile's mad loop, so
+// the global latency hides behind compute. That needs only ONE SLM buffer
+// (2*BK*(BM+BN) halfs) instead of the double-buffer's two, which lets BK double
+// while staying inside the ~12 KB/WG occupancy wall -- halving the barrier count
+// (the dominant cost, see docs/kernel.md R12).
+#if PF
+#define ACHUNKS ((BM * (BK / VEC)) / NTHR)
+#define BCHUNKS ((BK * (BN / VEC)) / NTHR)
+#if ((BM * (BK / VEC)) % NTHR) || ((BK * (BN / VEC)) % NTHR)
+#error "PF requires BM*(BK/VEC) and BK*(BN/VEC) to be exact multiples of NTHR"
+#endif
+#if AT
+#error "PF=1 is only implemented for the row-major A path"
+#endif
+#endif
+
+#if SG
+__attribute__((intel_reqd_sub_group_size(SG)))
+#endif
 __attribute__((reqd_work_group_size(LX, LY, 1)))
 __kernel void gemm_f16(__global const half *restrict A,
                        __global const half *restrict B,
@@ -92,12 +141,14 @@ __kernel void gemm_f16(__global const half *restrict A,
   //   DBUF=1 -> 2 A-buffers + 2 B-buffers (double-buffered software pipeline).
   //   DBUF=0 -> 1 A-buffer + 1 B-buffer (classic single-buffer).
   // DBUF=1 doubles SLM/WG, which is why the default BK is 16 (see Round 9).
+#if !GN
 #if AT
-  __local half As_[DBUF ? 2 : 1][BK][ASP];
+  __local half As_[PF ? 1 : (DBUF ? 2 : 1)][BK][ASP];
 #else
-  __local half As_[DBUF ? 2 : 1][BM][AR];
+  __local half As_[PF ? 1 : (DBUF ? 2 : 1)][BM][AR];
 #endif
-  __local half Bs_[DBUF ? 2 : 1][BK][BR];
+  __local half Bs_[PF ? 1 : (DBUF ? 2 : 1)][BK][BR];
+#endif
 
 
 // ---- vectorized synchronous staging of the A tile into buffer `pa` ----
@@ -215,6 +266,76 @@ __kernel void gemm_f16(__global const half *restrict A,
     }                                                                               \
   } while (0)
 
+#if PF
+// ---- Round 12 register prefetch -------------------------------------------
+// Issue the global loads for tile `K0` into per-thread registers (pa/pb) so the
+// latency overlaps the following COMPUTE_TILE. STORE_PREFETCH then commits those
+// registers to the single SLM buffer after the compute barrier (no latency, just
+// the SLM store). The chunk->(row,col) mapping is identical to STAGE_A/STAGE_B.
+#define PREFETCH(K0)                                                             \
+  do {                                                                            \
+    const int k0_ = (K0);                                                         \
+    if ((K % VEC) == 0) {                                                         \
+      _Pragma("unroll") for (int i = 0; i < ACHUNKS; ++i) {                       \
+        int idx = tid + i * NTHR;                                                 \
+        int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                             \
+        int gr = blockRow + r, gc = k0_ + c;                                      \
+        if (gr < M && gc + VEC <= K) {                                            \
+          pa[i] = *(__global const half4 *)&A[gr * K + gc];                       \
+        } else {                                                                  \
+          _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
+            pa[i][v] = (gr < M && gc + v < K) ? A[gr * K + gc + v] : (half)0;     \
+        }                                                                         \
+      }                                                                           \
+    } else {                                                                      \
+      _Pragma("unroll") for (int i = 0; i < ACHUNKS; ++i) {                       \
+        int idx = tid + i * NTHR;                                                 \
+        int r = idx / (BK / VEC), c = (idx % (BK / VEC)) * VEC;                   \
+        int gr = blockRow + r, gc = k0_ + c;                                      \
+        _Pragma("unroll") for (int v = 0; v < VEC; ++v)                           \
+          pa[i][v] = (gr < M && gc + v < K) ? A[gr * K + gc + v] : (half)0;       \
+      }                                                                           \
+    }                                                                             \
+    if ((N % VEC) == 0) {                                                         \
+      _Pragma("unroll") for (int i = 0; i < BCHUNKS; ++i) {                       \
+        int idx = tid + i * NTHR;                                                 \
+        int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                             \
+        int gr = k0_ + r, gc = blockCol + c;                                      \
+        if (gr < K && gc + VEC <= N) {                                            \
+          pb[i] = *(__global const half4 *)&B[gr * N + gc];                       \
+        } else {                                                                  \
+          _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
+            pb[i][v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0;     \
+        }                                                                         \
+      }                                                                           \
+    } else {                                                                      \
+      _Pragma("unroll") for (int i = 0; i < BCHUNKS; ++i) {                       \
+        int idx = tid + i * NTHR;                                                 \
+        int r = idx / (BN / VEC), c = (idx % (BN / VEC)) * VEC;                   \
+        int gr = k0_ + r, gc = blockCol + c;                                      \
+        _Pragma("unroll") for (int v = 0; v < VEC; ++v)                           \
+          pb[i][v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0;       \
+      }                                                                           \
+    }                                                                             \
+  } while (0)
+
+#define STORE_PREFETCH()                                                         \
+  do {                                                                            \
+    __local half (*As)[AR] = (__local half (*)[AR])As_;                           \
+    __local half (*Bs)[BR] = (__local half (*)[BR])Bs_;                           \
+    _Pragma("unroll") for (int i = 0; i < ACHUNKS; ++i) {                         \
+      int idx = tid + i * NTHR;                                                   \
+      int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                               \
+      *(__local half4 *)&As[r][c] = pa[i];                                        \
+    }                                                                             \
+    _Pragma("unroll") for (int i = 0; i < BCHUNKS; ++i) {                         \
+      int idx = tid + i * NTHR;                                                   \
+      int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                               \
+      *(__local half4 *)&Bs[r][c] = pb[i];                                        \
+    }                                                                             \
+  } while (0)
+#endif  // PF
+
   half acc[TM][TN];
 #pragma unroll
   for (int i = 0; i < TM; ++i)
@@ -256,11 +377,54 @@ __kernel void gemm_f16(__global const half *restrict A,
   } while (0)
 
   const int kTiles = (K + BK - 1) / BK;
-#if SKIP_STAGE
+#if SKIP_STAGE && !GN
   STAGE_VEC(0, 0);
   barrier(CLK_LOCAL_MEM_FENCE);
 #endif
-#if DBUF == 1
+#if GN
+  // ---- Round 12 no-SLM GEMM: read A/B straight from global (L1/L2) ----
+  // No __local, hence no work-group barriers and no SLM capacity/occupancy
+  // coupling at all. The WG-resident A/B tiles are re-read every kk but the
+  // in-WG reuse (A broadcast over lx, B broadcast over ly) is served by the L1
+  // cache. This is the direct test of whether the SLM wall is real.
+  for (int kt = 0; kt < kTiles; ++kt) {
+    _Pragma("unroll") for (int kk = 0; kk < BK; ++kk) {
+      const int k = kt * BK + kk;
+      half a[TM], b[TN];
+      _Pragma("unroll") for (int i = 0; i < TM; ++i) {
+        const int gr = blockRow + ly * TM + i;
+        a[i] = (gr < M && k < K) ? A[gr * K + k] : (half)0;
+      }
+      _Pragma("unroll") for (int j = 0; j < TN; ++j) {
+        const int gc = blockCol + lx * TN + j;
+        b[j] = (k < K && gc < N) ? B[k * N + gc] : (half)0;
+      }
+      _Pragma("unroll") for (int i = 0; i < TM; ++i)
+        _Pragma("unroll") for (int j = 0; j < TN; ++j)
+          acc[i][j] = mad(a[i], b[j], acc[i][j]);
+    }
+  }
+#elif PF
+  // ---- Round 12 single-buffer pipeline with register prefetch ----
+  // No second SLM buffer: tile kt+1 is fetched into registers (pa/pb) *before*
+  // the tile-kt mad loop, so the global latency hides behind compute; the
+  // registers are committed to the single SLM buffer after the compute barrier.
+  // This keeps SLM at 2*BK*(BM+BN) halfs, so BK can double vs DBUF=1 and the
+  // barrier count (2/k-tile) halves.
+  {
+    half4 pa[ACHUNKS];
+    half4 pb[BCHUNKS];
+    STAGE_VEC(0, 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int kt = 0; kt < kTiles; ++kt) {
+      if (kt + 1 < kTiles) PREFETCH((kt + 1) * BK);
+      COMPUTE_TILE(0, 0);
+      barrier(CLK_LOCAL_MEM_FENCE);
+      if (kt + 1 < kTiles) STORE_PREFETCH();
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+  }
+#elif DBUF == 1
   // ---- full double-buffered software pipeline ----
   // Stage tile (kt+1) into the *other* buffer before computing tile kt, so the
   // global->SLM latency overlaps the mad loop. The k-tile loop is explicitly
@@ -270,10 +434,14 @@ __kernel void gemm_f16(__global const half *restrict A,
   barrier(CLK_LOCAL_MEM_FENCE);
   int kt = 0;
   for (; kt + 1 < kTiles; kt += 2) {
+#if !SKIP_STAGE
     STAGE_VEC(1, (kt + 1) * BK);
+#endif
     COMPUTE_TILE(0, 0);
     barrier(CLK_LOCAL_MEM_FENCE);
+#if !SKIP_STAGE
     if (kt + 2 < kTiles) STAGE_VEC(0, (kt + 2) * BK);
+#endif
     COMPUTE_TILE(1, 1);
     barrier(CLK_LOCAL_MEM_FENCE);
   }
@@ -296,7 +464,9 @@ __kernel void gemm_f16(__global const half *restrict A,
 #else
     COMPUTE_TILE(0, 0);
 #endif
+#if !SKIP_BARRIER
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
   }
 #endif
 
@@ -314,4 +484,8 @@ __kernel void gemm_f16(__global const half *restrict A,
 #undef STAGE_ASYNC
 #undef COMPUTE_TILE
 #undef LOAD_A
+#if PF
+#undef PREFETCH
+#undef STORE_PREFETCH
+#endif
 }
