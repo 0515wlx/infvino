@@ -552,6 +552,7 @@ int main(int argc, char ** argv)
       depth = std::atoi(next().c_str());
     } else if (a == "--sg") {
       sg = std::atoi(next().c_str());
+      conv.SG = sg;
     } else if (a == "--sizes") {
       for (int v : parseInts(next())) sizes_kb.push_back(static_cast<size_t>(v));
     } else if (a == "--slm-kb") {

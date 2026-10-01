@@ -50,6 +50,11 @@
 #ifndef UNROLL_CI
 #define UNROLL_CI 1
 #endif
+// Round 15: force the sub-group (SIMD) width, like the GEMM (SG=16 avoids the
+// IGC SIMD8 cliff). 0 = let IGC decide.
+#ifndef SG
+#define SG 0
+#endif
 
 #define KH 3
 #define KW 3
@@ -73,6 +78,9 @@ inline half activate_h(half v) {
 #endif
 }
 
+#if SG
+__attribute__((intel_reqd_sub_group_size(SG)))
+#endif
 __attribute__((reqd_work_group_size(LX, LY, 1)))
 __kernel void conv3x3_f16(
   __global const half *restrict X,     // [Cin][H][W]

@@ -111,6 +111,8 @@ struct Conv3x3Cfg
 {
   int TX = 64, TY = 8, TM = 1, CB = 32, CINC = 16, STRIDE = 1, PAD = 1, ACT = 0,
       UNROLL_CI = 3, VECC = 1;
+  // Round 15: SIMD width override (0 = IGC decides; 16 avoids the SIMD8 cliff).
+  int SG = 0;
 
   std::string options() const
   {
@@ -118,7 +120,7 @@ struct Conv3x3Cfg
     o << "-DTX=" << TX << " -DTY=" << TY << " -DTM=" << TM << " -DCB=" << CB
       << " -DCINC=" << CINC << " -DSTRIDE=" << STRIDE
       << " -DPAD=" << PAD << " -DACT=" << ACT << " -DUNROLL_CI=" << UNROLL_CI
-      << " -DVECC=" << VECC
+      << " -DVECC=" << VECC << " -DSG=" << SG
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -127,7 +129,7 @@ struct Conv3x3Cfg
     std::ostringstream o;
     o << "TX" << TX << " TY" << TY << " TM" << TM << " CB" << CB
       << " CINC" << CINC << " s" << STRIDE << " act" << ACT << " u" << UNROLL_CI
-      << " v" << VECC;
+      << " v" << VECC << " sg" << SG;
     return o.str();
   }
 };
@@ -150,6 +152,7 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 7) c.ACT = v[7];
   if (v.size() > 8) c.UNROLL_CI = v[8];
   if (v.size() > 9) c.VECC = v[9];
+  if (v.size() > 10) c.SG = v[10];
   return c;
 }
 

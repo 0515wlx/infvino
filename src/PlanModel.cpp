@@ -299,8 +299,15 @@ void PlanModel::run()
       cfg.STRIDE = attrInt(n, "stride", 1);
       cfg.PAD    = attrInt(n, "pad", 1);
       cfg.ACT    = attrInt(n, "act", cfg.ACT);
-      cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
+      cfg.SG     = 16;  // Round 15: pin SIMD16 (see Tiles.hpp / docs R15)
       const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
+      // Round 15: adaptive spatial tile. The old fixed TX=64 wasted up to 3x on
+      // the small (20x20) stages and left too few work-groups; per-shape sweeps
+      // on the model shapes pick TX=40 (>=40) / TX=20 (small W), TY=8.
+      cfg.TX = (Wout >= 40) ? 40 : (Wout >= 20 ? 20 : 16);
+      if (cfg.TX > Wout) cfg.TX = Wout;
+      cfg.TY = 8;
+      cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
       const auto & id = in(0).dims;
       const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
       int Cin  = static_cast<int>(id[base]), H = static_cast<int>(id[base + 1]);
