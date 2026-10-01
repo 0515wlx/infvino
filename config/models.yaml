@@ -1,0 +1,68 @@
+# infvino 模型注册表
+#
+# 用法: infvino::ModelInfo::fromYaml(path, key)
+#   - key 为空时使用顶层 default 指定的模型
+#
+# 说明:
+#   - path  : 导出的 ONNX（导出/校验用，后端不直接读）。
+#   - plan  : 由 scripts/onnx2plan.py 生成的执行计划（自研 kernel 后端必需）。
+#   - device: AUTO/GPU（ClRuntime 自动优先 GPU 平台，无 GPU 时退到任一设备）。
+#
+# 生成 plan:
+#   python3 scripts/onnx2plan.py --onnx models/yolov8n-pose.onnx --out-dir models/yolov8n-pose
+
+default: yolov8n-pose
+
+models:
+  # ======================= 本次任务的 3 个目标模型 =======================
+
+  # ---- 姿态：yolov8n-pose ----
+  yolov8n-pose:
+    path: models/yolov8n-pose.onnx
+    plan: models/yolov8n-pose/model.plan
+    task: pose
+    imgsz: [640, 640]
+    num_classes: 1
+    kpt_shape: [17, 3]
+    conf: 0.25
+    iou: 0.45
+    device: AUTO
+
+  # ---- 姿态：yolo11n-pose（与 v8-pose 输出布局相同 [1,56,8400]） ----
+  yolo11n-pose:
+    path: models/yolo11n-pose.onnx
+    plan: models/yolo11n-pose/model.plan
+    task: pose
+    imgsz: [640, 640]
+    num_classes: 1
+    kpt_shape: [17, 3]
+    conf: 0.25
+    iou: 0.45
+    device: AUTO
+
+  # ---- 分类：mobilenetv3-small（ImageNet 1000 类） ----
+  mobilenetv3-small:
+    path: models/mobilenetv3-small.onnx
+    plan: models/mobilenetv3-small/model.plan
+    task: classify
+    imgsz: [224, 224]
+    num_classes: 1000
+    letterbox: false
+    to_rgb: true
+    normalize: true
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    device: AUTO
+
+  # ======================= 其他/预留 =======================
+
+  # ---- 预留: 装甲板检测 ----
+  # armor:
+  #   path: models/armor.onnx
+  #   plan: models/armor/model.plan
+  #   task: detect
+  #   imgsz: [640, 640]
+  #   num_classes: 8
+  #   names: [One, Two, Three, Four, Five, Outpost, Sentry, Base]
+  #   conf: 0.3
+  #   device: AUTO
