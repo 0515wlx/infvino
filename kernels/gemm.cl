@@ -9,7 +9,17 @@
 //   * The inner loop reads b[] with a vector load too (N is contiguous).
 //   * ASYNC=1 stages the tiles with async_work_group_copy (no register pressure).
 //
-// Knobs (-D): BM BN BK TM TN PAD VEC ASYNC SKIP_STAGE SKIP_COMPUTE
+// Round 9 design:
+//   * DBUF=1 double-buffers BOTH tiles and software-pipelines the k-loop: tile
+//     kt+1 is staged into the other buffer *before* computing tile kt, so the
+//     global->SLM latency overlaps the mad loop. The k-loop is explicitly
+//     unrolled by two so the buffer indices stay compile-time constants (with a
+//     runtime `(kt&1)` index IGC deletes the whole compute body -> 0 mad).
+//   * DBUF doubles SLM/WG, so BK had to drop 32->16 to stay inside the ~16 KB
+//     SLM budget; that trade is a net win (6.75 -> 11.8 @ 4096x512x512).
+//   * SKIP_STAGE / SKIP_COMPUTE are bottleneck probes (diagnostic only).
+//
+// Knobs (-D): BM BN BK TM TN PAD VEC ASYNC DBUF SKIP_STAGE SKIP_COMPUTE
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifndef BM
@@ -19,7 +29,7 @@
 #define BN 64
 #endif
 #ifndef BK
-#define BK 8
+#define BK 16
 #endif
 #ifndef TM
 #define TM 8
@@ -35,6 +45,9 @@
 #endif
 #ifndef ASYNC
 #define ASYNC 0
+#endif
+#ifndef DBUF
+#define DBUF 1
 #endif
 #ifndef SKIP_STAGE
 #define SKIP_STAGE 0
@@ -64,13 +77,23 @@ __kernel void gemm_f16(__global const half *restrict A,
   const int blockRow = get_group_id(1) * BM;
   const int blockCol = get_group_id(0) * BN;
 
-  __local half As[BM][AR];
-  __local half Bs[BK][BR];
+  // SLM tiles (Round 9):
+  //   DBUF=1 -> 2 A-buffers + 2 B-buffers (double-buffered software pipeline).
+  //   DBUF=0 -> 1 A-buffer + 1 B-buffer (classic single-buffer).
+  // DBUF=1 doubles SLM/WG, which is why the default BK is 16 (see Round 9).
+#if DBUF
+  __local half As_[2][BM][AR];
+  __local half Bs_[2][BK][BR];
+#else
+  __local half As_[1][BM][AR];
+  __local half Bs_[1][BK][BR];
+#endif
 
 
-// ---- vectorized synchronous staging ----
-#define STAGE_VEC(BUF_UNUSED, K0)                                                   \
+// ---- vectorized synchronous staging of the A tile into buffer `pa` ----
+#define STAGE_A(pa, K0)                                                             \
   do {                                                                              \
+    __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;                \
     const int k0_ = (K0);                                                           \
     if ((K % VEC) == 0) {                                                           \
       _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) {  \
@@ -79,7 +102,7 @@ __kernel void gemm_f16(__global const half *restrict A,
           int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                             \
           int gr = blockRow + r, gc = k0_ + c;                                      \
           if (gr < M && gc + VEC <= K) {                                            \
-            *(__local half4 *)&As[r][c] = *(__global const half4 *)&A[gr * K + gc];  \
+            *(__local half4 *)&As[r][c] = *(__global const half4 *)&A[gr * K + gc]; \
           } else {                                                                  \
             _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
               As[r][c + v] = (gr < M && gc + v < K) ? A[gr * K + gc + v] : (half)0; \
@@ -96,6 +119,13 @@ __kernel void gemm_f16(__global const half *restrict A,
         }                                                                           \
       }                                                                             \
     }                                                                               \
+  } while (0)
+
+// ---- vectorized synchronous staging of the B tile into buffer `pb` ----
+#define STAGE_B(pb, K0)                                                             \
+  do {                                                                              \
+    __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
+    const int k0_ = (K0);                                                           \
     if ((N % VEC) == 0) {                                                           \
       _Pragma("unroll") for (int i = 0; i < (BK * BC_PR + NTHR - 1) / NTHR; ++i) {  \
         int idx = tid + i * NTHR;                                                   \
@@ -103,7 +133,7 @@ __kernel void gemm_f16(__global const half *restrict A,
           int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                             \
           int gr = k0_ + r, gc = blockCol + c;                                      \
           if (gr < K && gc + VEC <= N) {                                            \
-            *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&B[gr * N + gc];  \
+            *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&B[gr * N + gc]; \
           } else {                                                                  \
             _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
               Bs[r][c + v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0; \
@@ -122,9 +152,18 @@ __kernel void gemm_f16(__global const half *restrict A,
     }                                                                               \
   } while (0)
 
-// ---- async (group DMA) staging of the contiguous B tile; A stays vector-sync ----
-#define STAGE_ASYNC(K0)                                                             \
+// ---- combined synchronous staging (single buffer) ----
+#define STAGE_VEC(pb, K0)                                                           \
   do {                                                                              \
+    STAGE_A(pb, K0);                                                               \
+    STAGE_B(pb, K0);                                                               \
+  } while (0)
+
+// ---- async (group DMA) staging of the contiguous B tile; A stays vector-sync ----
+#define STAGE_ASYNC(pb, K0)                                                         \
+  do {                                                                              \
+    __local half (*As)[AR] = (__local half (*)[AR])As_ + (pb) * BM;                 \
+    __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     const int k0_ = (K0);                                                           \
     _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) {    \
       int idx = tid + i * NTHR;                                                     \
@@ -164,8 +203,10 @@ __kernel void gemm_f16(__global const half *restrict A,
 #pragma unroll
     for (int j = 0; j < TN; ++j) acc[i][j] = (half)(0);
 
-#define COMPUTE_TILE()                                                              \
+#define COMPUTE_TILE(pa, pb)                                                        \
   do {                                                                              \
+    __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;                 \
+    __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     _Pragma("unroll") for (int kk = 0; kk < BK; ++kk) {                            \
       half a[TM];                                                                   \
       half b[TN];                                                                   \
@@ -183,22 +224,45 @@ __kernel void gemm_f16(__global const half *restrict A,
   STAGE_VEC(0, 0);
   barrier(CLK_LOCAL_MEM_FENCE);
 #endif
+#if DBUF == 1
+  // ---- full double-buffered software pipeline ----
+  // Stage tile (kt+1) into the *other* buffer before computing tile kt, so the
+  // global->SLM latency overlaps the mad loop. The k-tile loop is explicitly
+  // unrolled by two so that the buffer indices are compile-time constants; with
+  // a runtime `(kt&1)` index IGC drops the whole compute body (verified: 0 mad).
+  STAGE_VEC(0, 0);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  int kt = 0;
+  for (; kt + 1 < kTiles; kt += 2) {
+    STAGE_VEC(1, (kt + 1) * BK);
+    COMPUTE_TILE(0, 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (kt + 2 < kTiles) STAGE_VEC(0, (kt + 2) * BK);
+    COMPUTE_TILE(1, 1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (kt < kTiles) {  // odd tail: last tile already staged, just compute it
+    COMPUTE_TILE(0, 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+#else
   for (int kt = 0; kt < kTiles; ++kt) {
 #if !SKIP_STAGE
 #if ASYNC
-    STAGE_ASYNC(kt * BK);
+    STAGE_ASYNC(0, kt * BK);
 #else
     STAGE_VEC(0, kt * BK);
 #endif
     barrier(CLK_LOCAL_MEM_FENCE);
 #endif
 #if SKIP_COMPUTE
-    acc[0][0] += As[ly * TM][kt % AR] + Bs[lx * TN][kt % BR];
+    acc[0][0] += ((__local half *)As_)[ly * TM * AR] + ((__local half *)Bs_)[lx * TN * BR];
 #else
-    COMPUTE_TILE();
+    COMPUTE_TILE(0, 0);
 #endif
     barrier(CLK_LOCAL_MEM_FENCE);
   }
+#endif
 
 #pragma unroll
   for (int i = 0; i < TM; ++i)
@@ -209,6 +273,8 @@ __kernel void gemm_f16(__global const half *restrict A,
       if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
     }
 #undef STAGE_VEC
+#undef STAGE_A
+#undef STAGE_B
 #undef STAGE_ASYNC
 #undef COMPUTE_TILE
 }

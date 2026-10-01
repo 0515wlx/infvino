@@ -14,10 +14,15 @@ namespace gk
 
 struct Tiles
 {
-  // 经 round-1 sweep 选出的默认（见 docs/kernel.md）：大 K/N 与 YOLO 小 shape 折中最佳。
-  int BM = 128, BN = 64, BK = 8, TM = 8, TN = 4, VEC2 = 0, PAD = 0, DBUF = 0;
+  // Round 8/9 defaults: BM=128,BN=64,TM=8,TN=4,VEC=4 with the double-buffered
+  // pipeline (DBUF=1) at BK=16. Double-buffering needs 2x SLM per workgroup, so
+  // BK had to drop 32->16 to stay inside the ~16 KB SLM/WG budget; that trade is
+  // a net win (~11.8 vs ~6.7 ops/EU/cyc @ 4096x512x512, see docs/kernel.md R9).
+  int BM = 128, BN = 64, BK = 16, TM = 8, TN = 4, VEC2 = 0, PAD = 0, DBUF = 1;
   // Round 8: staging vector width (halfs) and async staging toggle.
   int VEC = 4, ASYNC = 0;
+  // Round 9: bottleneck probes (diagnostic only).
+  int SKIP_STAGE = 0, SKIP_COMPUTE = 0;
 
   std::string options() const
   {
@@ -26,6 +31,7 @@ struct Tiles
       << " -DTM=" << TM << " -DTN=" << TN
       << " -DVEC2=" << VEC2 << " -DPAD=" << PAD << " -DDBUF=" << DBUF
       << " -DVEC=" << VEC << " -DASYNC=" << ASYNC
+      << " -DSKIP_STAGE=" << SKIP_STAGE << " -DSKIP_COMPUTE=" << SKIP_COMPUTE
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -35,7 +41,8 @@ struct Tiles
     std::ostringstream o;
     o << BM << "," << BN << "," << BK << "," << TM << "," << TN
       << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF
-      << " vec=" << VEC << " async=" << ASYNC;
+      << " vec=" << VEC << " async=" << ASYNC
+      << (SKIP_STAGE ? " skipstage" : "") << (SKIP_COMPUTE ? " skipcompute" : "");
     return o.str();
   }
 
@@ -43,7 +50,7 @@ struct Tiles
   size_t localY() const { return static_cast<size_t>(BM / TM); }
 };
 
-/** @brief 解析 "BM,BN,BK,TM,TN[,VEC2,PAD]"；字段不足时沿用默认。 */
+/** @brief 解析 "BM,BN,BK,TM,TN[,VEC2,PAD,DBUF,VEC,ASYNC[,SKIP_STAGE,SKIP_COMPUTE]]"；字段不足时沿用默认。 */
 inline Tiles parseTiles(const std::string & s)
 {
   Tiles t;
@@ -61,6 +68,8 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 7) t.DBUF = v[7];
   if (v.size() > 8) t.VEC = v[8];
   if (v.size() > 9) t.ASYNC = v[9];
+  if (v.size() > 10) t.SKIP_STAGE = v[10];
+  if (v.size() > 11) t.SKIP_COMPUTE = v[11];
   return t;
 }
 

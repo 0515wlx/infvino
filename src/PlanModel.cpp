@@ -336,10 +336,24 @@ void PlanModel::run()
       const int K = static_cast<int>(in(0).dims[1]);
       const int N = static_cast<int>(in(1).numel() / K);
       cl_mem da = in(0).mem, db = in(1).mem, dc = out.mem;
-      // Per-node k-tile: BK=32 amortizes the per-tile barrier for large K, while
-      // BK=8 is better for the small-K / small-N 1x1-conv shapes (Round 8).
+      // Per-node tile (Round 9). The double-buffered pipeline (DBUF=1) raises SLM
+      // per workgroup to 2x, so it only pays off when there are enough workgroups
+      // to keep the EUs busy. Measured dispatch (docs/kernel.md R9):
+      //   * M<=64            : BM=64 (half the A tile) + DBUF=1 -> +20..70%.
+      //   * else small K     : BK=8 DBUF=0 (few k-tiles: pipeline overhead wins).
+      //   * else large grid  : BK=16 DBUF=1 (barrier amortization + overlap).
+      //   * otherwise        : BK=8 DBUF=0 (safe, occupancy-friendly).
       Tiles t;
-      t.BK = (K >= 256) ? 32 : 8;
+      const long grid = static_cast<long>((M + t.BM - 1) / t.BM) *
+                        static_cast<long>((N + t.BN - 1) / t.BN);
+      if (M <= 64) {
+        t.BM = 64;
+      } else if (K >= 192 && grid >= 64) {
+        t.BK = 16;  // DBUF is already 1 by default
+      } else {
+        t.BK = 8;
+        t.DBUF = 0;
+      }
       cl_kernel kg = rt_.buildKernel("gemm", "gemm_f16", t.options());
       clSetKernelArg(kg, 0, sizeof(da), &da);
       clSetKernelArg(kg, 1, sizeof(db), &db);

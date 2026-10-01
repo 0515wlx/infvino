@@ -416,6 +416,108 @@ mobilenet 6.31→**6.10 ms**（GEMM 占比已很小，故整网提升仅 ~2–3%
 到此 `gemm_f16` 从 ~8.4 → ~11 ops/EU/cyc（@4096×512×512）；剩余 gap 仍是 staging 未与
 compute 重叠（v2 的思路是 `async`/子组 block IO 的**双缓冲**，本轮单缓冲 async 无效）。
 
+## Round 9 —— GEMM 双缓冲软件流水 + 自适应 tile（+6~75%，端到端 gemm −18%）
+
+Round 8 把 staging 做廉价后，最大症结是 **staging 与 compute 被 barrier 串行化**（Round 7：
+`normal ≈ staging + compute`）。本轮真正把软件流水做出来，并发现**双缓冲的胜负完全由
+SLM/WG 预算决定的 occupancy 支配**，因此最终落成**按 shape 自适应分派**。
+
+### 9.1 双缓冲流水线：先在 ISA 上踩了「编译器把整个 compute 消掉」的坑
+
+朴素写法（`cur = kt & 1` 运行时选 buffer）**编译出 0 条 `mad`**：`As_ + (kt&1)*BM` 让 SLM
+基址数据相关，IGC 无法解析别名，直接把循环体删了（`ocloc disasm` 实测 mad=0，kernel 假快到
+240 ops/EU/cyc、结果全错）。修法：**k-tile 循环显式 2× 展开**，让 buffer 下标成为编译期常量：
+
+```
+stage(tile0 -> buf0); barrier;
+for (kt = 0; kt+1 < kTiles; kt += 2) {
+  stage(tile kt+1 -> buf1);  compute(buf0); barrier;   // 预取下一块，算当前块
+  stage(tile kt+2 -> buf0);  compute(buf1); barrier;
+}
+```
+
+一个**正确性坑**：`As_` 是 `half[2][BM][AR]`，取缓冲区要 `(__local half (*)[AR])As_ + pb*BM`
+（按 **half 元素**偏移），第一版写成 `As_ + pb*BM`（按 `[BM][AR]` 行偏移）→ 结果错。
+
+### 9.2 关键约束：SLM 容量 ≈ 16 KB/WG 决定 occupancy，不是 BK 越大越好
+
+`DBUF=1` 让 SLM/WG 翻倍。显式 2× 展开后，**双缓冲本身是对的**，但：
+
+- `BK=32, DBUF=1`（24.5 KB/WG）→ **5.3**（occupancy 崩），尽管它 barrier 最少。
+- `BK=16, DBUF=1`（12 KB/WG）→ **11.8**：与 `BK=32, DBUF=0`（11.9）持平，但 **比
+  `BK=16, DBUF=0`（6.75）高 +75%** —— 这 +75% 就是纯粹「staging 被 overlap 掉」的收益。
+
+探针（`-DSKIP_STAGE`/`-DSKIP_COMPUTE`，本轮已接进 `Tiles` 以便复现）显示：`BK=32, DBUF=0`
+的 **compute-only 上限 ≈ 13.66 ops/EU/cyc（85%）**；`BK=16, DBUF=1` 已把 staging 藏干净，
+瓶颈回到 **barrier 频率 × occupancy**。16 KB/WG 是硬墙：`(BM+BN)*BK*2(bytes)*2(buf) ≤ 16K`。
+
+### 9.3 自适应 tile：双缓冲只在「网格足够大」时才赢
+
+把候选配置在整批真实 shape 上实测，规律非常清楚（ops/EU/cyc）：
+
+| shape (M×N×K) | BK8 DBUF0 | BK16 DBUF1 | BK16 DBUF1 BM64 | 网格 WG |
+|---|---|---|---|---|
+| 4096×512×512 | 10.89 | **11.80** | | 256 |
+| 1024×1024×1024 | 10.63 | **11.70** | | 128 |
+| 1024×576×576 | 9.91 | **10.77** | | 72 |
+| 1000×1024×1024 | 10.40 | **11.32** | | 128 |
+| 128×6400×192 | 9.85 | **10.04** | 9.79 | 100 |
+| 256×400×384 | **4.87** | 4.81 | | 14 |
+| 128×1600×192 | **6.85** | 5.11 | | 25 |
+| 128×1600×384 | **7.26** | 5.73 | | 25 |
+| 64×6400×64 | 4.47 | 3.93 | **5.66** | 100 |
+| 64×6400×192 | 5.02 | 4.83 | **8.46** | 100 |
+| 240×196×40 | **1.21** | 0.62 | | 8 |
+| 576×49×96 | **1.03** | 0.74 | | 5 |
+| 72×3136×16 | **2.11** | 1.74 | | 49 |
+
+规律：**双缓冲把 SLM 翻倍 → 常驻 WG 变少 → 只有网格够大（≈≥64 个 WG）时才有足够的
+work-group 去填满 80 EU、隐藏长延迟**。网格小（M/N 很窄，如 `M=128`、`N=49`）时，`BK=8
+DBUF=0` 的「小 SLM、高常驻」反而赢；`K` 很小时（≤一个 k-tile 量级）流水的 prologue/epilogue
+也亏。`M≤64`（YOLO head / mobilenet 尾层）时 `BM=64` 把 A tile 减半，occupancy 上来，DBUF=1
+反而大幅领先（+20~70%）。
+
+**落地分派**（`PlanModel`，按节点）：
+
+```cpp
+Tiles t;                                   // 默认 BM=128, BN=64, BK=16, DBUF=1
+long grid = ceil(M/BM) * ceil(N/BN);
+if      (M <= 64)                  t.BM = 64;         // 小 M：减半 A tile
+else if (K >= 192 && grid >= 64)   t.BK = 16;         // 大网格：双缓冲流水
+else                             { t.BK = 8; t.DBUF = 0; } // 否则回退单缓冲小 tile
+```
+
+每个节点按需 build/cache 对应 kernel（编译期常量 tile，无运行时开销）。
+
+### 9.4 结果
+
+**纯 GEMM（`kernel_bench`，4096×512×512）**：8.37 → 11.09（R8）→ **11.80**（R9）；
+1024³：8.05 → 10.91 → **11.70**。官方 `kernel_check.py` 全部 PASS（相对误差判据）。
+
+**端到端（kernel busy，warm）**：
+
+| 模型 | R8 | R9 | gemm 分项 R8→R9 |
+|---|---|---|---|
+| yolov8n-pose | 26.38 ms | **26.07 ms** | 4.62 → **3.79 ms（−18%）** |
+| yolo11n-pose | 27.91 ms | **27.48 ms** | — |
+| mobilenetv3-small | 6.10 ms | **6.09 ms** | 4.56 → **3.91 ms** |
+
+三模型 `model_check` 全部 **PASS**。整网总时提升有限（gemm 只占 ~15%），但 gemm 自身
+**−18%**，且拿到了可迁移到 conv3x3 的硬经验（见下）。
+
+### 9.5 给 conv3x3 的迁移经验
+
+1. **软件流水的敌人是 occupancy，不是分支**：`DBUF` 让 SLM 翻倍，必须同步缩小 tile（这里
+   `BK 32→16`）把 WG 压回 ~16 KB；否则越「优化」越慢。
+2. **编译期常量下标是硬要求**：运行时选 buffer 会让 IGC 删体/放弃优化；循环要显式展开，
+   缓冲区下标必须是字面量。
+3. **按 grid 大小而不是按「理论更优」分派**：同一份 kernel，窄 M 形状必须回退到小 tile。
+4. **staging 与 compute 重叠可白赚 1.75×**（6.75→11.8），但前提是别把 SLM 撑爆。
+
+**未做/已证伪**：`async_work_group_copy`（R8 已证伪）；非对称缓冲（只双缓冲 B、A 单缓冲）需要
+每 k-tile 再 stage 一次 A → 多一道 barrier，分析上是**净负**，未保留代码；更深流水（3 buffer）
+会再翻 SLM，按 9.2 的墙可判定不划算，未试。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
