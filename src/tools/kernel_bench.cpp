@@ -272,6 +272,198 @@ int benchBandwidth(gk::ClRuntime & rt, size_t mb, int iters)
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Round 10 micro-benchmarks: ALU latency/throughput + cache hierarchy.
+// ---------------------------------------------------------------------------
+
+// Report per-dependent-FMA latency. For DEPTH=1 the loop is one chain, so
+// cycles/iter is the FMA latency; for large DEPTH it approaches 1 (throughput).
+int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters, int fi)
+{
+  std::string kname;
+  int lanes = 1;
+  if (width == "f32") { kname = "fma_f32_lat"; lanes = 1; }
+  else if (width == "h1") { kname = "fma_h1_lat"; lanes = 1; }
+  else if (width == "h2") { kname = "fma_h2_lat"; lanes = 2; }
+  else if (width == "h4") { kname = "fma_h4_lat"; lanes = 4; }
+  else if (width == "h8") { kname = "fma_h8_lat"; lanes = 8; }
+  else if (width == "add") { kname = "add_lat"; lanes = 1; }
+  else { std::fprintf(stderr, "unknown width %s\n", width.c_str()); return 2; }
+  const bool is_add = (width == "add");
+
+  const int ITERS = 4096;
+  std::string kname2 = is_add ? std::string("add_lat") : kname;
+  std::string opts = "-DDEPTH=" + std::to_string(depth) + " -DITERS=" + std::to_string(ITERS) +
+                     " -cl-mad-enable -cl-fast-relaxed-math";
+  cl_kernel k;
+  try { k = rt.buildKernel("micro", kname2, opts); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+
+  cl_mem out = rt.alloc(16 * 8, CL_MEM_WRITE_ONLY);
+  const float a = 1.0001f, b = 1e-4f;
+  if (is_add) {
+    const int ia = 3;
+    clSetKernelArg(k, 0, sizeof(out), &out);
+    clSetKernelArg(k, 1, sizeof(ia), &ia);
+  } else if (width == "f32") {
+    clSetKernelArg(k, 0, sizeof(out), &out);
+    clSetKernelArg(k, 1, sizeof(a), &a);
+    clSetKernelArg(k, 2, sizeof(b), &b);
+  } else {
+    const uint16_t ah = gk::f32_to_f16(a), bh = gk::f32_to_f16(b);
+    clSetKernelArg(k, 0, sizeof(out), &out);
+    clSetKernelArg(k, 1, sizeof(ah), &ah);
+    clSetKernelArg(k, 2, sizeof(bh), &bh);
+  }
+
+  const size_t lws = 64;
+  const size_t gws = 64 * 512;  // plenty of work-items to fill the EUs
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+  // Aggregate FPU throughput of the whole device (the number comparable to the
+  // gemm ops/EU/cyc): FLOPs = work-items x iters x depth x lanes x 2.
+  const double flops = 2.0 * static_cast<double>(gws) * ITERS * depth * lanes;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  // Per-work-item dependent-chain latency (with loop overhead): total cycles of
+  // the kernel is the per-work-item chain time (all work-items run in parallel).
+  const double total_cyc = med * 1e-3 * rt.info().clock_mhz * 1e6;
+  const double cyc_per_iter = total_cyc / ITERS;
+  const double cyc_per_dep_fma = cyc_per_iter / depth;
+  std::printf("  fma %-3s depth=%-4d lanes=%-2d  %8.3f ms  ops/EU/cyc=%5.2f  "
+              "chain=%.1f cyc/iter  %.2f cyc/dep-%s-FMA\n",
+              width.c_str(), depth, lanes, med, ops, cyc_per_iter, cyc_per_dep_fma,
+              width.c_str());
+  clReleaseMemObject(out);
+  clReleaseKernel(k);
+  return 0;
+}
+
+// Pointer chase: latency per access vs working-set size (bytes).
+int benchMemLat(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+{
+  cl_kernel k = rt.buildKernel("micro", "mem_chase", "-cl-mad-enable");
+  for (size_t kb : sizes_kb) {
+    const size_t n = kb * 1024 / 4;  // uint elements
+    std::vector<uint32_t> h(n);
+    // stride permutation: idx -> (idx + step) with step coprime to n, so the
+    // walk visits every cache line. step in elements; pick ~ n/2 rounded odd.
+    uint32_t step = static_cast<uint32_t>(n / 2) | 1u;
+    for (size_t i = 0; i < n; ++i) h[i] = static_cast<uint32_t>((i + step) % n);
+    cl_mem tbl = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+    cl_mem sink = rt.alloc(65536 * 4, CL_MEM_WRITE_ONLY);
+    rt.write(tbl, n * 4, h.data());
+    const uint nn = static_cast<uint>(n);
+    const uint iters = 4096;
+    clSetKernelArg(k, 0, sizeof(tbl), &tbl);
+    clSetKernelArg(k, 1, sizeof(sink), &sink);
+    clSetKernelArg(k, 2, sizeof(nn), &nn);
+    clSetKernelArg(k, 3, sizeof(iters), &iters);
+    // Keep the launch latency-bound: few enough work-items that the EUs are not
+    // over-subscribed (each work-item is a serial dependent chain).
+    const size_t lws = 64, gws = 64 * 4;
+    const double med = rt.timeMs(
+      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 1, fi);
+    const double ns_per_acc = med * 1e6 / iters;
+    const double cyc = ns_per_acc * rt.info().clock_mhz * 1e-3;
+    std::printf("  memlat %6zu KB  %8.3f ms  %6.2f ns/access  %6.1f cyc/access\n",
+                kb, med, ns_per_acc, cyc);
+    clReleaseMemObject(tbl);
+    clReleaseMemObject(sink);
+  }
+  clReleaseKernel(k);
+  return 0;
+}
+
+// Streaming copy bandwidth vs footprint. A full copy touches every byte, so the
+// traffic is exactly 2 x footprint per pass (1 read + 1 write). Sweeping the
+// footprint reveals the cache tiers: fast while it fits in a level, then it
+// drops to the next level's bandwidth.
+int benchMemBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+{
+  cl_kernel k = rt.buildKernel("stream", "copy_u32", "-cl-mad-enable");
+  for (size_t kb : sizes_kb) {
+    const size_t n = kb * 1024 / 4;  // uint elements
+    cl_mem in = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+    cl_mem out = rt.alloc(n * 4, CL_MEM_WRITE_ONLY);
+    {
+      std::vector<uint32_t> z(n, 1);
+      rt.write(in, n * 4, z.data());
+    }
+    const uint nn = static_cast<uint>(n);
+    clSetKernelArg(k, 0, sizeof(in), &in);
+    clSetKernelArg(k, 1, sizeof(out), &out);
+    clSetKernelArg(k, 2, sizeof(nn), &nn);
+    const size_t lws = 256;
+    const size_t gws = ((n + lws - 1) / lws) * lws;
+    const double med = rt.timeMs(
+      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+    const double bytes = static_cast<double>(n) * 4.0 * 2.0;  // read + write
+    std::printf("  membw %6zu KB  %8.3f ms  %7.1f GB/s (copy: read+write)\n",
+                kb, med, bytes / (med * 1e-3) / 1e9);
+    clReleaseMemObject(in);
+    clReleaseMemObject(out);
+  }
+  clReleaseKernel(k);
+  return 0;
+}
+
+// Read-only bandwidth vs footprint with an internal pass loop, so even small
+// footprints keep the launch long enough to be bandwidth-bound (L1/LLC tiers).
+int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+{
+  cl_kernel k = rt.buildKernel("micro", "scan_rep", "-cl-mad-enable");
+  for (size_t kb : sizes_kb) {
+    const size_t n = kb * 1024 / 4;  // uint elements
+    cl_mem in = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+    cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+    {
+      std::vector<uint32_t> z(n, 1);
+      rt.write(in, n * 4, z.data());
+    }
+    const uint nn = static_cast<uint>(n), step = 1, passes = 64;
+    clSetKernelArg(k, 0, sizeof(in), &in);
+    clSetKernelArg(k, 1, sizeof(sink), &sink);
+    clSetKernelArg(k, 2, sizeof(nn), &nn);
+    clSetKernelArg(k, 3, sizeof(step), &step);
+    clSetKernelArg(k, 4, sizeof(passes), &passes);
+    const size_t lws = 256, gws = 256 * 64;  // more work-items -> more loads in flight
+    const double med = rt.timeMs(
+      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+    const double bytes = static_cast<double>(n) * 4.0 * passes;
+    std::printf("  scanbw %6zu KB  %8.3f ms  %7.1f GB/s (read only)\n",
+                kb, med, bytes / (med * 1e-3) / 1e9);
+    clReleaseMemObject(in);
+    clReleaseMemObject(sink);
+  }
+  clReleaseKernel(k);
+  return 0;
+}
+
+// SLM (on-die scratchpad) read bandwidth at a given per-WG allocation.
+int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::string & width)
+{
+  std::string ksrc = (width == "v4") ? "slm_bw_v4" : "slm_bw";
+  std::string opts = "-DSLM_KB=" + std::to_string(slm_kb) + " -cl-mad-enable";
+  cl_kernel k;
+  try { k = rt.buildKernel("micro", ksrc, opts); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+  cl_mem out = rt.alloc(4096 * 4, CL_MEM_WRITE_ONLY);
+  const uint it = static_cast<uint>(iters);
+  clSetKernelArg(k, 0, sizeof(out), &out);
+  clSetKernelArg(k, 1, sizeof(it), &it);
+  const size_t lws = 64, gws = 64 * 64;  // fill the machine: SLM bw scales with active WGs
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+  // bytes read per iteration per work-item: 16 (scalar x4: 4 loads of 4B) or
+  // 16 for the uint4 vector variant; both read 16 bytes per work-item/iter.
+  const double bytes = 16.0 * gws * iters;
+  std::printf("  slmbw %3d KB/WG %-3s %8.3f ms  %7.1f GB/s (SLM read)\n",
+              slm_kb, width.c_str(), med, bytes / (med * 1e-3) / 1e9);
+  clReleaseMemObject(out);
+  clReleaseKernel(k);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -284,6 +476,10 @@ int main(int argc, char ** argv)
   int iters = 100;
   size_t mb = 256;
   bool verify = false;
+  std::string width = "h1";
+  int depth = 1;
+  std::vector<size_t> sizes_kb;
+  int slm_kb = 16;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -319,6 +515,14 @@ int main(int argc, char ** argv)
       auto v = parseInts(next());
       if (v.size() != 3) { std::fprintf(stderr, "--shape needs M,N,K\n"); return 2; }
       shapes.push_back({v[0], v[1], v[2], "MxNxK"});
+    } else if (a == "--width") {
+      width = next();
+    } else if (a == "--depth") {
+      depth = std::atoi(next().c_str());
+    } else if (a == "--sizes") {
+      for (int v : parseInts(next())) sizes_kb.push_back(static_cast<size_t>(v));
+    } else if (a == "--slm-kb") {
+      slm_kb = std::atoi(next().c_str());
     } else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       return 2;
@@ -349,6 +553,25 @@ int main(int argc, char ** argv)
   } else if (op == "bandwidth") {
     std::printf("[bandwidth] buffer=%zu MB\n", mb);
     rc = benchBandwidth(rt, mb, iters);
+  } else if (op == "fmalat") {
+    std::printf("[fmalat] width=%s depth=%d (depth=1 -> latency, large -> throughput)\n",
+                width.c_str(), depth);
+    rc = benchFma(rt, width, depth, iters, 3);
+  } else if (op == "memlat") {
+    std::printf("[memlat] pointer-chase latency vs working set\n");
+    if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};
+    rc = benchMemLat(rt, sizes_kb, 2);
+  } else if (op == "membw") {
+    std::printf("[membw] streaming read bandwidth vs footprint\n");
+    if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};
+    rc = benchMemBw(rt, sizes_kb, 2);
+  } else if (op == "scanbw") {
+    std::printf("[scanbw] read-only bandwidth vs footprint (internal passes)\n");
+    if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 512, 1024, 2048};
+    rc = benchScanBw(rt, sizes_kb, 2);
+  } else if (op == "slmbw") {
+    std::printf("[slmbw] SLM read bandwidth\n");
+    rc = benchSlmBw(rt, slm_kb, iters, 2, width);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

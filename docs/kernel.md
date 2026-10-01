@@ -518,6 +518,100 @@ else                             { t.BK = 8; t.DBUF = 0; } // 否则回退单缓
 每 k-tile 再 stage 一次 A → 多一道 barrier，分析上是**净负**，未保留代码；更深流水（3 buffer）
 会再翻 SLM，按 9.2 的墙可判定不划算，未试。
 
+## Round 10 —— 指令延迟与各级缓存/带宽实测（为分块策略定标）
+
+Round 9 确认「DBUF 让 SLM 翻倍 → occupancy 掉 → 流水填不平延迟」。本轮把平台的关键常数
+测出来，给分块策略一个**理论标尺**。新增 `kernels/micro.cl` + `kernel_bench` 的
+`--op fmalat / memlat / membw / scanbw / slmbw`（全部短核，遵守 `docs/benchmark_protocol.md`）。
+
+### 10.1 FP16/FP32 FMA 延迟与吞吐（`--op fmalat`）
+
+方法：`DEPTH` 条独立累加链 × `ITERS` 次；`DEPTH=1` 是纯依赖链（测延迟），`DEPTH` 大测吞吐。
+额外用整数依赖 `add` 链测出**循环开销 = 20.4 cyc/iter**，从 `DEPTH=1` 结果里减掉即得真实延迟。
+
+| 指令 | depth=1 cyc/iter | **净延迟（−20.4）** | depth=8 吞吐 ops/EU/cyc | 备注 |
+|---|---|---|---|---|
+| `add`（int，基准）| 20.4 | ~0 | 40 | 纯循环开销 |
+| **half mad（h1）** | 49.5 | **≈29 cyc** | 23.8 | 标量 half |
+| half2/half4 mad | 49.5 | ≈29 cyc | 25.1 / 27.1 | 与 h1 同延迟 |
+| **half8 mad** | 49.5 | **≈29 cyc** | **27.7** | 同延迟，吞吐最高 |
+| **float mad** | 74.4 | **≈54 cyc** | 14.9 | FP32 延迟约为 FP16 的 1.9× |
+
+结论：**(a) FP16 FMA 延迟 ~29 cyc，FP32 ~54 cyc；(b) half2/4/8 相比 half 标量「零延迟代价」**，
+向量化只涨吞吐（29→27.7 ops/EU/cyc 里 h8 比 h1 高 ~16%）。(c) 延迟 29 cyc 意味着
+**一条依赖链要 29 条独立链才能填满**——这正是 GEMM 需要大 tile / 多累加器的量化依据。
+
+### 10.2 存储层级的大小与带宽（`membw` / `scanbw` / `slmbw`）
+
+**读带宽 vs footprint**（`scanbw`，只读、核内多次 pass 以压过 launch 开销）：
+
+| footprint | 读带宽 | 层级 |
+|---|---|---|
+| 256 KB – 2 MB | **270–293 GB/s** | **LLC（片上共享）** |
+| 4 MB | 180 GB/s | LLC→DRAM 过渡 |
+| ≥16 MB | **16–20 GB/s** | **DRAM** |
+
+**拷贝带宽 vs footprint**（`membw`，read+write）：1 MB 达 92 GB/s，2 MB 掉到 37，≥16 MB 稳定
+**19.7 GB/s**（与 DRAM 只读一致）。→ **LLC 边界 ≈ 2–4 MB**（与旧文档「~4 MB 内持平、8 MB 崩塌」一致）。
+
+**SLM（片上 L1 scratchpad）读带宽**（`slmbw`，uint4 向量读）：
+
+| 每 WG SLM 配额 | 读带宽 |
+|---|---|
+| 2–4 KB | **~555 GB/s**（上限） |
+| 8 KB | 541 GB/s |
+| 16 KB | **301 GB/s** |
+| 32 KB | 168 GB/s |
+
+→ **SLM 带宽与「每 WG 配额」强耦合**：配额翻倍，常驻 WG 减半，聚合带宽近似腰斩。
+这就是 Round 9「16 KB/WG 是墙」的物理来源：**SLM 容量 ↔ 带宽 ↔ occupancy 是一个耦合约束**，
+不是独立的三件事。
+
+### 10.3 用这套常数做分块理论分析（关键）
+
+**GEMM 内循环的 SLM 喂给强度**：每个 kk，读 `TM` 个 A + `TN` 个 B（half），做 `TM×TN` 次 FMA。
+→ **每 FLOP 的 SLM 字节 = (TM+TN)/(TM·TN)**：
+
+| tile | B/FLOP | 满速(27.7 ops/EU/cyc)所需 SLM 带宽 |
+|---|---|---|
+| TM8×TN4（当前）| 0.375 | **~1080 GB/s** |
+| TM16×TN4 | 0.3125 | ~900 GB/s |
+| TM8×TN8 | 0.25 | ~720 GB/s |
+| TM16×TN8 | 0.1875 | ~540 GB/s |
+
+把 27.7 ops/EU/cyc、80 EU、1.3 GHz 代进去：`BW = ops/2×80×1.3e9×(TM+TN)/(TM·TN)`。
+实测 SLM 上限 ~550 GB/s（且只有配额 ≤4–8 KB/WG 时才有）。**当前 TM8×TN4 的理论需求 1080 GB/s
+远超 550** → 说明当前 GEMM 的 **inner loop 是被「SLM 喂给 + barrier 串行」共同卡住**，
+而不是纯 FPU。要往 13.7（compute-only 上限）甚至更高走，方向是：
+
+1. **加大 TN 到 8**（B/FLOP 0.375→0.25）——但寄存器会涨，且 R9 实测 TN=8 慢于 TN=4（occupancy）。
+2. **更关键：把 SLM 配额压到 ≤8 KB/WG**（带宽 2×），再谈大 tile。
+3. **彻底绕开 SLM 喂给**：把 A 或 B 的复用放到**寄存器**里（外层 k 循环多累加），或改用
+   `sub_group` 内共享（Xe 上 sub-group 寄存器交换不占 SLM）——这是下一步。
+
+> **物理结论（用户观点证实）**：真正的约束是 **「容量 ↔ 带宽 ↔ 并发」的耦合**：
+> - LLC 只有 ~2–4 MB、DRAM ~19 GB/s → 大 K 的数据复用必须靠**分块在 LLC 内做**，
+>   否则一掉出 LLC 就直接 DRAM 限速（19 GB/s，AI≈1 的算子必死）。
+> - SLM 容量小（~16 KB/WG 级）→ 一旦为了双缓冲/大 tile 把配额推高，**SLM 带宽随常驻 WG
+>   减少而腰斩**，软件流水也填不平。
+> - 因此「缓存不够」只能靠**软件流水**缓解；但流水的收益又受 SLM 带宽-occupancy 耦合上限——
+>   两者是同一个约束的两面。
+
+### 10.4 复现
+
+```bash
+# FP16/FP32 延迟与吞吐（depth=1 延迟；depth=8 吞吐）
+./build/kernel_bench --op fmalat --width h1  --depth 1
+./build/kernel_bench --op fmalat --width h8  --depth 8
+./build/kernel_bench --op fmalat --width f32 --depth 1
+./build/kernel_bench --op fmalat --width add --depth 1     # 循环开销基准
+# 存储层级
+./build/kernel_bench --op scanbw --sizes 256,1024,2048,4096,16384,65536
+./build/kernel_bench --op membw  --sizes 1024,2048,8192,65536,262144
+./build/kernel_bench --op slmbw  --slm-kb 4 --width v4
+./build/kernel_bench --op slmbw  --slm-kb 16 --width v4
+```
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
