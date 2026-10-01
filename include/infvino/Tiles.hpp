@@ -16,6 +16,8 @@ struct Tiles
 {
   // 经 round-1 sweep 选出的默认（见 docs/kernel.md）：大 K/N 与 YOLO 小 shape 折中最佳。
   int BM = 128, BN = 64, BK = 8, TM = 8, TN = 4, VEC2 = 0, PAD = 0, DBUF = 0;
+  // Round 8: staging vector width (halfs) and async staging toggle.
+  int VEC = 4, ASYNC = 0;
 
   std::string options() const
   {
@@ -23,6 +25,7 @@ struct Tiles
     o << "-DBM=" << BM << " -DBN=" << BN << " -DBK=" << BK
       << " -DTM=" << TM << " -DTN=" << TN
       << " -DVEC2=" << VEC2 << " -DPAD=" << PAD << " -DDBUF=" << DBUF
+      << " -DVEC=" << VEC << " -DASYNC=" << ASYNC
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -31,7 +34,8 @@ struct Tiles
   {
     std::ostringstream o;
     o << BM << "," << BN << "," << BK << "," << TM << "," << TN
-      << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF;
+      << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF
+      << " vec=" << VEC << " async=" << ASYNC;
     return o.str();
   }
 
@@ -55,6 +59,8 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 5) t.VEC2 = v[5];
   if (v.size() > 6) t.PAD = v[6];
   if (v.size() > 7) t.DBUF = v[7];
+  if (v.size() > 8) t.VEC = v[8];
+  if (v.size() > 9) t.ASYNC = v[9];
   return t;
 }
 

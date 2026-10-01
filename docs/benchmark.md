@@ -58,25 +58,39 @@
 
 | 模型 | conv+gemm GFLOPs | 旧 kernel total (ms) | 旧 ops/EU/cyc | **新 kernel total (ms)** | **新 ops/EU/cyc** | 加速 | % of 32 |
 |---|---|---|---|---|---|---|---|
-| yolov8n-pose | 9.178 | 55.8 | 1.58 | **27.06** | **3.26** | **2.07×** | 10.2% |
-| yolo11n-pose | 7.406 | 61.2 | 1.16 | **28.57** | **2.49** | **2.14×** | 7.8% |
-| mobilenetv3-small | 0.110 | 6.54 | 0.16 | 6.37 | 0.17 | 1.03× | 0.5% |
+| yolov8n-pose | 9.178 | 55.8 | 1.58 | **26.38** | **3.34** | **2.12×** | 10.4% |
+| yolo11n-pose | 7.406 | 61.2 | 1.16 | **27.91** | **2.55** | **2.19×** | 8.0% |
+| mobilenetv3-small | 0.110 | 6.54 | 0.16 | 6.10 | 0.17 | 1.07× | 0.5% |
 
 主要来自：把 K=3、groups=1 的 **stride-2** 层从朴素 `conv_general` 改走调优的
-`conv3x3_f16`，并把 s1 默认 tile 改为 `TX64 TY8 TM1 CB32 CINC16`（详见 `docs/kernel.md` Round 6）。
+`conv3x3_f16`，并把 s1 默认 tile 改为 `TX64 TY8 TM1 CB32 CINC16`（`docs/kernel.md` Round 6）；
+以及 GEMM staging 改为**行主序 B + half4 向量化**（Round 8）。
 三模型数值检验仍全部 PASS。
 
 ### 2.2 整机墙钟（`infvino_bench`，mean，含 launch 开销）
 
 | 模型 | infer (ms) | pipeline (ms) | 说明 |
 |---|---|---|---|
-| yolov8n-pose | 33.5 | 38.0 | kernel busy ~27.0 ms，其余 ~6.5 ms 为 launch/同步 |
-| yolo11n-pose | 35.7 | 40.2 | kernel busy ~28.6 ms |
-| mobilenetv3-small | 8.1 | 8.5 | kernel busy ~6.4 ms |
+| yolov8n-pose | 33.3 | 37.6 | kernel busy ~26.4 ms，其余 ~7 ms 为 launch/同步 |
+| yolo11n-pose | 35.0 | 39.7 | kernel busy ~27.9 ms |
+| mobilenetv3-small | 7.9 | 8.4 | kernel busy ~6.1 ms |
 
 > 旧墙钟（Round 5）：yolov8 ~62.6 / yolo11 ~69.4 / mobilenet ~8.4 ms。
-> 非 profiling 模式下墙钟仍含可观 **kernel launch 开销**（yolov8：busy 27.0 vs 墙钟 33.5），
+> 非 profiling 模式下墙钟仍含可观 **kernel launch 开销**（yolov8：busy 26.4 vs 墙钟 33.3），
 > 这是下一步优化重点（算子融合、减少 kernel 数、批处理/持久化 kernel），见 `docs/kernel.md`。
+
+### 2.3 纯 GEMM 算子（`kernel_bench`，`f16`）
+
+| shape (M×N×K) | 旧 ops/EU/cyc | 新 BK=8 | 新 BK=32 |
+|---|---|---|---|
+| 4096×512×512 | 8.37 | 10.02 | **11.09** |
+| 1024×1024×1024 | 8.05 | 9.79 | **10.91** |
+| 6400×64×64 | 6.04 | **6.93** | 5.25 |
+| 128×1600×384 | 5.54 | **6.65** | 5.23 |
+| 400×256×256 | ~4.0 | 4.34 | 3.84 |
+
+行主序 B（消除转置 staging 的 bank conflict）+ half4 向量化 staging + 按 K 选 BK
+（`K>=256` 用 32，否则 8）。详见 `docs/kernel.md` Round 8。
 
 ## 3. 复现
 

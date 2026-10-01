@@ -336,18 +336,23 @@ void PlanModel::run()
       const int K = static_cast<int>(in(0).dims[1]);
       const int N = static_cast<int>(in(1).numel() / K);
       cl_mem da = in(0).mem, db = in(1).mem, dc = out.mem;
-      clSetKernelArg(kGemm_, 0, sizeof(da), &da);
-      clSetKernelArg(kGemm_, 1, sizeof(db), &db);
-      clSetKernelArg(kGemm_, 2, sizeof(dc), &dc);
-      clSetKernelArg(kGemm_, 3, sizeof(M), &M);
-      clSetKernelArg(kGemm_, 4, sizeof(N), &N);
-      clSetKernelArg(kGemm_, 5, sizeof(K), &K);
-      Tiles        t;
+      // Per-node k-tile: BK=32 amortizes the per-tile barrier for large K, while
+      // BK=8 is better for the small-K / small-N 1x1-conv shapes (Round 8).
+      Tiles t;
+      t.BK = (K >= 256) ? 32 : 8;
+      cl_kernel kg = rt_.buildKernel("gemm", "gemm_f16", t.options());
+      clSetKernelArg(kg, 0, sizeof(da), &da);
+      clSetKernelArg(kg, 1, sizeof(db), &db);
+      clSetKernelArg(kg, 2, sizeof(dc), &dc);
+      clSetKernelArg(kg, 3, sizeof(M), &M);
+      clSetKernelArg(kg, 4, sizeof(N), &N);
+      clSetKernelArg(kg, 5, sizeof(K), &K);
       const size_t lws[2] = {t.localX(), t.localY()};
       const size_t gws[2] = {
         static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0],
         static_cast<size_t>((M + t.BM - 1) / t.BM) * lws[1]};
-      timed("gemm", kGemm_, 2, gws, lws);
+      timed("gemm", kg, 2, gws, lws);
+      clReleaseKernel(kg);
     }
     else if (n.op == "ew_binary")
     {

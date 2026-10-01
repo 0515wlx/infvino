@@ -120,6 +120,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/architecture.md`](docs/architecture.md) | 分层设计、API、执行计划、扩展点 |
 | [`docs/kernel.md`](docs/kernel.md) | 自研 kernel 优化日志与 ops/EU/cyc |
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
+| [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
 
 ## 状态

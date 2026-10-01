@@ -378,6 +378,44 @@ work-group 少、AI 低），换 tile 无效（~1.0 ops/EU/cyc），需要后续
 (c) 或干脆放弃大 K 的通用 tiling，针对 1×1 conv 的 (M=Cout, N=HW, K=Cin) 做专用内核。
 当前 `gemm_f16` 仍是已验证的最优（~8.4 ops/EU/cyc @ 4096×512×512）。
 
+## Round 8 —— GEMM staging：行主序 B + 向量化 staging（+1.2~1.33×）
+
+Round 7 定位到「BK≥16 时 staging 崩掉」是最大症结。进一步确认**元凶是转置 B 的 SLM 写
+bank conflict 随 `BKP=BK+PAD` 线性放大**（步长 `BKP` halfs → BK=8/16/32 时 4/8/16 路冲突）。
+本轮做了两件事：
+
+**(1) 行主序 B（不转置）+ half4 向量化 staging —— 正收益**
+
+- `Bs[BK][BN]` 行主序：staging 写变得**连续、无冲突**；inner loop 的 `b[]` 也变成连续
+  `half4` 载入（`b[j]=Bs[kk][lx*TN+j]`）。
+- staging 用 `half4` 向量载入/存储，指令数降 ~4×；`K%4`/`N%4` 不满足时自动回退标量。
+- 结果（`kernel_bench`，单配置）：
+
+| shape | 旧 | 新 BK=8 | 新 BK=32 |
+|---|---|---|---|
+| 4096×512×512 | 8.37 | 10.02 | **11.09 (1.33×)** |
+| 1024×1024×1024 | 8.05 | 9.79 | **10.91 (1.36×)** |
+| 6400×64×64 | 6.04 | **6.93** | 5.25 |
+| 1600×128×128 | 5.11 | 5.44 | 4.19 |
+| 128×1600×384 | 5.54 | **6.65** | 5.23 |
+| 400×256×256 | ~4.0 | 4.34 | 3.84 |
+
+- **大 K 用 BK=32、小 K 用 BK=8**：已在 `PlanModel` 的 gemm 分派里按 `K>=256` 选（每个 gemm
+  节点按需 build/cache kernel）。
+
+**(2) 异步 staging（`async_work_group_copy`）—— 负收益**
+
+- A 有 BM=128 行，逐行 async copy 不现实；只对 B 的 BK 行做 `async_work_group_copy`。
+- 实测**显著更慢**（4096×512×512：10.11 → 3.86 ops/EU/cyc）——这台 iGPU 上逐行 async copy
+  的开销远大于收益。保留为 `-DASYNC`（默认 0）作为已证伪记录。
+
+**端到端**（kernel busy，warm）：yolov8 27.06→**26.38 ms**、yolo11 28.55→**27.91 ms**、
+mobilenet 6.31→**6.10 ms**（GEMM 占比已很小，故整网提升仅 ~2–3%）。
+三模型 `model_check` 仍全部 **PASS**。
+
+到此 `gemm_f16` 从 ~8.4 → ~11 ops/EU/cyc（@4096×512×512）；剩余 gap 仍是 staging 未与
+compute 重叠（v2 的思路是 `async`/子组 block IO 的**双缓冲**，本轮单缓冲 async 无效）。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
@@ -386,20 +424,12 @@ work-group 少、AI 低），换 tile 无效（~1.0 ops/EU/cyc），需要后续
 - **带宽测试 OOM**：`kernel_bench --op bandwidth --mb 1024` 分配 2×1 GB buffer + host 1 GB，
   iGPU 共享主存 → 打满 8 GB 机器。已把 `--mb` 上限钳到 256。
 - **所有容器/脚本已加 `--memory=3g --memory-swap=3g`**，容器不可能再拖垮宿主。
-- **整机硬死机（无日志）与 i915 GPU hang**：本开发板（i5-1135G7 + **PREEMPT_RT 内核**
-  `5.15.179-rt84`）历史上有频繁重启（06:20/06:31/06:50/09:40/10:01/10:16…），
-  `kern.log`/`syslog` 中可见 `[drm] GPU HANG ... in kernel_run` 与引擎复位记录；
-  两次「硬死机」在重启前**没有任何 OOM/i915 日志**，属硬锁死而非 OOM（`dmesg` 不可读，
-  但 syslog 无 `oom-kill`）。**排查**：实验内核 `CL_KERNEL_PRIVATE_MEM_SIZE=0`（非寄存器
-  溢出/scratch 打爆内存）。
-  **防护协议（务必遵守）**：
-  1. GPU 实验「短促化」：单个 kernel 目标 < 100 ms，**一条命令只跑一个配置**，
-     之间留间隔；不要在一次命令里循环编译/运行大量配置（IGC JIT 反复编译期间风险最高）。
-  2. 尽量用 `ocloc compile/disasm` **离线**做 ISA 逆向，不需要 GPU。
-  3. 容器 `--memory=2~3g --memory-swap` 限死；`--device=/dev/dri/renderD128` 即可（无需 privileged）。
-  4. 用仓库自带、已验证的 `kernel_bench`/`kernel_run` 跑短时基准，少用临时 standalone 驱动。
-  5. 机器上还有一个第三方 `deploy-docker`（ROS，restart=always 且无内存上限）在
-     段错误-重启循环，与本项目无关，但会持续占用资源。
+- **整机硬死机（无日志）与 i915 GPU hang**：本开发板（i5-1135G7 + **PREEMPT_RT** `5.15.179-rt84`，
+  7.5 GB 与 iGPU 共享）历史上有频繁重启与 `[drm] GPU HANG ... in kernel_run`；两次硬死机在重启前
+  **没有任何 OOM/i915/panic 日志**（硬锁死），`CL_KERNEL_PRIVATE_MEM_SIZE=0` 排除寄存器溢出；
+  部分重启是 **宿主上无关脚本的 OOM**（人工重启），与本项目无关。
+  **⚠️ 完整、标准化的防护协议见 [`docs/benchmark_protocol.md`](benchmark_protocol.md)**（容器限资源、
+  GPU 实验短促化、优先离线 ISA、运行前后查内存、hang 处理等），做任何 GPU 实验前先读。
 
 ## 复现
 
