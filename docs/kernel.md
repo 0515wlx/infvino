@@ -326,6 +326,58 @@ yolov8 18.61 ms / 4.74 ops）都是这个 bug 的产物。修正：`run()` 不�
 mobilenet 几乎没动：它的瓶颈是 576×49×576 这类 1×1 pointwise GEMM（N=HW 只有 49，
 work-group 少、AI 低），换 tile 无效（~1.0 ops/EU/cyc），需要后续专门处理。
 
+## Round 7 —— 纯 GEMM 瓶颈定位（结论：不是 FPU 流水，是 barrier/SLM/occupancy）
+
+目标：把 `gemm_f16` 单独拆开，找真正的瓶颈。方法：给 `gemm.cl` 加临时探针宏
+（`SKIP_STAGE`：只 stage 第一块、保留 barrier；`SKIP_COMPUTE`：只 staging、不做 mad），
+配合 `ocloc disasm` 与独立微基准（`GBM` 默认 tile `128,64,8,8,4`，shape `4096×512×512`）。
+
+**分解结果（旧结构，transposed-B, VEC2=0）**
+
+| 版本 | ops/EU/cyc | 时间 | 含义 |
+|---|---|---|---|
+| normal | 8.37 | 2.46 ms | 完整 |
+| `SKIP_STAGE`（只算+barrier）| 8.23 | 2.50 ms | **staging 在 BK=8 下几乎免费** |
+| `SKIP_COMPUTE`（只 staging+barrier）| 24.25 | 0.85 ms | staging 本身 ~0.85 ms |
+| normal, BK=16 | 4.82 | 4.28 ms | 加 staging 后崩 |
+| `SKIP_STAGE`, BK=16 | **12.85** | 1.61 ms | 无 staging 时 BK=16 好得多 |
+
+**关键结论**
+
+1. **inner loop 不是 FPU 上限**：去掉 staging 后 `BK=16` 能到 12.85；纯寄存器外积微基准
+   24.9–28.8；标量 half 已被 IGC 自动打包。ALU 有富余。
+2. **BK=8 的「compute」主要被 barrier 限制**：每个 k-tile 只有 8 个 kk 的计算夹在 barrier 之间，
+   编译器无法跨 barrier 预取 SLM。微基准里在循环内插 barrier 会把 13.2 打到 10.07。
+   `BK≥16`（更多计算/barrier）可恢复，但**真实 kernel 的转置 B staging 在 BK≥16 时急剧变慢**
+   （0.85→1.1→2.5 ms），抵消收益。
+3. **staging 与 compute 是相加而非重叠**：normal ≈ staging + compute（2.46 ≈ 0.85 + 1.61 量级），
+   因为二者被 barrier 串行化。
+4. **ISA 佐证**：default kernel 静态指令 256 `mad` vs 252 `mov` + 143 `add` + 76 `mul`+76 `mach`
+   + 67 `shl` + 91 `cmp` + 49 `csel` + 46 `if`——大量非 FPU 指令（staging/地址/边界）。
+
+**试过但未取得正收益（都已实测，故未保留）**
+
+| 尝试 | 结果 |
+|---|---|
+| N 打包 half2 + B 行主序（不转置）| 微基准 inner loop 14.08，但真实 kernel 仅 5.8（TN=8）/8.2（TN=4）|
+| A 转置 + half8 宽载 | staging 转置有 bank conflict，5.05 |
+| `-DDBUF`（编译期常量索引双缓冲）| 负优化（8.05→4.94）|
+| `-DPIPE`（寄存器预取软流水）| 负优化（8.4→2.3，寄存器压力/occupancy 下降）|
+| `BK=16/32/64` | 无 staging 时 12.8，有 staging 时 4–5 |
+| 32-bit 索引（去掉 `size_t`）| 无变化 |
+| `PAD`（SLM padding）| 无改善甚至更差 |
+| `VEC2`（沿 K 打包）| 更慢（与历史结论一致）|
+
+> **微基准的坑**：当 SLM 在循环内不变（只 stage 一次）时，编译器会把 SLM 载入**提升到循环外**，
+> 于是测到的是「纯 mad」而非「SLM 载入 + mad」。所以 13–14 的「inner loop 上限」被高估；
+> 真实 kernel 里 SLM 每 tile 变化，载入无法提升。Round 6 里的 17 也受此影响。
+
+**下一步方向（未做）**：真正需要的是「更大的 BK + 廉价 staging + 足够 occupancy」的组合，
+比如：(a) 用向量化 staging（`vload`/half2/half4）把 staging 指令数降 2–4×；
+(b) 用 `async_work_group_copy`/子组 block IO 做无寄存器占用的异步 staging；
+(c) 或干脆放弃大 K 的通用 tiling，针对 1×1 conv 的 (M=Cout, N=HW, K=Cin) 做专用内核。
+当前 `gemm_f16` 仍是已验证的最优（~8.4 ops/EU/cyc @ 4096×512×512）。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
