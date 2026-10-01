@@ -810,6 +810,113 @@ mobilenetv3-small 6.13 → 6.18 ms，**gemm 部分基本不变**。原因是这�
 ./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,16,8,4,0,0,1,4,0,0,0,0,0,0,0,16   # baseline+SG16
 ```
 
+## Round 13 —— 物理极限标定：IGC 掉 SIMD 的真因是「寄存器大小」，不是带宽
+
+R12 发现 `SG=16` 让 GEMM +15%，但没说清 IGC 为什么会掉到 SIMD8。结论先行：**是每线程
+128 GRF 的寄存器分配上限**（`28 KB/EU` = 7 个线程上下文 × 4 KB），既不是 RF 读带宽，也不是
+「耦合导致」的间接效应。顺带修正了一个**差 2× 的峰值归一化错误**。
+
+### 13.1 FP16 峰值修正（重要）：是 32，不是 16
+
+给 `--op fmalat` 加了 `--sg`（强制子组宽度）。纯 FMA 吞吐：
+
+| 探针 | depth | ops/EU/cyc |
+|---|---|---|
+| `h1`（scalar half）| 4 / 8 / 16 / 32 / 48 / 64 | 25.9 / 26.3 / 25.4 / 26.3 / 26.3 / **27.8** |
+| `h4` | 4 / 8 / 16 | 27.8 / 27.1 / 27.1 |
+| `h8` | 8 | 27.7 |
+| **`h1` SG=8** | 32 | **14.1**（恰为一半）|
+| **`h1` SG=32** | 8 | 1.6（溢出崩）|
+| `f32` | 4…32 | **14.5–14.7**（40 以上崩）|
+
+要点：
+- **与深度无关**（h1 从 4 到 64 都 ~26–28）→ 是**吞吐**受限，不是延迟（R10「depth=8 = 27.7」
+  其实是延迟假象，但那不重要，吞吐恰好也在同一量级）。
+- **吞吐随子组宽度线性变化**（SG8 恰为 SG16 的一半）→ **EU 每周期只发射 1 条向量指令**，
+  SIMD 宽度直接决定 FPU 吞吐。
+- `f16 : f32 ≈ 1.9–2`。
+
+→ 这台机器 **FP16 峰 = 32 ops/EU/cyc = 3.328 TFLOP/s**（16 packed FMA），FP32 = 16 ops。
+`kernel_bench` / `ClRuntime` 之前用 `EU × clk × 16` 归一（打印 “peak 1664 GFLOP/s”、“% of 16”），
+**少算了一半**——和 `kernel.md` 第 20 行自己写的 3.328 TFLOP/s 自相矛盾。**已修正为 32**。
+
+> **修正读法**：R1–R12 里所有 “% of 16” 都要 **×2** 读；`ops/EU/cyc` 绝对值不变。
+> 因此 **GEMM 的 13.7 只是真实峰值的 ~43%**（不是 86%），compute-only ~17.7 ≈ 55%。
+
+### 13.2 RF 读带宽被排除
+
+`h1`（每指令/lane 读 1 个 half）与 `h8`（8 个 half）吞吐**完全相同**（~27），只有子组宽度能
+让吞吐翻倍/腰斩。→ 稳态 FMA 由 **lane 发射吞吐**决定，**寄存器读端口/字节带宽不是瓶颈**。
+
+### 13.3 IGC 的 SIMD 选择 = 寄存器**大小**压力（离线 ISA 实测）
+
+`SG=0`（让 IGC 自己选）下扫配置，记录它选的 SIMD + GRF 峰值 + spill：
+
+| 配置 (SG=0) | IGC 选 | GRF | scratch |
+|---|---|---|---|
+| `DBUF0 BK16 full` | **S8** | 127 | 0 |
+| `DBUF0 BK16 skipstage` | **S8** | 126 | 23 |
+| `PF BK32` | **S8** | 117 | 0 |
+| `TN8` | **S8** | 126 | 12 |
+| `DBUF0 BK32 full` | S16 | 119 | 0 |
+| `DBUF1 BK16 full` | S16 | 112 | 0 |
+| `DBUF0 BK64 / BK8 / GN` | S16 | 115–127 | 0 |
+
+规律很干净：**只要 SIMD16 的分配会顶到 ~126–128 GRF，IGC 就退回 SIMD8**（每 GRF 少装一半
+lane，逻辑值所需 GRF 减半）。这不是物理不可能——同一配置加 `-DSG=16` 后能塞进 ≤120 GRF、
+零 spill（`DBUF0 BK16`：6.1 → 13.1）。所以它是**寄存器分配器的保守启发式**：它宁可降 SIMD
+也不愿多花力气把分配压进 128 GRF。
+
+### 13.4 「寄存器大小 → 并发 → 可达 tile」耦合（128 GRF 是硬墙）
+
+想靠「加大寄存器 tile」降低 load/FLOP（提高算术强度）时，全部撞墙（均强制 SG=16）：
+
+| 配置 | SIMD | GRF | scratch | ops/EU/cyc |
+|---|---|---|---|---|
+| **TM8 TN4 BK32** | S16 | 112 | **0** | **13.7** |
+| TM8 TN8 BK32 | S16 | 126 | 6 | 8.4 |
+| TM16 TN4 BK32 | S16 | 127 | **513** | 4.2 |
+| TM16 TN4 BK16 | S16 | 120 | **477** | 0.53 |
+
+- 用量过 ~120 GRF 开始 spill，过 128 彻底崩。
+- `f32` 深度扫描同现象：depth 32（acc[32]）→ 14.5，depth 64（acc[64]）→ 7.1。
+
+→ **物理模型**：RF = `128 GRF × 32 B = 4 KB`/线程；`28 KB/EU` 恰好 = **7 个线程上下文 × 4 KB**
+（与 Gen11/Xe 的 7 threads/EU 对上）。**每 EU 每周期发射 1 条向量指令**，所以
+`work-items/EU = 7 × SIMD宽度`。SIMD8 把 lane 数砍半 → FPU 饿死（实测正好一半）。
+**容量（RF 大小）↔ 并发（线程/lane 数）↔ 可达 tile（算术强度）是同一个约束**，和 R10 的
+SLM 容量↔带宽↔并发是这台机器上的孪生墙。
+
+### 13.5 对 GEMM 物理极限的结论
+
+| 层级 | ops/EU/cyc | 占真实峰（32）|
+|---|---|---|
+| 纯 FP16 FMA（h1/h4/h8, SG16）| ~27.8 | 87% |
+| GEMM compute-only（skipstage）| ~17.7 | 55% |
+| **GEMM 整核（BK32 SG16）** | **13.7** | **43%** |
+| 旧默认（SG=0 掉 SIMD8）| 11.9 | 37% |
+
+- GEMM **不是 FPU 受限**（43%）；限制来自内循环的 **load/issue 喂给 + occupancy/barrier**。
+- 而唯一能把「feed」降下来的手段——更大寄存器 tile（更高算术强度）——被 **128 GRF 硬墙**
+  挡住（TM16/TN8 全部 spill）。
+- 所以在「这台机器 + 这套 tile 算法」下，**13.7 就是寄存器墙下的现实上限**。要再往上只能改
+  算法层：让数据复用不依赖大 GRF tile（例如用 sub-group 内寄存器交换/广播减少 SLM+GRF
+  压力），或消灭冗余计算（conv 融合、小 M 专用 tile）。
+
+### 13.6 复现
+
+```bash
+# 纯 FMA 吞吐 vs 子组宽度（h1 与 h8 同量级；SG8 腰斩）
+for s in 8 16 32; do ./build/kernel_bench --op fmalat --width h1 --depth 32 --sg $s; done
+./build/kernel_bench --op fmalat --width h8 --depth 8  --sg 16
+./build/kernel_bench --op fmalat --width f32 --depth 32 --sg 16   # f16:f32 ≈ 2
+# 寄存器墙：TM16 直接 spill
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,32,16,4,0,0,0,4,0,0,0,0,0,0,0,16
+# 离线看 IGC 自己选什么（SG=0）
+ocloc compile -file kernels/gemm.cl -device tgl -options "-DBM=128 -DBN=64 -DBK=16 -DTM=8 -DTN=4 -DDBUF=0 -cl-mad-enable" -output k && \
+ocloc disasm -file k_tgllp.bin -device tgl -dump ./isa && grep -m1 'mad (' isa/.text.gemm_f16.asm
+```
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

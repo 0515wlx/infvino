@@ -150,7 +150,7 @@ int main(int argc, char ** argv)
   {
     const double ops_eu_cyc = gflops * 1e9 * infer_fps / (eu * clock_ghz * 1e9);
     std::cout << "efficiency : " << gflops << " GFLOPs -> " << ops_eu_cyc
-              << " ops/EU/cyc = " << (ops_eu_cyc / 16.0 * 100.0) << "% of 16"
+              << " ops/EU/cyc = " << (ops_eu_cyc / 32.0 * 100.0) << "% of 32"
               << "  (assume EU=" << eu << ", clock=" << clock_ghz << "GHz)\n";
   }
   return 0;

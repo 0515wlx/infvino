@@ -34,7 +34,7 @@ struct DeviceInfo
   size_t          max_work_group{0};
   size_t          subgroup_size{0};
   bool            is_gpu{false};        // device is CL_DEVICE_TYPE_GPU
-  double          peak_fp16_gflops{0};  // eu * clock(MHz) * 16 ops
+  double          peak_fp16_gflops{0};  // eu * clock(MHz) * 32 FLOP (16 packed FP16 FMA)
 
   std::string     describe() const;
 };
@@ -88,7 +88,7 @@ public:
     const std::function<cl_event()> & enqueue, int warmup, int iters,
     double * min_ms = nullptr, double * p90_ms = nullptr);
 
-  /** @brief 计算 ops/EU/cycle（相对理论极限 16 的百分比）。 */
+  /** @brief 计算 ops/EU/cycle（相对理论极限 32 的百分比；FP16 = 16 packed FMA/EU/cyc）。 */
   double opsPerEuCycle(double flops, double milliseconds) const
   {
     const double sec = milliseconds * 1e-3;

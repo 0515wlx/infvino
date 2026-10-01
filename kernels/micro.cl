@@ -18,8 +18,17 @@
 #ifndef ITERS
 #define ITERS 4096
 #endif
+// Round 13: force sub-group width (0 = IGC decides). Applied to the FMA probes.
+#ifndef SG
+#define SG 0
+#endif
+#if SG
+#define SGATTR __attribute__((intel_reqd_sub_group_size(SG)))
+#else
+#define SGATTR
+#endif
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
 __kernel void fma_f32_lat(__global float *out, const float a, const float b) {
   float acc[DEPTH];
 #pragma unroll
@@ -34,7 +43,7 @@ __kernel void fma_f32_lat(__global float *out, const float a, const float b) {
   if (s == -12345.678f) out[0] = s;  // never true; keeps the chain alive
 }
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
 __kernel void fma_h1_lat(__global half *out, const half a, const half b) {
   half acc[DEPTH];
 #pragma unroll
@@ -50,7 +59,7 @@ __kernel void fma_h1_lat(__global half *out, const half a, const half b) {
 }
 
 // half2 / half4 / half8: DEPTH chains, each chain is a vector FMA.
-__attribute__((reqd_work_group_size(64, 1, 1)))
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
 __kernel void fma_h2_lat(__global half *out, const half a, const half b) {
   half2 acc[DEPTH];
   const half2 av = (half2)(a, a), bv = (half2)(b, b);
@@ -66,7 +75,7 @@ __kernel void fma_h2_lat(__global half *out, const half a, const half b) {
   if (s.s0 == (half)-12345.0f) out[0] = s.s0;
 }
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
 __kernel void fma_h4_lat(__global half *out, const half a, const half b) {
   half4 acc[DEPTH];
   const half4 av = (half4)(a, a, a, a), bv = (half4)(b, b, b, b);
@@ -82,7 +91,7 @@ __kernel void fma_h4_lat(__global half *out, const half a, const half b) {
   if (s.s0 == (half)-12345.0f) out[0] = s.s0;
 }
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
 __kernel void fma_h8_lat(__global half *out, const half a, const half b) {
   half8 acc[DEPTH];
   const half8 av = (half8)(a, a, a, a, a, a, a, a);
@@ -92,6 +101,25 @@ __kernel void fma_h8_lat(__global half *out, const half a, const half b) {
   for (int i = 0; i < ITERS; ++i) {
 #pragma unroll
     for (int d = 0; d < DEPTH; ++d) acc[d] = mad(acc[d], av, bv);
+  }
+  half8 s = (half8)(0, 0, 0, 0, 0, 0, 0, 0);
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d) s += acc[d];
+  if (s.s0 == (half)-12345.0f) out[0] = s.s0;
+}
+
+// RF read-port probe: both multiply operands are the SAME register (one GRF
+// read instead of two). If FP16 FMA throughput is register-bandwidth limited,
+// this should beat the two-distinct-operand fma_h8_lat.
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
+__kernel void fma_h8_1op(__global half *out, const half a, const half b) {
+  half8 acc[DEPTH];
+  const half8 av = (half8)(a, a, a, a, a, a, a, a);
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d) acc[d] = (half8)((half)(get_global_id(0) + d), 0, 0, 0, 0, 0, 0, 0);
+  for (int i = 0; i < ITERS; ++i) {
+#pragma unroll
+    for (int d = 0; d < DEPTH; ++d) acc[d] = mad(acc[d], av, av);
   }
   half8 s = (half8)(0, 0, 0, 0, 0, 0, 0, 0);
 #pragma unroll

@@ -67,7 +67,7 @@ DeviceInfo queryDevice(cl_device_id d)
   if (clGetDeviceInfo(d, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sg), &sg, nullptr) == CL_SUCCESS) {
     i.subgroup_size = sg;
   }
-  i.peak_fp16_gflops = static_cast<double>(i.eu) * i.clock_mhz * 1e6 * 16.0 / 1e9;
+  i.peak_fp16_gflops = static_cast<double>(i.eu) * i.clock_mhz * 1e6 * 32.0 / 1e9;
   return i;
 }
 }  // namespace

@@ -1,6 +1,6 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
-// kernel_bench —— 自研 kernel 基准：延迟(ms) + ops/EU/cycle（FP16 上限 16）。
+// kernel_bench —— 自研 kernel 基准：延迟(ms) + ops/EU/cycle（FP16 上限 32 = 16 packed FMA）。
 //
 //   kernel_bench --list-devices
 //   kernel_bench --op gemm --shape 1024,1024,1024 --verify
@@ -122,8 +122,8 @@ int benchGemm(gk::ClRuntime & rt, const gk::Tiles & t, const Shape & s, int iter
 
   std::printf(
     "  gemm %-16s M=%-5d N=%-4d K=%-5d  %8.3f ms  %7.1f GFLOP/s  "
-    "ops/EU/cyc=%5.2f (%5.1f%% of 16)",
-    s.label.c_str(), M, N, K, med, flops / (med * 1e-3) / 1e9, ops, ops / 16 * 100);
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), M, N, K, med, flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
 
   if (verify) {
     rt.read(dC, (size_t)M * N * 2, hC.data());
@@ -196,9 +196,9 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
     "  conv3x3 %-18s Cin=%-4d Cout=%-4d %dx%d s%d  %8.3f ms  %7.1f GFLOP/s  "
-    "ops/EU/cyc=%5.2f (%5.1f%% of 16)",
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
     s.label.c_str(), Cin, Cout, H, W, c.STRIDE, med, flops / (med * 1e-3) / 1e9,
-    ops, ops / 16 * 100);
+    ops, ops / 32 * 100);
 
   if (verify) {
     rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
@@ -278,7 +278,7 @@ int benchBandwidth(gk::ClRuntime & rt, size_t mb, int iters)
 
 // Report per-dependent-FMA latency. For DEPTH=1 the loop is one chain, so
 // cycles/iter is the FMA latency; for large DEPTH it approaches 1 (throughput).
-int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters, int fi)
+int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters, int fi, int sg)
 {
   std::string kname;
   int lanes = 1;
@@ -287,6 +287,7 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
   else if (width == "h2") { kname = "fma_h2_lat"; lanes = 2; }
   else if (width == "h4") { kname = "fma_h4_lat"; lanes = 4; }
   else if (width == "h8") { kname = "fma_h8_lat"; lanes = 8; }
+  else if (width == "h8_1op") { kname = "fma_h8_1op"; lanes = 8; }
   else if (width == "add") { kname = "add_lat"; lanes = 1; }
   else { std::fprintf(stderr, "unknown width %s\n", width.c_str()); return 2; }
   const bool is_add = (width == "add");
@@ -294,6 +295,7 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
   const int ITERS = 4096;
   std::string kname2 = is_add ? std::string("add_lat") : kname;
   std::string opts = "-DDEPTH=" + std::to_string(depth) + " -DITERS=" + std::to_string(ITERS) +
+                     " -DSG=" + std::to_string(sg) +
                      " -cl-mad-enable -cl-fast-relaxed-math";
   cl_kernel k;
   try { k = rt.buildKernel("micro", kname2, opts); }
@@ -329,9 +331,9 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
   const double total_cyc = med * 1e-3 * rt.info().clock_mhz * 1e6;
   const double cyc_per_iter = total_cyc / ITERS;
   const double cyc_per_dep_fma = cyc_per_iter / depth;
-  std::printf("  fma %-3s depth=%-4d lanes=%-2d  %8.3f ms  ops/EU/cyc=%5.2f  "
+  std::printf("  fma %-6s depth=%-4d lanes=%-2d sg=%-2d %8.3f ms  ops/EU/cyc=%5.2f  "
               "chain=%.1f cyc/iter  %.2f cyc/dep-%s-FMA\n",
-              width.c_str(), depth, lanes, med, ops, cyc_per_iter, cyc_per_dep_fma,
+              width.c_str(), depth, lanes, sg, med, ops, cyc_per_iter, cyc_per_dep_fma,
               width.c_str());
   clReleaseMemObject(out);
   clReleaseKernel(k);
@@ -508,7 +510,7 @@ int main(int argc, char ** argv)
   std::string width = "h1";
   int depth = 1;
   std::vector<size_t> sizes_kb;
-  int slm_kb = 16, mode = 0, nwg = 64, wg = 256;
+  int slm_kb = 16, mode = 0, nwg = 64, wg = 256, sg = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -548,6 +550,8 @@ int main(int argc, char ** argv)
       width = next();
     } else if (a == "--depth") {
       depth = std::atoi(next().c_str());
+    } else if (a == "--sg") {
+      sg = std::atoi(next().c_str());
     } else if (a == "--sizes") {
       for (int v : parseInts(next())) sizes_kb.push_back(static_cast<size_t>(v));
     } else if (a == "--slm-kb") {
@@ -566,7 +570,7 @@ int main(int argc, char ** argv)
 
   gk::ClRuntime rt(kernel_dir);
   std::printf("device     : %s\n", rt.info().describe().c_str());
-  std::printf("peak FP16  : %.1f GFLOP/s (EU x clk x 16)\n\n", rt.info().peak_fp16_gflops);
+  std::printf("peak FP16  : %.1f GFLOP/s (EU x clk x 32)\n\n", rt.info().peak_fp16_gflops);
 
   if (shapes.empty()) shapes = {{1024, 1024, 1024, "square"}, {512, 512, 512, "square"}};
 
@@ -591,7 +595,7 @@ int main(int argc, char ** argv)
   } else if (op == "fmalat") {
     std::printf("[fmalat] width=%s depth=%d (depth=1 -> latency, large -> throughput)\n",
                 width.c_str(), depth);
-    rc = benchFma(rt, width, depth, iters, 3);
+    rc = benchFma(rt, width, depth, iters, 3, sg);
   } else if (op == "memlat") {
     std::printf("[memlat] pointer-chase latency vs working set\n");
     if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};
