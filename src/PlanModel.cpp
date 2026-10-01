@@ -216,7 +216,6 @@ void PlanModel::releaseKernels()
 
 void PlanModel::run()
 {
-  tprof_.clear();
   const auto t0 = std::chrono::steady_clock::now();
 
   auto timed = [&](const std::string & tag, cl_kernel k, cl_uint dim, const size_t * gws,

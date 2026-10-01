@@ -81,8 +81,12 @@ public:
 
   /** @brief 最近一次 run() 的墙钟耗时（ms）。 */
   double lastRunMs() const { return last_run_ms_; }
-  /** @brief 算子耗时表（仅 profiling=true 时填充）：op -> {ms, calls}。 */
+  /** @brief 算子耗时表（仅 profiling=true 时填充）：op -> {ms, calls}。
+   *  耗时在多次 run() 之间**累加**，便于对 warm 后的多次运行求平均；
+   *  统计前先调用 clearProfile()。 */
   const std::map<std::string, std::pair<double, int>> & opProfile() const { return tprof_; }
+  /** @brief 清空算子耗时表（在统计循环前调用）。 */
+  void clearProfile() { tprof_.clear(); }
 
 private:
   struct Tensor

@@ -235,6 +235,97 @@ mobilenet 的 SE/depthwise/5×5）。
   （concat/copy/ew/bias_add；`bias_add` 在 yolo11 里 48 次）+ 每层一次 kernel 启动/同步。
   **融合（conv+bias+act + 消除 concat/copy）是下一步关键**。
 
+## Round 6 —— Xe-LP 逆向：half2/half8 到底有没有用？+ conv 路由修正
+
+**背景**：上一轮怀疑「GEMM/conv 没上 half2/half8」。用 `ocloc`（离线编译+`disasm`，不占 GPU）
+反汇编真实 kernel，并用独立微基准逐层定位瓶颈。结论出人意料：**half2 不是关键**。
+
+### 6.1 纯寄存器 FP16 吞吐（微基准，`cl_khr_fp16`）
+
+8 条独立累加链、大 work-item 数、循环内无访存：
+
+| 内核 | 实现 | 实测 ops/EU/cyc | 说明 |
+|---|---|---|---|
+| `fma_f32` | 标量 float | **15.3** | FP32 上限 16，96% |
+| `fma_h1` | 标量 half | **28.8** | IGC **自动**打成 half2 |
+| `fma_h2` | 显式 half2 | 29.5 | |
+| `fma_h8` | 显式 half8 | 29.6 | |
+| `fma_h16` | 显式 half16 | 30.1 | 逼近 32 上限 |
+
+→ **硬件确实是 2× FP16，而且标量 half 也会被 IGC 自动向量化**。所以「朴素 half 代码 = 没享受到
+2×」这个前提不成立；`mad ...:hf`（SIMD16）本身就是 packed 的。
+
+### 6.2 逐层逼近：瓶颈其实在 SLM/调度，不在 FPU
+
+| 实验 | 配置 | ops/EU/cyc |
+|---|---|---|
+| 纯寄存器 outer-product（N 打包） | 4×8 tile, ILP1 | 24.9 |
+| 同上 ILP4 | | 28.8 |
+| SLM 内层循环（`slm_prod`） | TM4 TN8, 标量 a + half2 b | 14.2 |
+| SLM 内层 + half8 宽载 + A 转置（`slm_prod2`） | TM8 TN8 | 17.0 |
+| **真实 `gemm_f16`** | 默认 tile | **8.0** |
+| `gemm_np`（N 打包 + 宽载 + A 转置） | 64,64,32,8,8 | 5.05（更慢） |
+
+- 真实 GEMM 的 `disasm`：每个 k-tile 256 条 `mad :hf`（对应 256 次标量 half FMA），
+  即该布局下编译器**没有**把不同 `(i,j)` 的 FMA 两两打包；但即便如此，FPU 也不是瓶颈。
+- 加大 tile（BM/BN）、换 N 打包、加宽 SLM 载入，都不能把真实 GEMM 拉高到微基准的 17 ——
+  说明瓶颈是**全局/SLM 访存延迟 + 调度/occupied work-group 数**，而非 ALU。
+- `DBUF`（k-tile 双缓冲）实测**负优化**（8.05 → 4.94）：即使把两个 SLM buffer 的索引做成
+  编译期常量，仍变慢，说明问题不是「staging 延迟未被隐藏」。相关代码保留在 `gemm.cl`
+  （`-DDBUF`，默认 0），作为已证伪的实验记录。
+
+> **教训**：这台 iGPU（Iris Xe 80EU，单通道 DDR ~19GB/s）上，盲目追 half2/half8 收益有限；
+> 真正的大头是**数据复用/分块**与**避免朴素 kernel**。
+
+### 6.3 真正的端到端加速点：`conv_general` 占了一半
+
+用逐节点计时（`kernel_run --report` 按节点 tag）定位 yolov8：
+
+| 节点 | ms | 说明 |
+|---|---|---|
+| `conv_general` × 7 | **9.44** | K3S2 G1 的 stride2 层，朴素 kernel（~0.6–0.8 ops/EU/cyc）|
+| `conv3x3` × 12 | 6.42 | s1 主力层 |
+| 其余小算子 | ~2.7 | concat/bias/ew/gemm |
+
+yolo11 里 `conv_general` 更是 12.24/20.41 ms（60%）。**修正**：这些 K=3、groups=1 的层
+之前只把 **stride1** 路由到 `conv3x3_f16`，stride2 全走了朴素 kernel；而 `conv3x3_f16`
+本来就支持 stride。于是：
+
+1. `scripts/onnx2plan.py`：`use_direct = (kh==3 and groups==1 and sh in (1,2))`。
+   - **s2** 用 `cfg=64,8,1,32,8,2`（TX=64,TY=8,**TM=1,CB=32**,CINC=8,s2）：halo 是 s1 的两倍，
+     用 TM=1/CB=32 降输入重读放大（`Cout/CB`），CINC=8 保证 halo 不超 SLM。
+   - **s1** 默认 `Conv3x3Cfg` 从 `TX128 TY8 TM2 CB16 CINC16` 改为 **`TX64 TY8 TM1 CB32 CINC16`**。
+2. 结果（**逐层**）：低通道 s2 层最高 **4.5×**，高通道 s1 层约 **1.9–2×**：
+
+| 层 (Cin→Cout@Hout, s) | 旧 conv_general/默认 | 新 cfg | 加速 |
+|---|---|---|---|
+| 32→64@160 s2 | 1.77 ms | 0.55 ms | 3.2× |
+| 64→128@80 s2 | 1.37 ms | 0.54 ms | 2.6× |
+| 128→256@40 s2 | 1.55 ms | 1.19 ms | 1.3× |
+| 64→128@40 s1 | ~3.3 | 0.67 ms→6.46 ops | ~2× |
+| 128→128@40 s1 | 3.5 ops | 6.44 ops | 1.9× |
+| 256→256@20 s1 | 1.46 ops | 3.02 ops | 2.0× |
+
+### 6.4 修正 `kernel_run` 的耗时统计 bug（重要）
+
+`PlanModel::run()` 每次开头 `tprof_.clear()`，而 `kernel_run` 又把累计值 **除以 iters** →
+「total kernel time」被低估 `iters` 倍（`1/iters` 缩放），`benchmark.md` 的旧数字（如
+yolov8 18.61 ms / 4.74 ops）都是这个 bug 的产物。修正：`run()` 不再清空，改由
+`clearProfile()` 在统计循环前显式清空；`kernel_run` 先跑一次 warmup 再计时。
+修好后数值与 iters 无关（yolov8 恒为 ~27.0 ms）。
+
+**真实结果**（单流、kernel 自身时间之和，warm）：
+
+| 模型 | 旧（修正后）| 新 | 加速 | 新 ops/EU/cyc |
+|---|---|---|---|---|
+| yolov8n-pose | 55.8 ms / 1.58 | **27.0 ms** | **2.07×** | **3.26** |
+| yolo11n-pose | 61.2 ms / 1.16 | **28.6 ms** | **2.14×** | **2.49** |
+| mobilenetv3-small | 6.54 ms / 0.16 | 6.37 ms | 1.03× | 0.17 |
+
+数值检验：`scripts/model_check.py` 三模型全部 **PASS**（相对误差判据不变）。
+mobilenet 几乎没动：它的瓶颈是 576×49×576 这类 1×1 pointwise GEMM（N=HW 只有 49，
+work-group 少、AI 低），换 tile 无效（~1.0 ops/EU/cyc），需要后续专门处理。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
@@ -243,6 +334,20 @@ mobilenet 的 SE/depthwise/5×5）。
 - **带宽测试 OOM**：`kernel_bench --op bandwidth --mb 1024` 分配 2×1 GB buffer + host 1 GB，
   iGPU 共享主存 → 打满 8 GB 机器。已把 `--mb` 上限钳到 256。
 - **所有容器/脚本已加 `--memory=3g --memory-swap=3g`**，容器不可能再拖垮宿主。
+- **整机硬死机（无日志）与 i915 GPU hang**：本开发板（i5-1135G7 + **PREEMPT_RT 内核**
+  `5.15.179-rt84`）历史上有频繁重启（06:20/06:31/06:50/09:40/10:01/10:16…），
+  `kern.log`/`syslog` 中可见 `[drm] GPU HANG ... in kernel_run` 与引擎复位记录；
+  两次「硬死机」在重启前**没有任何 OOM/i915 日志**，属硬锁死而非 OOM（`dmesg` 不可读，
+  但 syslog 无 `oom-kill`）。**排查**：实验内核 `CL_KERNEL_PRIVATE_MEM_SIZE=0`（非寄存器
+  溢出/scratch 打爆内存）。
+  **防护协议（务必遵守）**：
+  1. GPU 实验「短促化」：单个 kernel 目标 < 100 ms，**一条命令只跑一个配置**，
+     之间留间隔；不要在一次命令里循环编译/运行大量配置（IGC JIT 反复编译期间风险最高）。
+  2. 尽量用 `ocloc compile/disasm` **离线**做 ISA 逆向，不需要 GPU。
+  3. 容器 `--memory=2~3g --memory-swap` 限死；`--device=/dev/dri/renderD128` 即可（无需 privileged）。
+  4. 用仓库自带、已验证的 `kernel_bench`/`kernel_run` 跑短时基准，少用临时 standalone 驱动。
+  5. 机器上还有一个第三方 `deploy-docker`（ROS，restart=always 且无内存上限）在
+     段错误-重启循环，与本项目无关，但会持续占用资源。
 
 ## 复现
 

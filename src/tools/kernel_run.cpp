@@ -75,6 +75,8 @@ int main(int argc, char ** argv)
     }
     model.setInput(in.data());
 
+    model.run();  // warmup（构建/预热 cache，不计入统计）
+    model.clearProfile();
     for (int it = 0; it < iters; ++it) model.run();
 
     for (size_t i = 0; i < model.outputCount(); ++i)

@@ -141,11 +141,16 @@ def main():
             c.declare_init(b)
         c.declare(out, oshape)
         groups = c.attr(n, "group", 1)
-        # 3x3 s1 (groups=1) 走调优过的专用 kernel；其余走通用 kernel
-        use_direct = (kh == 3 and sh == 1 and groups == 1)
+        # 3x3 groups=1 走调优过的专用 kernel（含 stride2；s2 用更小的 CINC/TX
+        # 以免输入 halo 超出 SLM）。其余走通用 kernel。
+        use_direct = (kh == 3 and groups == 1 and sh in (1, 2))
         if use_direct:
+            # cfg = TX,TY,TM,CB,CINC（STRIDE/PAD/ACT 由 PlanModel 从节点属性注入）
+            # s2 的输入 halo 是 s1 的两倍：用 TM=1 / CB=32 提高通道复用、降低输入重读
+            # 放大（Cout/CB），CINC=8 保证 halo 不超 SLM。
+            cfg = None if sh == 1 else "64,8,1,32,8,2"
             c.node_line("conv3x3", [x, w, b or "-"], [out], stride=sh, pad=ph,
-                        Hout=oshape[2], Wout=oshape[3], act=(act or None), cfg=None)
+                        Hout=oshape[2], Wout=oshape[3], act=(act or None), cfg=cfg)
             return
         # 1x1 且 groups=1 -> gemm
         if kh == 1 and groups == 1:

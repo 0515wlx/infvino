@@ -15,14 +15,14 @@ namespace gk
 struct Tiles
 {
   // 经 round-1 sweep 选出的默认（见 docs/kernel.md）：大 K/N 与 YOLO 小 shape 折中最佳。
-  int BM = 128, BN = 64, BK = 8, TM = 8, TN = 4, VEC2 = 0, PAD = 0;
+  int BM = 128, BN = 64, BK = 8, TM = 8, TN = 4, VEC2 = 0, PAD = 0, DBUF = 0;
 
   std::string options() const
   {
     std::ostringstream o;
     o << "-DBM=" << BM << " -DBN=" << BN << " -DBK=" << BK
       << " -DTM=" << TM << " -DTN=" << TN
-      << " -DVEC2=" << VEC2 << " -DPAD=" << PAD
+      << " -DVEC2=" << VEC2 << " -DPAD=" << PAD << " -DDBUF=" << DBUF
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -31,7 +31,7 @@ struct Tiles
   {
     std::ostringstream o;
     o << BM << "," << BN << "," << BK << "," << TM << "," << TN
-      << " vec2=" << VEC2 << " pad=" << PAD;
+      << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF;
     return o.str();
   }
 
@@ -54,13 +54,14 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 4) t.TN = v[4];
   if (v.size() > 5) t.VEC2 = v[5];
   if (v.size() > 6) t.PAD = v[6];
+  if (v.size() > 7) t.DBUF = v[7];
   return t;
 }
 
 /** @brief 3x3 直接卷积配置（见 kernels/conv.cl）。 */
 struct Conv3x3Cfg
 {
-  int TX = 128, TY = 8, TM = 2, CB = 16, CINC = 16, STRIDE = 1, PAD = 1, ACT = 0,
+  int TX = 64, TY = 8, TM = 1, CB = 32, CINC = 16, STRIDE = 1, PAD = 1, ACT = 0,
       UNROLL_CI = 3, VECC = 1;
 
   std::string options() const

@@ -47,26 +47,36 @@
 
 ## 2. 性能
 
-### 2.1 kernel 自身时间（`model_check.py --report`，GPU busy，单流）
+### 2.1 kernel 自身时间（`kernel_run --report`，GPU busy，单流，warm）
 
-`ops/EU/cyc` 以 conv+gemm FLOPs 计（EU=80，1.3 GHz；硬件上限讨论见 `docs/kernel.md`）。
+`ops/EU/cyc` 以 conv+gemm FLOPs 计（EU=80，1.3 GHz；硬件 FP16 上限 = **32**，见 `docs/kernel.md`）。
 
-| 模型 | conv+gemm GFLOPs | kernel total (ms) | 等效 fps | ops/EU/cyc | % of 16 |
-|---|---|---|---|---|---|
-| yolov8n-pose | 9.178 | 18.61 | 53.7 | 4.74 | 29.6% |
-| yolo11n-pose | 7.406 | 20.41 | 49.0 | 3.49 | 21.8% |
-| mobilenetv3-small | 0.110 | 2.18 | 459.1 | 0.48 | 3.0% |
+> ⚠️ **统计口径修正（Round 6）**：旧 `kernel_run` 的 “total kernel time” 被 `iters` 整除，
+> 但 `PlanModel::run()` 每轮清空了耗时表 → 实际是把**单轮时间**又除以 `iters`，数值随
+> `iters` 线性变小。已修（`run()` 不再清空，改用 `clearProfile()` + warmup）。
+> 下表旧列为**按 ×iters 还原后的真实值**，与 `docs/kernel.md` Round 5 一致。
+
+| 模型 | conv+gemm GFLOPs | 旧 kernel total (ms) | 旧 ops/EU/cyc | **新 kernel total (ms)** | **新 ops/EU/cyc** | 加速 | % of 32 |
+|---|---|---|---|---|---|---|---|
+| yolov8n-pose | 9.178 | 55.8 | 1.58 | **27.06** | **3.26** | **2.07×** | 10.2% |
+| yolo11n-pose | 7.406 | 61.2 | 1.16 | **28.57** | **2.49** | **2.14×** | 7.8% |
+| mobilenetv3-small | 0.110 | 6.54 | 0.16 | 6.37 | 0.17 | 1.03× | 0.5% |
+
+主要来自：把 K=3、groups=1 的 **stride-2** 层从朴素 `conv_general` 改走调优的
+`conv3x3_f16`，并把 s1 默认 tile 改为 `TX64 TY8 TM1 CB32 CINC16`（详见 `docs/kernel.md` Round 6）。
+三模型数值检验仍全部 PASS。
 
 ### 2.2 整机墙钟（`infvino_bench`，mean，含 launch 开销）
 
 | 模型 | infer (ms) | pipeline (ms) | 说明 |
 |---|---|---|---|
-| yolov8n-pose | ~62.6 | ~67.1 | 非 profiling；kernel busy 仅 ~18.6 ms，其余为 launch/同步开销 |
-| yolo11n-pose | ~69.4 | ~74.1 | |
-| mobilenetv3-small | ~8.4 | ~8.9 | |
+| yolov8n-pose | 33.5 | 38.0 | kernel busy ~27.0 ms，其余 ~6.5 ms 为 launch/同步 |
+| yolo11n-pose | 35.7 | 40.2 | kernel busy ~28.6 ms |
+| mobilenetv3-small | 8.1 | 8.5 | kernel busy ~6.4 ms |
 
-> 注意：非 profiling 模式下整网墙钟由 **kernel launch 开销**主导（GPU busy 时间远低于墙钟）。
-> 这是后续优化重点（算子融合、减少 kernel 数、批处理/持久化 kernel），见 `docs/kernel.md`。
+> 旧墙钟（Round 5）：yolov8 ~62.6 / yolo11 ~69.4 / mobilenet ~8.4 ms。
+> 非 profiling 模式下墙钟仍含可观 **kernel launch 开销**（yolov8：busy 27.0 vs 墙钟 33.5），
+> 这是下一步优化重点（算子融合、减少 kernel 数、批处理/持久化 kernel），见 `docs/kernel.md`。
 
 ## 3. 复现
 
