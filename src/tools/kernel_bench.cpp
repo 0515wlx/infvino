@@ -440,10 +440,15 @@ int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi
 }
 
 // SLM (on-die scratchpad) read bandwidth at a given per-WG allocation.
-int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::string & width)
+int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::string & width,
+               int mode, int nwg)
 {
   std::string ksrc = (width == "v4") ? "slm_bw_v4" : "slm_bw";
   std::string opts = "-DSLM_KB=" + std::to_string(slm_kb) + " -cl-mad-enable";
+  if (width == "conf") {
+    ksrc = "slm_conf";
+    opts += " -DMODE=" + std::to_string(mode);
+  }
   cl_kernel k;
   try { k = rt.buildKernel("micro", ksrc, opts); }
   catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
@@ -451,14 +456,16 @@ int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::str
   const uint it = static_cast<uint>(iters);
   clSetKernelArg(k, 0, sizeof(out), &out);
   clSetKernelArg(k, 1, sizeof(it), &it);
-  const size_t lws = 64, gws = 64 * 64;  // fill the machine: SLM bw scales with active WGs
+  const size_t lws = 64, gws = 64 * static_cast<size_t>(nwg);
   const double med = rt.timeMs(
     [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
-  // bytes read per iteration per work-item: 16 (scalar x4: 4 loads of 4B) or
-  // 16 for the uint4 vector variant; both read 16 bytes per work-item/iter.
-  const double bytes = 16.0 * gws * iters;
-  std::printf("  slmbw %3d KB/WG %-3s %8.3f ms  %7.1f GB/s (SLM read)\n",
-              slm_kb, width.c_str(), med, bytes / (med * 1e-3) / 1e9);
+  // Bytes per work-item per iteration: base kernels do 4 x 4B, conf-mode does
+  // 4B per load; MODE 3/4 read one uint4 = 16B. Count them.
+  double bpw = 16.0;
+  if (width == "conf") bpw = (mode == 3 || mode == 4) ? 16.0 : 4.0;
+  const double bytes = bpw * gws * iters;
+  std::printf("  slmbw %3d KB/WG %-4s mode=%d nwg=%-3d %8.3f ms  %7.1f GB/s (SLM read)\n",
+              slm_kb, width.c_str(), mode, nwg, med, bytes / (med * 1e-3) / 1e9);
   clReleaseMemObject(out);
   clReleaseKernel(k);
   return 0;
@@ -479,7 +486,7 @@ int main(int argc, char ** argv)
   std::string width = "h1";
   int depth = 1;
   std::vector<size_t> sizes_kb;
-  int slm_kb = 16;
+  int slm_kb = 16, mode = 0, nwg = 64;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -523,6 +530,10 @@ int main(int argc, char ** argv)
       for (int v : parseInts(next())) sizes_kb.push_back(static_cast<size_t>(v));
     } else if (a == "--slm-kb") {
       slm_kb = std::atoi(next().c_str());
+    } else if (a == "--mode") {
+      mode = std::atoi(next().c_str());
+    } else if (a == "--nwg") {
+      nwg = std::atoi(next().c_str());
     } else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       return 2;
@@ -571,7 +582,7 @@ int main(int argc, char ** argv)
     rc = benchScanBw(rt, sizes_kb, 2);
   } else if (op == "slmbw") {
     std::printf("[slmbw] SLM read bandwidth\n");
-    rc = benchSlmBw(rt, slm_kb, iters, 2, width);
+    rc = benchSlmBw(rt, slm_kb, iters, 2, width, mode, nwg);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

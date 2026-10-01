@@ -23,6 +23,9 @@ struct Tiles
   int VEC = 4, ASYNC = 0;
   // Round 9: bottleneck probes (diagnostic only).
   int SKIP_STAGE = 0, SKIP_COMPUTE = 0;
+  // Round 11: store the A tile transposed so a thread's TM values are contiguous
+  // and load as half8 (fewer SLM transactions). 0 = row-major A.
+  int AT = 0;
 
   std::string options() const
   {
@@ -32,6 +35,7 @@ struct Tiles
       << " -DVEC2=" << VEC2 << " -DPAD=" << PAD << " -DDBUF=" << DBUF
       << " -DVEC=" << VEC << " -DASYNC=" << ASYNC
       << " -DSKIP_STAGE=" << SKIP_STAGE << " -DSKIP_COMPUTE=" << SKIP_COMPUTE
+      << " -DAT=" << AT
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -42,7 +46,8 @@ struct Tiles
     o << BM << "," << BN << "," << BK << "," << TM << "," << TN
       << " vec2=" << VEC2 << " pad=" << PAD << " dbuf=" << DBUF
       << " vec=" << VEC << " async=" << ASYNC
-      << (SKIP_STAGE ? " skipstage" : "") << (SKIP_COMPUTE ? " skipcompute" : "");
+      << (SKIP_STAGE ? " skipstage" : "") << (SKIP_COMPUTE ? " skipcompute" : "")
+      << " at=" << AT;
     return o.str();
   }
 
@@ -70,6 +75,7 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 9) t.ASYNC = v[9];
   if (v.size() > 10) t.SKIP_STAGE = v[10];
   if (v.size() > 11) t.SKIP_COMPUTE = v[11];
+  if (v.size() > 12) t.AT = v[12];
   return t;
 }
 

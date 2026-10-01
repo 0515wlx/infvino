@@ -229,3 +229,40 @@ __kernel void slm_bw_v4(__global uint *out, const uint iters) {
   }
   out[get_global_id(0)] = a;
 }
+
+// --- Bank-conflict controlled probes ---------------------------------------
+// MODE 0: scalar uint, consecutive (thread t reads word t)   -> conflict-free
+// MODE 1: scalar uint, stride 32 words (all threads same bank) -> 32-way conflict
+// MODE 2: scalar uint, all threads read the same word (broadcast) -> no traffic
+// MODE 3: uint4, thread t reads uint4 t (16B/thread, 4 words/thread)
+// MODE 4: uint4, thread t reads uint4 (t*32) (stride across banks)
+__attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel void slm_conf(__global uint *out, const uint iters) {
+  __local uint buf[SLM_KB * 256];
+  const int tid = get_local_id(0);
+  for (uint i = tid; i < SLM_KB * 256; i += 64) buf[i] = i + 1u;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uint m = SLM_KB * 256;
+  uint acc = 0;
+#if MODE == 0
+  for (uint i = 0; i < iters; ++i) acc += buf[(i * 64 + tid) & (m - 1)];
+#elif MODE == 1
+  for (uint i = 0; i < iters; ++i) acc += buf[((i * 32) + (tid & 31)) & (m - 1)];
+#elif MODE == 2
+  for (uint i = 0; i < iters; ++i) acc += buf[tid & 31];
+#elif MODE == 3
+  __local uint4 *b4 = (__local uint4 *)buf;
+  for (uint i = 0; i < iters; ++i) {
+    uint4 v = b4[(i * 64 + tid) & ((m / 4) - 1)];
+    acc += v.s0 + v.s1 + v.s2 + v.s3;
+  }
+#elif MODE == 4
+  __local uint4 *b4 = (__local uint4 *)buf;
+  for (uint i = 0; i < iters; ++i) {
+    uint4 v = b4[(i * 64 + ((tid * 8) & ((m / 4) - 1))) & ((m / 4) - 1)];
+    acc += v.s0 + v.s1 + v.s2 + v.s3;
+  }
+#endif
+  out[get_global_id(0)] = acc;
+}
+

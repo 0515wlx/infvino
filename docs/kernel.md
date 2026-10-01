@@ -596,6 +596,10 @@ Round 9 确认「DBUF 让 SLM 翻倍 → occupancy 掉 → 流水填不平延迟
 >   减少而腰斩**，软件流水也填不平。
 > - 因此「缓存不够」只能靠**软件流水**缓解；但流水的收益又受 SLM 带宽-occupancy 耦合上限——
 >   两者是同一个约束的两面。
+>
+> ⚠️ **R11 更正**：本节「inner loop 被 SLM 喂给卡住」的推断**已被证伪**（加宽 A 读无效、且
+> SLM 无 bank conflict/占用耦合已被直接测出）。真正的剩余瓶颈是 **occupancy + work-group barrier**，
+> 见 Round 11。
 
 ### 10.4 复现
 
@@ -611,6 +615,74 @@ Round 9 确认「DBUF 让 SLM 翻倍 → occupancy 掉 → 流水填不平延迟
 ./build/kernel_bench --op slmbw  --slm-kb 4 --width v4
 ./build/kernel_bench --op slmbw  --slm-kb 16 --width v4
 ```
+
+## Round 11 —— SLM 带宽到底是 bank conflict 还是 occupancy？+ 三个分块候选实测
+
+Round 10 留下两个问题：(1) SLM 带宽随配额腰斩，是 **bank conflict / miss** 还是 **occupancy**？
+(2) R10.3 提的三个候选（加大 TN、压 SLM 配额、绕开 SLM 喂给）实际怎样？本轮把两个都做了。
+
+### 11.1 SLM 带宽：不是 bank conflict，是 occupancy（证伪）
+
+在 `kernels/micro.cl` 加了**可控访存模式**的探针 `slm_conf`（`-DMODE`）：
+- MODE 0：标量、线程 t 读 word t（**无冲突**）
+- MODE 1：标量、所有线程同 bank（**32 路冲突**）
+- MODE 3：uint4、连续（可能 4 路冲突）
+- MODE 4：uint4、跨 bank 错开
+
+16 KB/WG、nwg=64 实测：
+
+| MODE | 访存 | 带宽 |
+|---|---|---|
+| 0 | 标量无冲突 | 99.8 GB/s |
+| 1 | 标量 **32 路冲突** | **100.0 GB/s** |
+| 3 | uint4 | 298.8 GB/s |
+| 4 | uint4 错开 | 299.8 GB/s |
+
+**无冲突与 32 路冲突完全同带宽**（99.8 vs 100.0）→ 该探针下冲突被完全隐藏，SLM 带宽
+**根本不是 bank conflict 限制**（SLM 也不会 miss）。
+
+再用 `--nwg` 直接扫**并发数**（同一份 MODE 3、16 KB/WG）：
+
+| nwg（活跃 WG） | 带宽 |
+|---|---|
+| 16 | 154.7 GB/s |
+| 64 | 298.8 GB/s |
+| 128 | 300.9 GB/s（饱和）|
+
+→ 带宽随活跃 WG 数上升并饱和。**结论：SLM 带宽低是 occupancy 耦合**——每 WG 占的 SLM 越大，
+能常驻的 WG 越少，聚合带宽越低。16 KB/WG 下机器只能维持 ~64 WG，所以只有 ~300 GB/s；
+4 KB/WG 能塞更多 WG，到 **558 GB/s**。这**坐实了「容量↔带宽↔并发」是同一个物理约束**，
+而不是冲突或 miss。
+
+### 11.2 三个分块候选实测（都不如现状）
+
+基线：`128,64,16,8,4 DBUF=1` @ 4096×512×512 = **11.90 ops/EU/cyc**。
+
+| 候选 | 配置 | 结果 | 结论 |
+|---|---|---|---|
+| **A：加大 TN** | `128,64,16,8,8`（TN8）| **7.13** | 寄存器压力 ↑、occupancy ↓，负 |
+| **B：压 SLM 配额 ≤8KB/WG** | `64,64,16,8,4 DBUF=1`（8 KB/WG）| **11.42** | BM 减半的复用损失 > 带宽收益，略负 |
+| **C：绕开 SLM 喂给（A 转置向量读）** | `AT=1`（`128,64,16,8,4`）| **9.80** | A 的 inner 读从 8 标量→1 half8，但**转置 staging 写**更贵，净负 |
+| C2：A 加 PAD 消冲突 | `PAD=8` | 10.74 | 同样负；印证冲突不是瓶颈 |
+| C3：VEC=2 | `128,64,16,8,4,···,VEC=2` | 10.54 | 负 |
+
+**为什么都不行**：11.1 已证明瓶颈不是「SLM 事务数 / 冲突」，而是 **occupancy 与 barrier 串行**。
+A/B/C 都在动 SLM 的形状或事务数，没动这两个根因，所以最好也只是打平。
+`AT=1` 代码保留（默认 0，已加 `#if AT && PAD #error` 防护），作为**已证伪记录**。
+
+### 11.3 对下一步的判断（纠正 R10.3 的方向）
+
+R10.3 假设「inner loop 被 SLM 喂给卡住」——**本轮证伪**：加宽 A 读（C）无效，说明事务数不是瓶颈。
+真正剩下的两个根因：
+
+1. **occupancy**：`128,64,16 DBUF=1` 用 12 KB/WG，机器装不满 → 需要**更小 SLM 足迹**同时**不牺牲复用**。
+   候选是「A 留在寄存器 + 只 stage B」（A 的复用靠寄存器而非 SLM），但 A 的寄存器量 = TM×BM/LX
+   需仔细设计。
+2. **barrier 串行**：每 k-tile 两道 barrier。真正要的是**子组级同步**（不需要 work-group barrier），
+   把 tile 缩小到 sub-group 能覆盖的程度。
+
+> 这两条都指向「**减少 work-group 级同步 + 把复用在寄存器/sub-group 内做**」，而不是继续折腾 SLM 布局。
+> 下一步优先验证 **sub-group tiling**。
 
 ## 稳定性事故记录（重要）
 

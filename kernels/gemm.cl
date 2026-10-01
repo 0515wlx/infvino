@@ -49,6 +49,17 @@
 #ifndef DBUF
 #define DBUF 1
 #endif
+#ifndef AT
+#define AT 0
+#endif
+#ifndef ASP
+#define ASP (BM + PAD)
+#endif
+// The transposed-A layout (AT=1) indexes rows with stride ASP, so it is only
+// valid without extra padding; the row-major path owns PAD.
+#if AT && PAD
+#error "AT=1 does not support PAD (both are negatives; see docs/kernel.md R11)"
+#endif
 #ifndef SKIP_STAGE
 #define SKIP_STAGE 0
 #endif
@@ -81,21 +92,27 @@ __kernel void gemm_f16(__global const half *restrict A,
   //   DBUF=1 -> 2 A-buffers + 2 B-buffers (double-buffered software pipeline).
   //   DBUF=0 -> 1 A-buffer + 1 B-buffer (classic single-buffer).
   // DBUF=1 doubles SLM/WG, which is why the default BK is 16 (see Round 9).
-#if DBUF
-  __local half As_[2][BM][AR];
-  __local half Bs_[2][BK][BR];
+#if AT
+  __local half As_[DBUF ? 2 : 1][BK][ASP];
 #else
-  __local half As_[1][BM][AR];
-  __local half Bs_[1][BK][BR];
+  __local half As_[DBUF ? 2 : 1][BM][AR];
 #endif
+  __local half Bs_[DBUF ? 2 : 1][BK][BR];
 
 
 // ---- vectorized synchronous staging of the A tile into buffer `pa` ----
 #define STAGE_A(pa, K0)                                                             \
   do {                                                                              \
-    __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;                \
     const int k0_ = (K0);                                                           \
-    if ((K % VEC) == 0) {                                                           \
+    if (AT) {                                                                       \
+      __local half (*AsT)[ASP] = (__local half (*)[ASP])As_ + (pa) * BK;           \
+      for (int idx = tid; idx < BM * BK; idx += NTHR) {                            \
+        int r = idx / BK, c = idx % BK;                                             \
+        int gr = blockRow + r, gc = k0_ + c;                                        \
+        AsT[c][r] = (gr < M && gc < K) ? A[gr * K + gc] : (half)0;                  \
+      }                                                                             \
+    } else if ((K % VEC) == 0) {                                                    \
+      __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;              \
       _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) {  \
         int idx = tid + i * NTHR;                                                   \
         if (idx < BM * AC_PR) {                                                     \
@@ -110,6 +127,7 @@ __kernel void gemm_f16(__global const half *restrict A,
         }                                                                           \
       }                                                                             \
     } else {                                                                        \
+      __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;              \
       _Pragma("unroll") for (int i = 0; i < (BM * BK + NTHR - 1) / NTHR; ++i) {     \
         int idx = tid + i * NTHR;                                                   \
         if (idx < BM * BK) {                                                        \
@@ -203,14 +221,32 @@ __kernel void gemm_f16(__global const half *restrict A,
 #pragma unroll
     for (int j = 0; j < TN; ++j) acc[i][j] = (half)(0);
 
-#define COMPUTE_TILE(pa, pb)                                                        \
+#if AT
+// A is stored transposed AsT[BK][ASP]; the TM values for a thread are contiguous,
+// so they come back as one or more vector loads instead of TM scalar loads.
+#define LOAD_A(aptr, kk, pa)                                                            \
+  do {                                                                              \
+    __local half (*AsT)[ASP] = (__local half (*)[ASP])As_ + (pa) * BK;             \
+    _Pragma("unroll") for (int v = 0; v < TM / 8; ++v)                              \
+      *(half8 *)(&aptr[v * 8]) = *(__local half8 *)&AsT[kk][ly * TM + v * 8];       \
+    _Pragma("unroll") for (int v = (TM / 8) * 8; v < TM; ++v)                       \
+      aptr[v] = AsT[kk][ly * TM + v];                                               \
+  } while (0)
+#else
+#define LOAD_A(aptr, kk, pa)                                                            \
   do {                                                                              \
     __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;                 \
+    _Pragma("unroll") for (int i = 0; i < TM; ++i) aptr[i] = As[ly * TM + i][kk];   \
+  } while (0)
+#endif
+
+#define COMPUTE_TILE(pa, pb)                                                        \
+  do {                                                                              \
     __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     _Pragma("unroll") for (int kk = 0; kk < BK; ++kk) {                            \
       half a[TM];                                                                   \
       half b[TN];                                                                   \
-      _Pragma("unroll") for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];    \
+      LOAD_A(a, kk, pa);                                                                \
       _Pragma("unroll") for (int v = 0; v < TN / VEC; ++v)                          \
         *((half4 *)&b[v * VEC]) = *(__local half4 *)&Bs[kk][lx * TN + v * VEC];     \
       _Pragma("unroll") for (int i = 0; i < TM; ++i)                               \
@@ -277,4 +313,5 @@ __kernel void gemm_f16(__global const half *restrict A,
 #undef STAGE_B
 #undef STAGE_ASYNC
 #undef COMPUTE_TILE
+#undef LOAD_A
 }
