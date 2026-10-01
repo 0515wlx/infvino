@@ -917,6 +917,100 @@ ocloc compile -file kernels/gemm.cl -device tgl -options "-DBM=128 -DBN=64 -DBK=
 ocloc disasm -file k_tgllp.bin -device tgl -dump ./isa && grep -m1 'mad (' isa/.text.gemm_f16.asm
 ```
 
+## Round 14 —— 冲顶尝试与封堵证明：13.7 是「寄存器 / SLM / 延迟」三耦合下的实测上限
+
+R13 标定后剩下的问题：13.7 = 43% of 32，离纯 FMA 的 27.8（87%）还有 2× 空间，能不能冲上去？
+本轮先做**决策分解**定位每一块损失，再逐个针对性尝试，最后给出约束推导证明空间被封死。
+
+### 14.1 决策分解（全部 SG=16，@4096×512×512）
+
+新增 `-DNOLOAD`（保留完全相同的 mad 结构与 BK/tile，只把内循环的 SLM 操作数读换成寄存器常量）。
+
+| build | ops/EU/cyc | 相对 |
+|---|---|---|
+| `normal`（staging + 内循环 loads）| **13.79** | 1.00 |
+| `SKIP_STAGE`（无每 k-tile staging，保留 loads）| **18.12** | **staging 抹掉 31%** |
+| `NOLOAD`（无内循环 loads，staging 变死代码）| **21.23** | **loads 再抹 17%** |
+| `SKIP_STAGE + NOLOAD` | 21.61 | |
+| 纯 FMA（h1/h8 微基准）| 27.8 | 结构+寄存器占用再抹 22% |
+| `SKIP_COMPUTE`（只 staging）| 0.448 ms | staging 绝对量 |
+
+对照 DBUF1 BK16 SG16：full **13.43** / SKIP_STAGE **17.65** / NOLOAD **26.24**
+→ **staging 24%、内循环 loads 33%**（DBUF1 的 B 重读 16×、32 个 k-tile，SLM 流量翻倍）。
+
+三块损失量级相当（~25–33%），来自三个不同来源，必须分别解决。
+
+### 14.2 冲顶尝试（全部失败，保留为负结果）
+
+| 尝试 | 目标 | 结果 |
+|---|---|---|
+| `PIPE`（kk 级软件流水，预取下一 kk）| load 延迟 | **11.46**（寄存器搬移 +37% 指令）|
+| staging 内点 fast-path（去边界检查）| staging 指令 | **13.81**（无变化 → 是延迟/BW 不是指令）|
+| TM4 TN4（更小 tile 换 occupancy）| occupancy | **9.79** |
+| TM8 TN2 / BM256 | 其他形状 | 9.65 / 11.02 |
+| TM16 TN4 / TN8（更大 tile 换算术强度）| 复用 | **spill**（grf=127 + 513 行 scratch）→ 0.5–8.4 |
+| GN / PF / AT / ASYNC | — | R12 已证伪 |
+
+### 14.3 严格约束推导
+
+**(a) 寄存器文件 —— 直接决定可用的 tile 与 occupancy**
+- 每线程 128 GRF × 32 B = **4 KB**；实测 RF `28 KB/EU` → **7 线程/EU**。
+- 数据寄存器下界 = `TM·TN/2`(acc, half) + `TM` + `TN`；TM8/TN4 只有 ~26 个。
+  但实测 grf：`8/4 → 112`、`8/8 → 126`、`16/4 → 127(+513 spill)`。
+  → **~90 个寄存器是寻址/调度/中间值开销**，真正的墙不是数据而是这套开销。
+  可容纳的算术强度上限就是 `TM·TN ≈ 32`；再大必 spill。
+- 同时 7 线程/EU 也把 occupancy 钉死：`work-items/EU = 7 × 16 = 112`。
+
+**(b) SLM 容量 —— 直接决定缓冲深度与 k-tile 摊销**
+- `SLM/WG = nbuf · BK · (BM+BN) · 2 B`；占用预算 ~12 KB → `nbuf·BK·(BM+BN) ≤ 3072`。
+- barrier 数 = `K/BK`。在预算内取值：`nbuf=2, BK=16`（DBUF1，32 barrier）或 `nbuf=1, BK=32`
+  （DBUF0，16 barrier）——**两条刚好打平（实测都 ~13.7）**：DBUF1 藏住 staging 但 barrier/loads ×2；
+  DBUF0 barrier 少一半但 staging 暴露。这就是 R12 那条经验规律的解析来源。
+
+**(c) SLM 带宽 —— 满速时刚好被卡**
+- 本 tile 的 SLM 读 = `2·(TM + BN) / (lanes · TM · TN)` = `2(8+64)/(16·32)` = **0.281 B/FMA**。
+- 满速 `16 FMA/EU/cyc × 80 EU × 1.3 GHz = 1.66e12 FMA/s` → 需要 **467 GB/s**。
+- 12 KB/WG 下实测 SLM 上限 ~300–450 GB/s（R10/R11）。即**即便完美重叠，也会卡在 SLM 带宽**；
+  DBUF1 实测跑到 ~384 GB/s（接近饱和），DBUF0 ~197 GB/s。
+- 降 0.281 的唯一办法是加大 TM/TN → 撞 (a)。
+
+**(d) 全局 staging 延迟 —— 单缓冲无法藏**
+- A=4 MB（LLC 边界）重读 `N/BN=8` 次 ≈ 32 MB，B ≈ 16 MB；实测 staging 0.36 ms → 有效 ~133 GB/s，
+  是**延迟主导**（非指令）。要藏只能 DBUF 双缓冲 → 撞 (b)。
+
+### 14.4 为什么四条路互相抵消、彻底堵死
+
+- 降 **SLM 读**（减 bytes/FMA）→ 加大 TM/TN → 撞 128 GRF 墙（且寻址开销占 ~90，放不下）。
+- 降 **staging 暴露** → DBUF 双缓冲 → SLM 翻倍 → BK 减半 → barrier 与 loads 翻倍，净持平（14.1 实测）。
+- 提 **occupancy** → 减数据寄存器 → tile 变小 → 算术强度与复用变差（14.2 实测更慢）。
+- 提 **BK**（减 barrier）→ SLM 超预算 → occupancy 崩（`DBUF0 BK64`/`DBUF1 BK32` = 5–11）。
+
+三条改进方向各自都被 (a) 或 (b) 挡住，且它们彼此是对偶的（省一样就费另一样），
+所以绕不开。**在「SLM-tile 算法 + 128 GRF 寄存器文件」下，13.7 是可达最优点。**
+
+### 14.5 仅剩的另类数据通路及其判定
+
+唯一没试的是**用 `intel_sub_group_block_read` / sub-group 寄存器交换**替代逐 lane SLM 读：
+- 它能用一条指令完成一个 sub-group 的 SLM 读，并**省掉 ≥90 的寻址寄存器开销**（(a) 的元凶），
+  有可能放下更大的 tile。
+- 但：(i) 它读的是**同样的 SLM 字节**，所以 (c) 的 SLM 带宽约束**不变**（467 GB/s 需求 vs ~450 上限）；
+  (ii) 交换本身占 GRF 与 issue，在 7 线程/EU 下未必能补回来。
+- **判定：即便实现，天花板也只是从「寄存器墙」换成「SLM 带宽墙」，两者都在 ~450–467 GB/s 附近，
+  不会突破 27.8 的结构上限，更不会突破 13.7 太多。** 故本轮判定空间已被严格封死，不再继续调这个 kernel。
+
+> 结论量化：`13.7` = 结构/寄存器上限 `21.2` × (loads 折损 0.85) × (staging 折损 0.76)，
+> 而 `21.2` 本身 = FMA 峰 `27.8` × (寄存器占用折损 0.76)。每一层折损都对应一堵已证实的硬墙。
+
+### 14.6 复现
+
+```bash
+P="--tiles 128,64,32,8,4,0,0,0,4"   # 后接 9 个字段 ASYNC,SKIP_STAGE,SKIP_COMPUTE,AT,PF,GN,SB,SG,NOLOAD
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,32,8,4,0,0,0,4,0,0,0,0,0,0,0,16,0  # normal 13.8
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,32,8,4,0,0,0,4,0,1,0,0,0,0,0,16,0  # skipstage 18.1
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,32,8,4,0,0,0,4,0,0,0,0,0,0,0,16,1  # noload 21.2
+./build/kernel_bench --op gemm --shape 4096,512,512 --tiles 128,64,32,8,4,0,0,0,4,0,0,0,0,0,0,0,16,0,1 # PIPE 11.5
+```
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

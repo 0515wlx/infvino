@@ -91,6 +91,12 @@
 #ifndef SKIP_BARRIER
 #define SKIP_BARRIER 0
 #endif
+// Round 14: keep the exact mad structure but replace the per-kk SLM operand
+// loads with register constants (diagnostic: isolates the feed from the
+// occupancy/issue structure).
+#ifndef NOLOAD
+#define NOLOAD 0
+#endif
 // Force the compiler to keep SIMD16 (diagnostic probe for the SIMD8 cliff).
 #ifndef SG
 #define SG 0
@@ -164,16 +170,27 @@ __kernel void gemm_f16(__global const half *restrict A,
       }                                                                             \
     } else if ((K % VEC) == 0) {                                                    \
       __local half (*As)[AR] = (__local half (*)[AR])As_ + (pa) * BM;              \
-      _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) {  \
-        int idx = tid + i * NTHR;                                                   \
-        if (idx < BM * AC_PR) {                                                     \
-          int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                             \
-          int gr = blockRow + r, gc = k0_ + c;                                      \
-          if (gr < M && gc + VEC <= K) {                                            \
-            *(__local half4 *)&As[r][c] = *(__global const half4 *)&A[gr * K + gc]; \
-          } else {                                                                  \
-            _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
-              As[r][c + v] = (gr < M && gc + v < K) ? A[gr * K + gc + v] : (half)0; \
+      if ((blockRow + BM <= M) && (k0_ + BK <= K)) {                               \
+        _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) { \
+          int idx = tid + i * NTHR;                                                 \
+          if (idx < BM * AC_PR) {                                                   \
+            int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                           \
+            *(__local half4 *)&As[r][c] =                                           \
+              *(__global const half4 *)&A[(blockRow + r) * K + k0_ + c];            \
+          }                                                                         \
+        }                                                                           \
+      } else {                                                                      \
+        _Pragma("unroll") for (int i = 0; i < (BM * AC_PR + NTHR - 1) / NTHR; ++i) { \
+          int idx = tid + i * NTHR;                                                 \
+          if (idx < BM * AC_PR) {                                                   \
+            int r = idx / AC_PR, c = (idx % AC_PR) * VEC;                           \
+            int gr = blockRow + r, gc = k0_ + c;                                    \
+            if (gr < M && gc + VEC <= K) {                                          \
+              *(__local half4 *)&As[r][c] = *(__global const half4 *)&A[gr * K + gc]; \
+            } else {                                                                \
+              _Pragma("unroll") for (int v = 0; v < VEC; ++v)                       \
+                As[r][c + v] = (gr < M && gc + v < K) ? A[gr * K + gc + v] : (half)0; \
+            }                                                                       \
           }                                                                         \
         }                                                                           \
       }                                                                             \
@@ -196,16 +213,27 @@ __kernel void gemm_f16(__global const half *restrict A,
     __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     const int k0_ = (K0);                                                           \
     if ((N % VEC) == 0) {                                                           \
-      _Pragma("unroll") for (int i = 0; i < (BK * BC_PR + NTHR - 1) / NTHR; ++i) {  \
-        int idx = tid + i * NTHR;                                                   \
-        if (idx < BK * BC_PR) {                                                     \
-          int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                             \
-          int gr = k0_ + r, gc = blockCol + c;                                      \
-          if (gr < K && gc + VEC <= N) {                                            \
-            *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&B[gr * N + gc]; \
-          } else {                                                                  \
-            _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
-              Bs[r][c + v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0; \
+      if ((blockCol + BN <= N) && (k0_ + BK <= K)) {                                \
+        _Pragma("unroll") for (int i = 0; i < (BK * BC_PR + NTHR - 1) / NTHR; ++i) { \
+          int idx = tid + i * NTHR;                                                 \
+          if (idx < BK * BC_PR) {                                                   \
+            int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                           \
+            *(__local half4 *)&Bs[r][c] =                                           \
+              *(__global const half4 *)&B[(k0_ + r) * N + blockCol + c];            \
+          }                                                                         \
+        }                                                                           \
+      } else {                                                                      \
+        _Pragma("unroll") for (int i = 0; i < (BK * BC_PR + NTHR - 1) / NTHR; ++i) { \
+          int idx = tid + i * NTHR;                                                 \
+          if (idx < BK * BC_PR) {                                                   \
+            int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                           \
+            int gr = k0_ + r, gc = blockCol + c;                                    \
+            if (gr < K && gc + VEC <= N) {                                          \
+              *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&B[gr * N + gc]; \
+            } else {                                                                \
+              _Pragma("unroll") for (int v = 0; v < VEC; ++v)                       \
+                Bs[r][c + v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0; \
+            }                                                                       \
           }                                                                         \
         }                                                                           \
       }                                                                             \
@@ -361,20 +389,55 @@ __kernel void gemm_f16(__global const half *restrict A,
   } while (0)
 #endif
 
+// Round 14: explicit kk-level software pipeline -- prefetch the next kk's A/B
+// operands while the current kk's mads run. Tries to hide the SLM load latency
+// that NOLOAD shows costs ~35%.
+#ifndef PIPE
+#define PIPE 0
+#endif
+
+#if PIPE
+#define LOAD_B(bptr, kk, pb)                                                        \
+  do {                                                                              \
+    __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
+    _Pragma("unroll") for (int v = 0; v < TN / VEC; ++v)                            \
+      *((half4 *)&bptr[v * VEC]) = *(__local half4 *)&Bs[kk][lx * TN + v * VEC];    \
+  } while (0)
+
+#define COMPUTE_TILE(pa, pb)                                                        \
+  do {                                                                              \
+    half a[TM], b[TN], an[TM], bn[TN];                                              \
+    LOAD_A(a, 0, pa);                                                               \
+    LOAD_B(b, 0, pb);                                                               \
+    _Pragma("unroll") for (int kk = 0; kk < BK; ++kk) {                            \
+      if (kk + 1 < BK) { LOAD_A(an, kk + 1, pa); LOAD_B(bn, kk + 1, pb); }          \
+      _Pragma("unroll") for (int i = 0; i < TM; ++i)                               \
+        _Pragma("unroll") for (int j = 0; j < TN; ++j)                             \
+          acc[i][j] = mad(a[i], b[j], acc[i][j]);                                   \
+      _Pragma("unroll") for (int i = 0; i < TM; ++i) a[i] = an[i];                 \
+      _Pragma("unroll") for (int j = 0; j < TN; ++j) b[j] = bn[j];                 \
+    }                                                                               \
+  } while (0)
+#else
 #define COMPUTE_TILE(pa, pb)                                                        \
   do {                                                                              \
     __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     _Pragma("unroll") for (int kk = 0; kk < BK; ++kk) {                            \
       half a[TM];                                                                   \
       half b[TN];                                                                   \
-      LOAD_A(a, kk, pa);                                                                \
-      _Pragma("unroll") for (int v = 0; v < TN / VEC; ++v)                          \
-        *((half4 *)&b[v * VEC]) = *(__local half4 *)&Bs[kk][lx * TN + v * VEC];     \
+      _Pragma("unroll") for (int i = 0; i < TM; ++i) a[i] = (half)(lx + i);         \
+      _Pragma("unroll") for (int j = 0; j < TN; ++j) b[j] = (half)(ly + j);         \
+      if (!(NOLOAD)) {                                                              \
+        LOAD_A(a, kk, pa);                                                          \
+        _Pragma("unroll") for (int v = 0; v < TN / VEC; ++v)                        \
+          *((half4 *)&b[v * VEC]) = *(__local half4 *)&Bs[kk][lx * TN + v * VEC];   \
+      }                                                                             \
       _Pragma("unroll") for (int i = 0; i < TM; ++i)                               \
         _Pragma("unroll") for (int j = 0; j < TN; ++j)                             \
           acc[i][j] = mad(a[i], b[j], acc[i][j]);                                   \
     }                                                                               \
   } while (0)
+#endif
 
   const int kTiles = (K + BK - 1) / BK;
 #if SKIP_STAGE && !GN
@@ -487,5 +550,8 @@ __kernel void gemm_f16(__global const half *restrict A,
 #if PF
 #undef PREFETCH
 #undef STORE_PREFETCH
+#endif
+#if PIPE
+#undef LOAD_B
 #endif
 }

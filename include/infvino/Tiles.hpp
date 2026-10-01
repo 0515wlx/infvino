@@ -40,6 +40,11 @@ struct Tiles
   // silently drops the *full* kernel to SIMD8 under staging register pressure.
   // 16 is the measured sweet spot on Xe-LP (32 spills, 8 starves the FPU).
   int SG = 16;
+  // Round 14: diagnostic — keep the mad structure but drop the per-kk SLM
+  // operand loads (register constants instead), to isolate the feed cost.
+  int NOLOAD = 0;
+  // Round 14: kk-level software pipeline (prefetch next kk's A/B during mads).
+  int PIPE = 0;
 
   std::string options() const
   {
@@ -50,7 +55,8 @@ struct Tiles
       << " -DVEC=" << VEC << " -DASYNC=" << ASYNC
       << " -DSKIP_STAGE=" << SKIP_STAGE << " -DSKIP_COMPUTE=" << SKIP_COMPUTE
       << " -DAT=" << AT << " -DPF=" << PF << " -DGN=" << GN
-      << " -DSKIP_BARRIER=" << SB << " -DSG=" << SG
+      << " -DSKIP_BARRIER=" << SB << " -DSG=" << SG << " -DNOLOAD=" << NOLOAD
+      << " -DPIPE=" << PIPE
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -95,6 +101,8 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 14) t.GN = v[14];
   if (v.size() > 15) t.SB = v[15];
   if (v.size() > 16) t.SG = v[16];
+  if (v.size() > 17) t.NOLOAD = v[17];
+  if (v.size() > 18) t.PIPE = v[18];
   return t;
 }
 
