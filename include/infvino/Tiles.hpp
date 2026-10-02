@@ -111,13 +111,17 @@ struct Conv3x3Cfg
 {
   int TX = 64, TY = 8, TM = 1, CB = 32, CINC = 16, STRIDE = 1, PAD = 1, ACT = 0,
       UNROLL_CI = 3, VECC = 1;
+  // Round 16: register-tiled kernel (conv3x3_rt): TN channels per thread.
+  int TN = 8;
+  int RT = 0;
   // Round 15: SIMD width override (0 = IGC decides; 16 avoids the SIMD8 cliff).
   int SG = 0;
 
   std::string options() const
   {
     std::ostringstream o;
-    o << "-DTX=" << TX << " -DTY=" << TY << " -DTM=" << TM << " -DCB=" << CB
+    o << "-DTX=" << TX << " -DTY=" << TY << " -DTM=" << TM << " -DTN=" << TN
+      << " -DCB=" << CB
       << " -DCINC=" << CINC << " -DSTRIDE=" << STRIDE
       << " -DPAD=" << PAD << " -DACT=" << ACT << " -DUNROLL_CI=" << UNROLL_CI
       << " -DVECC=" << VECC << " -DSG=" << SG
@@ -127,9 +131,9 @@ struct Conv3x3Cfg
   std::string label() const
   {
     std::ostringstream o;
-    o << "TX" << TX << " TY" << TY << " TM" << TM << " CB" << CB
+    o << "TX" << TX << " TY" << TY << " TM" << TM << " TN" << TN << " CB" << CB
       << " CINC" << CINC << " s" << STRIDE << " act" << ACT << " u" << UNROLL_CI
-      << " v" << VECC << " sg" << SG;
+      << " v" << VECC << " sg" << SG << (RT ? " rt" : "");
     return o.str();
   }
 };
@@ -153,6 +157,8 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 8) c.UNROLL_CI = v[8];
   if (v.size() > 9) c.VECC = v[9];
   if (v.size() > 10) c.SG = v[10];
+  if (v.size() > 11) c.TN = v[11];
+  if (v.size() > 12) c.RT = v[12];
   return c;
 }
 

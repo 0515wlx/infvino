@@ -1081,6 +1081,78 @@ cfg.TY = 8;                        // CB/CINC/UNROLL_CI 沿用原值
 ./build/kernel_run --plan models/yolov8n-pose/model.plan --report --iters 5
 ```
 
+## Round 16 —— 算法层（二）：寄存器分块 3×3（负结果）与原生 depthwise
+
+R15 拿下了 conv3×3 的 tile 匹配（端到端 −15%），并指出它仍卡在「TM=1 → 权重加载 : mad = 1:1」。
+本轮按这个方向做两件事：(1) 写寄存器分块版 3×3 `conv3x3_rt`（每线程 TM×TN，权重被 TM 次复用），
+(2) 用原生 depthwise 替换朴素 `conv_general`。
+
+### 16.1 寄存器分块 3×3 `conv3x3_rt`：更慢（负结果）
+
+新 kernel：线程算 TM 列 × TN 通道（工作组的通道按 CB/TN 分给不同 ly），权重向量一次加载服务
+TM 次 mad。实测（`--op conv3x3rt`，ops/EU/cyc）：
+
+| 配置 | 64→64 80×80 | 128→128 40×40 | 256→256 20×20 |
+|---|---|---|---|
+| 旧 kernel（R15 最优 TX40,TY8,TM1）| **9.86** | **8.35** | 6.02 |
+| RT TM4 TN8 CB32 | 7.20 | 7.04 | 3.10 |
+| RT TM4 TN8 TX40 | 8.12 | 7.81 | 3.17 |
+| RT TM4 TN16 | 7.20 | 6.89 | 2.51 |
+| RT TM8 TN4 | 5.43 | 5.47 | 2.50 |
+
+**RT 全面更慢**。反汇编：RT 已是 SIMD16（868 mad），但 **grf=127**（旧 kernel 112）——多出来的
+`w[8]`/`strip[]` 存活值把寄存器顶到墙，occupancy 掉下来，省下的权重加载指令被吃掉。
+结论（与 R14 同源）：**原 `TM=1` 设计其实是对的**——权重是 sub-group 内广播（每次加载很便宜），
+strip 被 CB=32 个通道复用，真正的限制不是指令数而是 128 GRF。`conv3x3_rt` 保留为负结果（默认不走）。
+
+### 16.2 原生 depthwise（替换 `conv_general`）
+
+mobilevert 的 3×3/5×5 depthwise、yolo11 的 grouped conv 原本都走 `conv_general`：**每线程一个
+输出像素、fp32 累加、K/S/ACT 全是运行时参数**（反汇编显示编译器把 silu/hardswish/relu/hardsigmoid
+**四条激活路径全编译**，32 条 `math.exp`）。
+
+新 `depthwise_f16`（`conv_general.cl`）：
+- 1 work-item = 1 输出，**1D grid 完全 coalesced**；
+- **K/S/P/ACT 编译期特化**（每节点一个 options，按 `source|options` 缓存），tap 循环全展开、
+  只发射一条激活；
+- fp16 累加。
+
+实测（`kernel_run --report`，5 iters）：
+
+| | `conv_general` | **`depthwise`** |
+|---|---|---|
+| mobilenetv3-small | 0.510 ms ×11 | **0.504 ms** ×11 |
+| yolo11n-pose | 0.831 ms ×7 | **0.762 ms** ×7（−8%）|
+
+（先试过一版沿 W 向量化 `vload8` 的 depthwise，反而慢 2–3×：窄 W 下 sub-group 跨行 → 不 coalesced，
+且边界谓词爆炸；已改成上面的 coalesced 标量版。）
+
+### 16.3 端到端
+
+| 模型 | R14 | R15 | **R16** |
+|---|---|---|---|
+| yolov8n-pose | 26.16 | 22.17 | **22.23 ms** |
+| yolo11n-pose | 27.30 | 24.89 | **24.74 ms** |
+| mobilenetv3-small | 6.29 | 6.36 | **6.29 ms** |
+
+`numerical_check.py` 三模型 **ALL PASS**。
+
+### 16.4 结论
+
+- conv3×3 和 depthwise 都已到**局部最优**：三堵墙（128 GRF 寄存器大小 / SLM 容量 / 延迟）里，
+  conv 主要撞的是**寄存器大小**（放不下能复用权重的大寄存器 tile）。
+- 本轮确定收益来自 R15 的 tile 匹配；R16 的 depthwise 是边际改善（yolo11 −8%、mobilenet 持平），
+  寄存器分块 3×3 明确为负。
+- 若要把 conv 再往上推，只能换**不靠大 GRF tile 的数据通路**（sub-group block-read / 寄存器交换），
+  但那和 R14 的结论一样：会把「寄存器墙」换成「SLM 带宽墙」，天花板一致。
+
+### 16.5 复现
+
+```bash
+./build/kernel_bench --op conv3x3rt --conv-shape 64,64,80,80 --conv 40,8,4,32,16,1,1,0,3,1,16,8,1
+./build/kernel_run --plan models/mobilenetv3-small/model.plan --report --iters 5
+```
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

@@ -151,7 +151,7 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
   cl_kernel k;
   try {
-    k = rt.buildKernel("conv", "conv3x3_f16", c.options());
+    k = rt.buildKernel("conv", c.RT ? "conv3x3_rt" : "conv3x3_f16", c.options());
   } catch (const std::exception & e) {
     std::fprintf(stderr, "[build-fail] %s\n", e.what());
     return 1;
@@ -184,7 +184,9 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   clSetKernelArg(k, 8, sizeof(ho), &ho);
   clSetKernelArg(k, 9, sizeof(wo), &wo);
 
-  const size_t lws[3] = {static_cast<size_t>(c.TX / c.TM), static_cast<size_t>(c.TY), 1};
+  const size_t lyThreads = c.RT ? static_cast<size_t>(c.TY) * (c.CB / c.TN)
+                                : static_cast<size_t>(c.TY);
+  const size_t lws[3] = {static_cast<size_t>(c.TX / c.TM), lyThreads, 1};
   const size_t gws[3] = {
     static_cast<size_t>((Wout + c.TX - 1) / c.TX) * lws[0],
     static_cast<size_t>((Hout + c.TY - 1) / c.TY) * lws[1],
@@ -586,8 +588,9 @@ int main(int argc, char ** argv)
       Shape g{s.Cout, s.H * s.W, s.Cin, "conv1x1"};
       rc |= benchGemm(rt, tiles, g, iters, verify);
     }
-  } else if (op == "conv3x3") {
-    std::printf("[conv3x3] %s\n", conv.label().c_str());
+  } else if (op == "conv3x3" || op == "conv3x3rt") {
+    if (op == "conv3x3rt") conv.RT = 1;
+    std::printf("[%s] %s\n", op.c_str(), conv.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "p3-3x3"}, {64, 64, 40, 40, "p4-3x3"}};
     for (const auto & s : conv_shapes) rc |= benchConv(rt, conv, s, iters, verify);
   } else if (op == "bandwidth") {

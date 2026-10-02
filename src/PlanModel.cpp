@@ -271,6 +271,27 @@ void PlanModel::run()
       int Cout = static_cast<int>(out.dims[out.dims.size() >= 3 ? out.dims.size() - 3 : 0]);
       cl_mem dx = in(0).mem, dw = in(1).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
+      // Round 16: native depthwise (groups == Cin) -> vectorised kernel.
+      if (G == Cin && (K == 3 || K == 5) && Cin == Cout) {
+        char dopts[128];
+        std::snprintf(dopts, sizeof(dopts),
+                      "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d "
+                      "-cl-mad-enable -cl-fast-relaxed-math", K, S, P, act);
+        cl_kernel kd = rt_.buildKernel("conv_general", "depthwise_f16", dopts);
+        int ho = Hout, wo = Wout;
+        clSetKernelArg(kd, 0, sizeof(dx), &dx);
+        clSetKernelArg(kd, 1, sizeof(dw), &dw);
+        clSetKernelArg(kd, 2, sizeof(db), &db);
+        clSetKernelArg(kd, 3, sizeof(dy), &dy);
+        clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kd, 5, sizeof(H), &H);
+        clSetKernelArg(kd, 6, sizeof(W), &W);
+        clSetKernelArg(kd, 7, sizeof(ho), &ho);
+        clSetKernelArg(kd, 8, sizeof(wo), &wo);
+        const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
+        timed("depthwise", kd, 1, gdw, nullptr);
+        clReleaseKernel(kd);
+      } else {
       clSetKernelArg(kConvG_, 0, sizeof(dx), &dx);
       clSetKernelArg(kConvG_, 1, sizeof(dw), &dw);
       clSetKernelArg(kConvG_, 2, sizeof(db), &db);
@@ -290,6 +311,7 @@ void PlanModel::run()
       clSetKernelArg(kConvG_, 14, sizeof(aa), &aa);
       const size_t g = static_cast<size_t>(Cout) * ho * wo;
       timed("conv_general", kConvG_, 1, &g, nullptr);
+      }
     }
     else if (n.op == "conv3x3")
     {

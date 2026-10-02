@@ -208,3 +208,121 @@ __kernel void conv3x3_f16(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Round 16: register-tiled direct conv. Each thread computes TM output columns
+// x TN output channels, so a loaded weight vector is reused across TM columns
+// (the old kernel had TM=1 -> 1:1 weight-load:FMA). Threads inside a work-group
+// split the CB channels into CB/TN groups (RTLY = TY * CB/TN).
+//   Work-item (lx,ly): ly -> row = ly/(CB/TN), channel group cg = ly%(CB/TN).
+// Knobs: TX TY TM TN CB CINC STRIDE PAD ACT UNROLL_CI SG
+// ---------------------------------------------------------------------------
+#ifndef TN
+#define TN 8
+#endif
+#define RTCGPW (CB / TN)
+#define RTLX (TX / TM)
+#define RTLY (TY * RTCGPW)
+#define RTT (RTLX * RTLY)
+#define RTSTRIP ((TM - 1) * STRIDE + KW)
+
+#if SG
+__attribute__((intel_reqd_sub_group_size(SG)))
+#endif
+__attribute__((reqd_work_group_size(RTLX, RTLY, 1)))
+__kernel void conv3x3_rt(
+  __global const half *restrict X,
+  __global const half *restrict Wt,
+  __global const half *restrict Bias,
+  __global half *restrict Y,
+  const int Cin, const int H, const int W,
+  const int Cout, const int Hout, const int Wout) {
+  const int lx = get_local_id(0);
+  const int ly = get_local_id(1);
+  const int tid = ly * RTLX + lx;
+  const int gx = get_group_id(0);
+  const int gy = get_group_id(1);
+  const int gz = get_group_id(2);
+
+  __local half Xs[CINC][IN_ROWS][IN_COLS];
+  __local half Ws[CINC][KHKW][CB];
+
+  const int x0 = gx * TX * STRIDE - PAD;
+  const int y0 = gy * TY * STRIDE - PAD;
+  const int out_c0 = gz * CB;
+  const int row = ly / RTCGPW;
+  const int cg = ly % RTCGPW;
+
+  half acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int t = 0; t < TN; ++t) acc[i][t] = (half)0;
+
+  const int cchunks = (Cin + CINC - 1) / CINC;
+  for (int cc = 0; cc < cchunks; ++cc) {
+    const int cbase = cc * CINC;
+    for (int idx = tid; idx < CINC * IN_ROWS * IN_COLS; idx += RTT) {
+      int ci = idx / (IN_ROWS * IN_COLS);
+      int rem = idx % (IN_ROWS * IN_COLS);
+      int r = rem / IN_COLS, c = rem % IN_COLS;
+      int gc = cbase + ci;
+      int yy = y0 + r, xx = x0 + c;
+      half v = (half)0;
+      if (gc < Cin && yy >= 0 && yy < H && xx >= 0 && xx < W)
+        v = X[((size_t)gc * H + yy) * W + xx];
+      Xs[ci][r][c] = v;
+    }
+    for (int idx = tid; idx < CB * CINC * KHKW; idx += RTT) {
+      int t = idx % CB;
+      int rem = idx / CB;
+      int ci = rem / KHKW;
+      int kk = rem % KHKW;
+      int gout = out_c0 + t;
+      int gc = cbase + ci;
+      half v = (half)0;
+      if (gout < Cout && gc < Cin) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
+      Ws[ci][kk][t] = v;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+#pragma unroll UNROLL_CI
+    for (int ci = 0; ci < CINC; ++ci) {
+#pragma unroll
+      for (int kh = 0; kh < KH; ++kh) {
+        half strip[RTSTRIP];
+#pragma unroll
+        for (int i = 0; i < RTSTRIP; ++i)
+          strip[i] = Xs[ci][row * STRIDE + kh][lx * TM * STRIDE + i];
+#pragma unroll
+        for (int kw = 0; kw < KW; ++kw) {
+          half w[TN];
+#pragma unroll
+          for (int t = 0; t < TN; ++t) w[t] = Ws[ci][kh * KW + kw][cg * TN + t];
+#pragma unroll
+          for (int i = 0; i < TM; ++i) {
+            const half x = strip[i * STRIDE + kw];
+#pragma unroll
+            for (int t = 0; t < TN; ++t) acc[i][t] = mad(x, w[t], acc[i][t]);
+          }
+        }
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+
+  const int oy = gy * TY + row;
+#pragma unroll
+  for (int t = 0; t < TN; ++t) {
+    const int gout = out_c0 + cg * TN + t;
+    if (gout < Cout) {
+      half b = Bias ? Bias[gout] : (half)0;
+#pragma unroll
+      for (int i = 0; i < TM; ++i) {
+        const int ox = gx * TX + lx * TM + i;
+        if (oy < Hout && ox < Wout)
+          Y[((size_t)gout * Hout + oy) * Wout + ox] = activate_h(acc[i][t] + b);
+      }
+    }
+  }
+}
