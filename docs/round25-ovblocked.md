@@ -138,3 +138,15 @@ conv3×3 签名（`scripts/autotune.py --ops conv3x3 --batch 3 --iters 10`，逐
 > 复现：`python3 scripts/autotune.py --model yolov8n-pose --ops conv3x3`（已 tuned 的会跳过；
 > 需要重扫先删对应 `conv3x3|...` 条目，或用 `kernel_autotune --retune` 单签名重扫）。
 
+### 7.1 已知 caveat：autotune 只计 conv kernel，未计输入重排
+
+`conv3x3_blk` 需要把输入 bfyx→fsv16 重排（`reorder_bfyx_to_fsv16`，见 `PlanModel::blkInput`），
+而调优器计时**只包含 conv kernel**（`makeEnqueue` 的计时闭包），不含这次重排。方法学上应当
+把重排成本并入比较（或在 `autotuneOp` 里给 blk 加一个偏好余量）。不过实测重排开销很小：
+把重排 kernel 从「1 线程/元素、写 stride=16」改成「1 线程/16 通道块、写连续」后整网
+**无变化**（yolov8n 14.40→14.41 ms、yolo11n 17.04→17.19 ms，均在 run 间噪声内），说明它
+不是瓶颈。因此临界层（如 `40×40 s1 64→64`）的 kernel 实测 blk 8.48 vs OV 8.33 是真优势；
+整网里两者 ~1.39–1.46 ms 的差是 run 间噪声。后续若要精调，把重排并入计时即可。
+
+
+
