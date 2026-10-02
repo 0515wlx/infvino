@@ -169,7 +169,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > 逐 size 对照：blk 赢在 **s1 小空间/大通道**（20×20 系 +12–44%、40×40 C128 +16%），
 > 输在 **stride-2**（−30–47%）与 **80×80 大层**（−16%），因此按 size 选而非替换。
 > 整网强制全 blk 也 **−0.9%**（17.35→17.19 ms），强制 blk 与 default 均 vs onnxruntime PASS。
-> **回答「能否到理论极限」：不能**——blk 指令配额 ≈15（实测达 80%）、osv32 ≈20（达 68%），
+> **回答「能否到理论极限」：不能**——blk 指令配额 ≈17（实测达 72%）、osv32 ≈20（达 68%），
 > 两条 OV 通路的现实天花板都在 **~12–14 ops**，差距是延迟/占用而非指令数。
 > 详见 [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md)。
 >
