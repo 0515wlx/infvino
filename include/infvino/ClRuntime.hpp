@@ -105,6 +105,7 @@ private:
   cl_context       context_{nullptr};
   cl_command_queue queue_{nullptr};
   std::unordered_map<std::string, cl_program> programs_;  // key: source|options
+  std::unordered_map<std::string, std::string> sources_;  // source_name -> .cl text
 };
 
 }  // namespace gk

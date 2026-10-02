@@ -114,6 +114,8 @@ private:
   Tensor & ref(const std::string & name);
   int     attrInt(const Node & n, const char * key, int def) const;
   cl_mem  ovWeight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief Build (once) and cache a kernel keyed by source|name|options. */
+  cl_kernel getKernel(const std::string & src, const std::string & name, const std::string & opts);
 
   ClRuntime         rt_;
   std::string       plan_path_;
@@ -135,6 +137,10 @@ private:
   cl_kernel kGemm_{nullptr}, kConvG_{nullptr}, kBin_{nullptr}, kBinB_{nullptr}, kUn_{nullptr},
     kCopy_{nullptr}, kSlice_{nullptr}, kConcat_{nullptr}, kPool_{nullptr}, kResize_{nullptr},
     kSoftmax_{nullptr}, kPerm_{nullptr}, kGap_{nullptr}, kBias_{nullptr}, kBmm_{nullptr};
+  // R23: per-node specialized kernels (conv3x3/conv1x1/gemm/gap/depthwise) built
+  // once and reused across run() calls — avoids clCreateKernel on every node of
+  // every inference. Pure caching; numerics are unchanged.
+  std::unordered_map<std::string, cl_kernel> kcache_;
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
   double                                        last_run_ms_{0.0};

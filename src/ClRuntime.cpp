@@ -179,7 +179,39 @@ cl_kernel ClRuntime::buildFromSource(
 cl_kernel ClRuntime::buildKernel(
   const std::string & source_name, const std::string & kernel_name, const std::string & options)
 {
-  return buildFromSource(readFile(kernel_dir_ + "/" + source_name + ".cl"), kernel_name, options);
+  // Cache the .cl text (the previous code re-read the file from disk and re-hashed
+  // the whole source on *every* buildKernel call — hundreds of disk reads + full
+  // hashes per inference for a ~250-node plan, which starved the GPU queue and
+  // inflated the wall/busy gap). Programs are now keyed by (source_name, options).
+  auto sit = sources_.find(source_name);
+  if (sit == sources_.end())
+    sit = sources_.emplace(source_name, readFile(kernel_dir_ + "/" + source_name + ".cl")).first;
+  const std::string key = "file|" + source_name + "|" + options;
+  cl_program prog = nullptr;
+  auto it = programs_.find(key);
+  if (it != programs_.end()) {
+    prog = it->second;
+  } else {
+    cl_int err;
+    const char * sp = sit->second.c_str();
+    prog = clCreateProgramWithSource(context_, 1, &sp, nullptr, &err);
+    if (err != CL_SUCCESS) throw std::runtime_error("clCreateProgramWithSource failed");
+    err = clBuildProgram(prog, 1, &device_, options.c_str(), nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+      size_t len = 0;
+      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+      std::vector<char> log(len + 1, 0);
+      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
+      clReleaseProgram(prog);
+      throw std::runtime_error(
+        "clBuildProgram failed for " + kernel_name + " (" + options + "):\n" + log.data());
+    }
+    programs_[key] = prog;
+  }
+  cl_int err;
+  cl_kernel k = clCreateKernel(prog, kernel_name.c_str(), &err);
+  if (err != CL_SUCCESS) throw std::runtime_error("clCreateKernel failed: " + kernel_name);
+  return k;
 }
 
 cl_mem ClRuntime::alloc(size_t bytes, cl_mem_flags flags)

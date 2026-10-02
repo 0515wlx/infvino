@@ -238,6 +238,20 @@ void PlanModel::releaseKernels()
     &kPool_, &kResize_, &kSoftmax_, &kPerm_, &kGap_, &kBias_, &kBmm_};
   for (cl_kernel * k : ks)
     if (*k) { clReleaseKernel(*k); *k = nullptr; }
+  for (auto & kv : kcache_)
+    if (kv.second) clReleaseKernel(kv.second);
+  kcache_.clear();
+}
+
+cl_kernel PlanModel::getKernel(
+  const std::string & src, const std::string & name, const std::string & opts)
+{
+  const std::string key = src + "|" + name + "|" + opts;
+  auto it = kcache_.find(key);
+  if (it != kcache_.end()) return it->second;
+  cl_kernel k = rt_.buildKernel(src, name, opts);
+  kcache_[key] = k;
+  return k;
 }
 
 void PlanModel::run()
@@ -306,7 +320,7 @@ void PlanModel::run()
         cfg.ACT = act;
         cfg.RES = dres ? 1 : 0;
         cfg.SG  = 16;
-        cl_kernel kg = rt_.buildKernel("conv1x1", "conv1x1_gemv_f16", cfg.options());
+        cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", cfg.options());
         clSetKernelArg(kg, 0, sizeof(dw), &dw);
         clSetKernelArg(kg, 1, sizeof(dx), &dx);
         clSetKernelArg(kg, 2, sizeof(db), &db);
@@ -317,7 +331,6 @@ void PlanModel::run()
         const size_t lws[1] = {16};
         const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
         timed("conv1x1g@" + std::to_string(Cout) + "x" + std::to_string(Cin), kg, 1, gws, lws);
-        clReleaseKernel(kg);
       } else {
         Tiles t;
         const long grid = static_cast<long>((Cout + t.BM - 1) / t.BM) *
@@ -350,7 +363,6 @@ void PlanModel::run()
         timed("conv1x1@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
                 std::to_string(Cin),
               kg, 2, gws, lws);
-        clReleaseKernel(kg);
       }
     }
     else if (n.op == "conv_general")
@@ -371,7 +383,7 @@ void PlanModel::run()
         std::snprintf(dopts, sizeof(dopts),
                       "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d "
                       "-cl-mad-enable -cl-fast-relaxed-math", K, S, P, act);
-        cl_kernel kd = rt_.buildKernel("conv_general", "depthwise_f16", dopts);
+        cl_kernel kd = getKernel("conv_general", "depthwise_f16", dopts);
         int ho = Hout, wo = Wout;
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
         clSetKernelArg(kd, 1, sizeof(dw), &dw);
@@ -384,7 +396,6 @@ void PlanModel::run()
         clSetKernelArg(kd, 8, sizeof(wo), &wo);
         const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
         timed("depthwise", kd, 1, gdw, nullptr);
-        clReleaseKernel(kd);
       } else {
       clSetKernelArg(kConvG_, 0, sizeof(dx), &dx);
       clSetKernelArg(kConvG_, 1, sizeof(dw), &dw);
@@ -438,7 +449,7 @@ void PlanModel::run()
                       "-DOBW=%d -DOBH=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DRES=%d -DSG=16 "
                       "-cl-mad-enable -cl-fast-relaxed-math",
                       obw, obh, stride, pad, act, dres ? 1 : 0);
-        cl_kernel kk = rt_.buildKernel("conv_ov", "conv3x3_ov", oo);
+        cl_kernel kk = getKernel("conv_ov", "conv3x3_ov", oo);
         cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
         clSetKernelArg(kk, 0, sizeof(dx), &dx);
         clSetKernelArg(kk, 1, sizeof(dw), &dw);
@@ -460,7 +471,6 @@ void PlanModel::run()
                 std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout),
               kk, 3, gws, lws);
-        clReleaseKernel(kk);
       }
       else
       {
@@ -479,7 +489,7 @@ void PlanModel::run()
         const int spatial = ((Wout + cfg.TX - 1) / cfg.TX) * ((Hout + cfg.TY - 1) / cfg.TY);
         const int wgs32   = spatial * ((Cout + 31) / 32);
         if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;
-        cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
+        cl_kernel kk = getKernel("conv", "conv3x3_f16", cfg.options());
         cl_mem dw = in(1).mem;
         clSetKernelArg(kk, 0, sizeof(dx), &dx);
         clSetKernelArg(kk, 1, sizeof(dw), &dw);
@@ -501,7 +511,6 @@ void PlanModel::run()
                 std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout),
               kk, 3, gws, lws);
-        clReleaseKernel(kk);
       }
     }
     else if (n.op == "gemm")
@@ -532,7 +541,7 @@ void PlanModel::run()
         t.DBUF = 0;
       }
       if (K < 32) t.SG = 0;
-      cl_kernel kg = rt_.buildKernel("gemm", "gemm_f16", t.options());
+      cl_kernel kg = getKernel("gemm", "gemm_f16", t.options());
       clSetKernelArg(kg, 0, sizeof(da), &da);
       clSetKernelArg(kg, 1, sizeof(db), &db);
       clSetKernelArg(kg, 2, sizeof(dc), &dc);
@@ -545,7 +554,6 @@ void PlanModel::run()
         static_cast<size_t>((M + t.BM - 1) / t.BM) * lws[1]};
       timed("gemm@" + std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K),
             kg, 2, gws, lws);
-      clReleaseKernel(kg);
     }
     else if (n.op == "ew_binary")
     {
@@ -735,7 +743,7 @@ void PlanModel::run()
       int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
       cl_mem dx = in(0).mem, dy = out.mem;
       const int WGS = 128;
-      cl_kernel k = rt_.buildKernel("ops", "gap_r", "-DGAP_WGS=" + std::to_string(WGS));
+      cl_kernel k = getKernel("ops", "gap_r", "-DGAP_WGS=" + std::to_string(WGS));
       clSetKernelArg(k, 0, sizeof(dx), &dx);
       clSetKernelArg(k, 1, sizeof(dy), &dy);
       clSetKernelArg(k, 2, sizeof(C), &C);
@@ -743,7 +751,6 @@ void PlanModel::run()
       const size_t lws[1] = {static_cast<size_t>(WGS)};
       const size_t gws[1] = {static_cast<size_t>(C) * WGS};
       timed("gap", k, 1, gws, lws);
-      clReleaseKernel(k);
     }
     else if (n.op == "bias_add")
     {
