@@ -1569,6 +1569,67 @@ gather read —— 权重读 `Wt[oc*Cin*9 + kr*3+kc]` 相邻 lane 步长 `Cin*9`
 4. `conv3x3_sg`（OV 式）与 `-DWGL` 一起保留为**实验/负结果**工具，带正确的 `[Cin][9][Cout]`
    权重布局要求；生产路径仍走 `conv3x3_f16`。
 
+## Round 21 —— Winograd 能否突破 16？（结论：不能，被 128 GRF 的「16 个 m 值」放大）
+
+### 21.1 目标与算法
+
+R18–R20 已确认：direct conv 和 OV 式两条数据通路的 ops/EU/cyc 上限都是 ~16。唯一能真正
+突破的算术手段是**减少乘数**。Winograd F(2×2,3×3)（stride 1）把每个 (tile, cin, cout) 的
+乘法从 direct 的 `2×2×9 = 36` 降到 `4×4 = 16`（**2.25×**）：
+
+```
+V = B^T d B            // 4x4 输入块 -> Winograd 域（32 个加法）
+U = G g G^T            // 3x3 权重 -> 4x4（离线预变换）
+M = Σ_ci V ⊙ U          // 16 个逐元素乘累加（GEMM 形态）
+Y = A^T M A            // 4x4 -> 2x2 输出（24 个加法）
+```
+
+算法本身已验证：用 numpy 完整复刻 host 的 `G g G^T` + lane-major 权重 swizzle + kernel 的
+读/存索引，结果与 direct conv 逐元素一致（maxerr 2.4e-7）。**数学没问题，问题在寄存器。**
+
+### 21.2 为什么在这台机器上不成立：M 需要「每 (tile, channel) 16 个活值」
+
+direct conv 每个 (像素, 通道) 只需要 **1–4 个累加器**；Winograd 在做逆变换前必须同时持有
+**16 个 m 值**。这是一个寄存器乘数：
+
+- 每线程累加器 = `16 × (通道/线程) / 2`（half2）。CB=8 就是 **64 个 half2**，已经贴到
+  128-GRF 墙；再叠加输入变换的 `d/t/V[4][4]`（~48 个 half）与权重/地址，必 spill。
+- 想靠减少 CB 降寄存器，则输入变换（每 (tile, ci) 32 个加法）只能摊到很少的通道上，
+  摊薄不了；lane=通道（OV 式）还会让每个 lane **冗余**做同一块输入变换。
+- 想靠「lane=空间 + 通道在寄存器」摊薄变换，则累加器 `16×TM×CB/2` 立刻爆掉。
+
+这正是 R16「寄存器分块 3×3 反而更慢」同一堵墙，只是 Winograd 把墙放大了 16 倍：
+**它用乘数换来的收益，被「多出来的活状态」在 128 GRF 上吃回去。**
+
+### 21.3 实测（fused 原型，负结果）
+
+实现了一版**单 kernel 融合** F(2×2,3×3)（lane=通道、VECO=2、一 WG=一 sub-group 处理一个
+2×2 tile，权重预变换+swizzle，输入/逆变换都在寄存器）。结果：
+
+- `ocladoc` 反汇编：出现 `byte gathering read 16b` 等 scratch/SLM 流量（即 `acc[16]`/`V[4][4]`
+  溢出到私有内存）；
+- 实测 **0.38 ops/EU/cyc**（12.1 ms vs direct 的 0.44 ms，≈**27× 慢**）——寄存器墙的直接后果。
+  （该原型还有一处 IGC codegen 导致部分通道结果不对；但即便修好，寄存器预算也把上限
+  压到远低于 16，故不再投入。）
+
+### 21.4 为什么 OV 也不靠 Winograd 破 16
+
+OV 确实有 `convolution_gpu_winograd_2x3_s1`，但它是**三段式**：`transform 输入 → Winograd 域
+GEMM（把 M 写回全局）→ 逆变换`，正是为了**不把 M 留在寄存器**。代价是 16 倍的中间张量
+流量（对 64→64@80 约 3.3 MB，能进 L3 但要走一遍 L3 往返），且 Winograd 域的 GEMM 是
+`M=Cout=64, N=tiles, K=Cin` 的一批小 GEMM，在本机（M 小、网格小）效率只有 ~5 ops。OV 的
+selector 在本模型这些形状上**没有选 Winograd，选的是 direct `os_iyx_osv32`**——与我们的结论一致。
+
+### 21.5 结论
+
+- **Winograd 不能在这台机器上突破 16**：它减少的是乘数，但把「每 (tile,通道) 的活值」从
+  1–4 放大到 16，在 128 GRF / 7 线程 per EU 上是决定性的负项；三段式又会引入 16× 中间流量。
+- 因此 **R20 的「两条路都撞 16」依然成立且更完整**：direct（staging 墙）与 OV 式（broadcast 墙）
+  之外，Winograd（register 墙）也在 16 以下。
+- 要真正突破，只剩**换硬件能力**（更大的 GRF/专用矩阵单元/更强的 L1）或**换问题规模**
+  （batch 足够大时 Winograd 域 GEMM 的 M 才够大）；在本机单流、小 batch 的现实下，
+  **direct conv ~10.3（大层）/ 网格饥饿层 +20–56% 就是当前最优**。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
