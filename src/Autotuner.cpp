@@ -241,6 +241,10 @@ std::vector<Candidate> candidatesSmall(const OpSignature & sig)
   if (op == "ew_binary_bcast")
   {
     addSmall(out, "ew_binary_bcast", "ops", "", "bcast");
+    // R30: 3-D 网格 + 运行期 stride（去掉逐元素 div/mod）；有效秩 ≤4 时可用。
+    const int effRank = sig.params.size() > 4 ? sig.params[4] : 4;
+    if (effRank <= 4)
+      addSmall(out, "ew_binary_bcast4", "ops", "", "grid3");
     // 仅当其中一个是「每通道一个标量」时才加入通道特化变体。
     const int n = sig.params.size() > 0 ? sig.params[0] : 0;
     const int C = sig.params.size() > 3 ? sig.params[3] : 0;

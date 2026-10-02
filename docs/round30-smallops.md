@@ -169,8 +169,16 @@ plan 带了 `bdims`，也走标量 `ew_binary` 核（a 与 out 同形连续 ⇒ 
 | yolov8n | 0.500 → **0.430** ms（−14%）| 14.584 → **14.539** ms |
 | yolo11n | 0.594 → **0.500** ms（−16%）| 15.974 → **15.720** ms（−1.6%）|
 
-第 2/3 种可用「3-D 网格 + 运行期 stride」去掉 div/mod（同 R23 concat4、R28 `_3d` 的
-思路），是剩余算子里下一个明确的可优化点（约 0.19 ms/模型）。
+**已落地（第 2/3 种，主要收益）**：新增 `ew_binary_bcast4` —— 把广播表达式放到
+**3-D 网格 + 运行期 stride**（有效维最多 4 个，`g0` 最内层连续，`g2` 折叠外层两维，
+每 WI 一次 div/mod 而非每元素四次），去掉通用 rank 核的 `iqot/irem`。默认 dispatch 与
+autotune 候选都接上；>4 有效维回退通用核（当前三模型无）。数值：`model_check` 三模型
+**PASS**，y8 `mean_rel=5.28e-4`、y11 `8.95e-4`，与基线一致。同会话 A/B（`--iters 5`）：
+
+| 模型 | `ew_binary` old → new | 整网 busy old → new |
+|---|---|---|
+| yolov8n | 0.493 → **0.291** ms（−41%）| 14.568 → **14.416** ms |
+| yolo11n | 0.592 → **0.379** ms（−36%）| 15.914 → **15.633** ms（−1.8%）|
 
 ### 4.3 归约：`softmax / gap`
 - `softmax_axis`（dfl，`[1,16,33600]`）：三趟串行 + exp，实测 27–31 GB/s（L3 上限
@@ -254,9 +262,11 @@ attention 两个 shape（`[1,2,400,32,400]` 用 TM8×TN4、`[1,2,64,400,400]` �
 
 ## 7. 已落地（本轮）
 
-### 7.1 标量广播快路径（kernel 侧，正向）
+### 7.1 广播快路径（kernel 侧，正向）
 
-见 §4.2：`b_scalar=1` 不再走通用 rank 核。输出逐位不变；`ew_binary` −14%/−16%。
+- `b_scalar=1` 不再走通用 rank 核（标量快路径，−14%/−16%，见上）。
+- 混合 stride 广播 → 新增 `ew_binary_bcast4`（3-D 网格 + 运行期 stride），
+  `ew_binary` 再 −36%/−41%，整网 −1.8%（y11）。三模型 `model_check` PASS。
 
 ### 7.2 `expectedOps` 的真实模型（替换 `return 8.0`）
 
@@ -278,10 +288,19 @@ attention 两个 shape（`[1,2,400,32,400]` 用 TM8×TN4、`[1,2,64,400,400]` �
 
 ---
 
+### 7.3 负结果：attention 转置的 SLM 分块（已回退）
+
+`permute` mode 1（attention `[1,2,400,400]` 的最后两轴转置）实测 0.44× 内存模型上限，
+是个跨步写问题（2 B store 跨 D2 → 每个 store 触一个 L3 sector）。试了 SLM 分块
+（`TT×TT`，读按 r 连续、写按 d2 连续）——单独看索引正确，但**在整网里得到错误的下游
+张量**（不复现独立算子级错误，说明与 attention 的后续 bmm/softmax 交互或并发写有微妙
+不一致）。为避免冒险已**回退**；若要重做，必须先给 permute 加独立 `kernel_check` 用例。
+
+---
+
 ## 8. 下一步（按预期收益）
 
-1. ~~pose-decode 广播的标量分支~~（**已落地**，−0.07/−0.09 ms）；剩余两条混合 stride
-   广播用 3-D 网格 stride 核去掉 `iqot/irem`（预计再 −0.19 ms/模型，~1.2%）。
+1. ~~pose-decode 广播（标量分支 + 3-D 网格 stride 核）~~（**已落地**，整网 −1.8%）。
 2. `maxpool` 向量化 tap（去边界谓词 + 一次读 K² 个连续 half）。
 3. `softmax` 的 2 趟（在线 max+sum）或减少写回读。
 4. `concat` 融合进下游 conv（结构改动，收益最大但风险高，属独立一轮）。

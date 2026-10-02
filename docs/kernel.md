@@ -1928,10 +1928,10 @@ copy(read+write) 带宽-足迹：1 MB **89.7 GB/s**（L3 峰）、2 MB 62.4、4 
 
 ### 30.4 落地
 
-1. **标量广播快路径（正结果）**：`b_scalar=1` 即使带 `bdims` 也走标量 `ew_binary` 核
-   （原来走通用 rank 核，每元素 4×整数 div/mod）。输出逐位相同；同会话 A/B：
-   yolov8 `ew_binary` 0.500→**0.430** ms、busy 14.584→**14.539**；
-   yolo11 0.594→**0.500** ms、busy 15.974→**15.720**（−1.6%）。
+1. **广播快路径（正结果）**：`b_scalar=1` 走标量核；混合 stride 广播走新增的
+   `ew_binary_bcast4`（3-D 网格 + 运行期 stride，去掉每元素 4×整数 div/mod）。
+   三模型 `model_check` PASS。同会话 A/B：yolov8 `ew_binary` 0.493→**0.291** ms、
+   busy 14.568→**14.416**；yolo11 0.592→**0.379** ms、busy 15.914→**15.633**（−1.8%）。
 2. **中间标准真实模型**：小算子占位 `return 8.0` 换成内存 roofline（`kBwCurve` +
    `smallMemCeiling`）+ depthwise/bmm 的 ISA 配额（只影响 ratio/报告，不影响选优）。
    `tuning_test` 新增 6 条断言。

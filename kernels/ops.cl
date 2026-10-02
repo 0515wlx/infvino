@@ -264,6 +264,44 @@ __kernel void ew_binary_ch(__global const half *restrict a, __global const half 
   y[i] = (half)res;
 }
 
+// ---- R30: broadcasting binary op on a 3-D grid with runtime strides -------------
+// The generic `ew_binary_bcast` walks the rank loop per *element* (4 integer
+// div/mod + dependent rem chain) — after removing the true-scalar case, the
+// remaining mixed-stride broadcasts (e.g. YOLO pose decode) are div/mod-latency
+// bound (~35 cyc/element) even though their footprint is L3-sized.  Here the
+// effective dims (unit dims dropped) are mapped onto a 3-D grid: gid0 is the
+// innermost (contiguous) dim, gid1 the next, and gid2 folds the (up to) two
+// outermost dims (one div/mod per work-item, not per element).  Operand offsets
+// are plain dot-products with the strides passed from the host.
+//   p0..p3: effective dims (already unit-filtered, innermost first)
+//   as*/bs*: per-operand element strides for those dims
+//   os*: output strides (p0, p0*p1, p0*p1*p2)
+__kernel void ew_binary_bcast4(__global const half *restrict a,
+                               __global const half *restrict b,
+                               __global half *restrict y, const int op,
+                               const int d0, const int d1, const int d2, const int d3,
+                               const int os1, const int os2, const int os3,
+                               const int as0, const int as1, const int as2, const int as3,
+                               const int bs0, const int bs1, const int bs2, const int bs3) {
+  const int g0 = get_global_id(0);
+  const int g1 = get_global_id(1);
+  const int g2 = get_global_id(2);
+  if (g0 >= d0 || g1 >= d1 || g2 >= d2 * d3) return;
+  const int lo = g2 % d2;         // 3rd effective dim
+  const int hi = g2 / d2;         // 4th effective dim
+  const int ai = g0 * as0 + g1 * as1 + lo * as2 + hi * as3;
+  const int bi = g0 * bs0 + g1 * bs1 + lo * bs2 + hi * bs3;
+  const int oi = g0 + g1 * os1 + lo * os2 + hi * os3;
+  const float av = (float)a[ai];
+  const float bv = (float)b[bi];
+  float r = av;
+  if (op == 0) r = av + bv;
+  else if (op == 1) r = av - bv;
+  else if (op == 2) r = av * bv;
+  else r = av / bv;
+  y[oi] = (half)r;
+}
+
 // ---- vectorized elementwise binary: EW_VEC contiguous elements per work-item ----
 #ifndef EW_VEC
 #define EW_VEC 4

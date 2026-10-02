@@ -364,7 +364,18 @@ OpSignature PlanModel::smallSig(const Node & n) const
         if (nonunit == 1 && dimpos == chidx && ld[chidx] == ts->numel())
           C = static_cast<int>(ts->numel());
       }
-      return OpSignature::custom("ew_binary_bcast", {nn, op, bs, C});
+      // R30: 有效秩（去掉 extent==1 的维）= 是否能用 3-D 网格 bcast 核（≤4）的判据。
+      int effRank = 0;
+      {
+        std::vector<int> vals;
+        std::stringstream ss(n.attr.at("bdims"));
+        std::string tk;
+        while (std::getline(ss, tk, ',')) vals.push_back(std::atoi(tk.c_str()));
+        const int rank = vals.empty() ? 0 : static_cast<int>(vals.size() / 3);
+        for (int r = 0; r < rank; ++r)
+          if (vals[r] != 1) ++effRank;
+      }
+      return OpSignature::custom("ew_binary_bcast", {nn, op, bs, C, effRank});
     }
     return OpSignature::custom("ew_binary", {nn, op, bs});
   }
@@ -477,6 +488,79 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int rank = 0;
     if (!spec.empty())
       rank = static_cast<int>((std::count(spec.begin(), spec.end(), ',') + 1) / 3);
+    if (kernel == "ew_binary_bcast4")
+    {
+      // R30: 3-D 网格 + 运行期 stride，去掉通用 rank 核的逐元素 div/mod。
+      // 有效维按「最内层在前」收集（p0 最连续）；最多 4 维，第 3/4 维折叠进 gid2。
+      std::vector<int> vals;
+      {
+        std::stringstream ss(spec);
+        std::string tk;
+        while (std::getline(ss, tk, ',')) vals.push_back(std::atoi(tk.c_str()));
+      }
+      const int rk = vals.empty() ? 0 : static_cast<int>(vals.size() / 3);
+      // 有效维 = 跳过 extent-1 的维（它们坐标恒为 0，对右对齐布局无影响），按
+      // 「最内层在前」收集，最多 4 维。每个有效维保留它自己的 stride——不同有效维
+      // 的 stride 恰好右对齐，所以 g0..g3 直接点乘即可。>4 个有效维时回退通用核。
+      int p[4] = {1, 1, 1, 1}, as[4] = {0, 0, 0, 0}, bs[4] = {0, 0, 0, 0}, kk = 0;
+      bool safe = true;
+      for (int r = rk - 1; r >= 0; --r)
+      {
+        if (vals[r] == 1) continue;
+        if (kk < 4)
+        {
+          p[kk]  = vals[r];
+          as[kk] = vals[rk + r];
+          bs[kk] = vals[2 * rk + r];
+          ++kk;
+        }
+        else { safe = false; break; }
+      }
+      if (!safe)
+      {
+        // 中部有 extent-1 维（或有效秩 >4）：回退通用 rank 核。它用 rank 参数，
+        // 与 bcast4 的 19 个参数不同，必须重新 build 通用 kernel 句柄。
+        k = getKernel("ops", "ew_binary_bcast", "");
+        cl_mem dm = bcastDims(spec);
+        clSetKernelArg(k, 0, sizeof(da), &da);
+        clSetKernelArg(k, 1, sizeof(db), &db);
+        clSetKernelArg(k, 2, sizeof(dy), &dy);
+        clSetKernelArg(k, 3, sizeof(nn), &nn);
+        clSetKernelArg(k, 4, sizeof(op), &op);
+        const int rr = rk;
+        clSetKernelArg(k, 5, sizeof(rr), &rr);
+        clSetKernelArg(k, 6, sizeof(dm), &dm);
+        dim = 1;
+        gws[0] = static_cast<size_t>(nn);
+        return;
+      }
+      const int d0 = p[0], d1 = p[1], d2 = p[2], d3 = p[3];
+      const int os1 = d0, os2 = d0 * d1, os3 = d0 * d1 * d2;
+      clSetKernelArg(k, 0, sizeof(da), &da);
+      clSetKernelArg(k, 1, sizeof(db), &db);
+      clSetKernelArg(k, 2, sizeof(dy), &dy);
+      clSetKernelArg(k, 3, sizeof(op), &op);
+      clSetKernelArg(k, 4, sizeof(d0), &d0);
+      clSetKernelArg(k, 5, sizeof(d1), &d1);
+      clSetKernelArg(k, 6, sizeof(d2), &d2);
+      clSetKernelArg(k, 7, sizeof(d3), &d3);
+      clSetKernelArg(k, 8, sizeof(os1), &os1);
+      clSetKernelArg(k, 9, sizeof(os2), &os2);
+      clSetKernelArg(k, 10, sizeof(os3), &os3);
+      clSetKernelArg(k, 11, sizeof(as[0]), &as[0]);
+      clSetKernelArg(k, 12, sizeof(as[1]), &as[1]);
+      clSetKernelArg(k, 13, sizeof(as[2]), &as[2]);
+      clSetKernelArg(k, 14, sizeof(as[3]), &as[3]);
+      clSetKernelArg(k, 15, sizeof(bs[0]), &bs[0]);
+      clSetKernelArg(k, 16, sizeof(bs[1]), &bs[1]);
+      clSetKernelArg(k, 17, sizeof(bs[2]), &bs[2]);
+      clSetKernelArg(k, 18, sizeof(bs[3]), &bs[3]);
+      dim = 3;
+      gws[0] = static_cast<size_t>(d0);
+      gws[1] = static_cast<size_t>(d1);
+      gws[2] = static_cast<size_t>(d2) * static_cast<size_t>(d3);
+      return;
+    }
     cl_mem dm = bcastDims(spec);
     clSetKernelArg(k, 0, sizeof(da), &da);
     clSetKernelArg(k, 1, sizeof(db), &db);
@@ -1240,9 +1324,19 @@ void PlanModel::run()
     {
       const OpSignature sig = smallSig(n);
       std::string kern, opts;
-      cl_kernel   k = smallKernelFor(sig, sig.op == "ew_binary_bcast" ? "ew_binary_bcast"
-                                                                     : "ew_binary",
-                                     kern, opts);
+      // R30: 广播默认走 3-D 网格核（去掉逐元素 div/mod）；通道标量走 ew_binary_ch；
+      // 仅当有效秩 >4 时回退通用 rank 核。
+      std::string dk = "ew_binary";
+      if (sig.op == "ew_binary_bcast")
+      {
+        const long n  = sig.params.size() > 0 ? sig.params[0] : 0;
+        const long C  = sig.params.size() > 3 ? sig.params[3] : 0;
+        const int  er = sig.params.size() > 4 ? sig.params[4] : 4;
+        if (C > 0 && C < n && n % C == 0) dk = "ew_binary_ch";
+        else if (er <= 4)                 dk = "ew_binary_bcast4";
+        else                              dk = "ew_binary_bcast";
+      }
+      cl_kernel   k = smallKernelFor(sig, dk.c_str(), kern, opts);
       cl_uint dim;
       size_t  gws[3], lws[3];
       bool    useLws;
