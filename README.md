@@ -128,6 +128,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
 | [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
 | [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) | **R25 OV 阻塞式 conv 完整移植**：逐 size 对照 / 第三条 autotune 通路 |
+| [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，

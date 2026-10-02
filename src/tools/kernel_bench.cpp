@@ -667,6 +667,42 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
   return 0;
 }
 
+// Round 27: occupancy / register-pressure probe (see micro.cl:fma_cyc). Sweeps
+// the grid size and reports aggregate ops/EU/cyc and per-mad cycles; the plateau
+// is 32*T_res/L, the knee is where the EUs fill up.
+int benchOcc(gk::ClRuntime & rt, int depth, int sg, const std::string & width)
+{
+  const bool hi = (width == "h8");            // high-ILP variant
+  const int eff_depth = hi ? 8 : depth;
+  const int ITERS = hi ? 2048 : 256;
+  const char * kname = hi ? "fma_h8_lat" : "fma_cyc";
+  std::string opts = "-DDEPTH=" + std::to_string(eff_depth) + " -DITERS=" + std::to_string(ITERS) +
+                     " -DSG=" + std::to_string(sg) + " -cl-mad-enable -cl-fast-relaxed-math";
+  cl_kernel k;
+  try { k = rt.buildKernel("micro", kname, opts); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+  cl_mem out = rt.alloc(16 * 8, CL_MEM_WRITE_ONLY);
+  const uint16_t ah = gk::f32_to_f16(1.0001f), bh = gk::f32_to_f16(1e-4f);
+  clSetKernelArg(k, 0, sizeof(out), &out);
+  clSetKernelArg(k, 1, sizeof(ah), &ah);
+  clSetKernelArg(k, 2, sizeof(bh), &bh);
+  std::printf("  occ %s depth=%-3d sg=%-2d ITERS=%d\n", kname, eff_depth, sg, ITERS);
+  for (int nwg : {8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 384, 512}) {
+    const size_t lws = 64, gws = static_cast<size_t>(nwg) * 64;
+    const double med = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 7);
+    // h8: each "mad" is a half8 vector (8 packed halfs/lane) = 8x the FLOPs.
+    const double fl = hi ? 8.0 : 1.0;
+    const double flops = 2.0 * static_cast<double>(gws) * ITERS * eff_depth * fl;
+    const double ops = rt.opsPerEuCycle(flops, med);
+    const long subgrp = static_cast<long>(gws / 16);
+    std::printf("    nwg=%-3d subgrp=%-5ld  %7.3f ms  ops/EU/cyc=%5.2f\n",
+                nwg, subgrp, med, ops);
+  }
+  clReleaseMemObject(out);
+  clReleaseKernel(k);
+  return 0;
+}
+
 // Pointer chase: latency per access vs working-set size (bytes).
 int benchMemLat(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 {
@@ -944,6 +980,10 @@ int main(int argc, char ** argv)
     std::printf("[fmalat] width=%s depth=%d (depth=1 -> latency, large -> throughput)\n",
                 width.c_str(), depth);
     rc = benchFma(rt, width, depth, iters, 3, sg);
+  } else if (op == "occ") {
+    std::printf("[occ] occupancy / register-pressure probe (--depth D --sg 16 --width h8|cyc)\n");
+    if (sg == 0) sg = 16;
+    rc = benchOcc(rt, depth, sg, width);
   } else if (op == "memlat") {
     std::printf("[memlat] pointer-chase latency vs working set\n");
     if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};

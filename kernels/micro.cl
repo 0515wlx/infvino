@@ -127,6 +127,36 @@ __kernel void fma_h8_1op(__global half *out, const half a, const half b) {
   if (s.s0 == (half)-12345.0f) out[0] = s.s0;
 }
 
+// ---------------------------------------------------------------------------
+// Round 27: occupancy / register-pressure probe.
+//
+// A *single* cyclic dependency chain (ILP == 1) that touches DEPTH registers:
+//     r[(d+1) & (DEPTH-1)] = mad(r[d], a, b)     (DEPTH a power of two)
+// Each outer iteration is one chain of DEPTH serial mads, so per work-item the
+// time is ITERS*DEPTH*L_cyc (L = FP16 FMA latency) as long as the EU can host
+// the work-items.  Aggregate throughput at saturation:
+//     ops/EU/cyc = 32 * T_res / L      (T_res = resident sub-groups per EU)
+// so the plateau directly gives T_res.  Raising DEPTH raises register pressure
+// (each r[d] is one GRF at SIMD16) *without* changing ILP, so T_res(DEPTH)
+// answers: is the 4 KB/thread register file per-thread (flat T_res) or shared
+// (T_res falls as DEPTH rises)?
+// ---------------------------------------------------------------------------
+__attribute__((reqd_work_group_size(64, 1, 1))) SGATTR
+__kernel void fma_cyc(__global half *out, const half a, const half b) {
+  half r[DEPTH];
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d)
+    r[d] = (half)((get_global_id(0) + d) & 7) * (half)0.125f + (half)1.0f;
+  for (int i = 0; i < ITERS; ++i) {
+#pragma unroll
+    for (int d = 0; d < DEPTH; ++d) r[(d + 1) & (DEPTH - 1)] = mad(r[d], a, b);
+  }
+  half s = (half)0;
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d) s += r[d];
+  if (s == (half)-12345.0f) out[0] = s;
+}
+
 // A dependent integer add chain (cheap ALU, same loop shape) to gauge the
 // per-iteration loop overhead; subtract from depth=1 to get true ALU latency.
 __attribute__((reqd_work_group_size(64, 1, 1)))
