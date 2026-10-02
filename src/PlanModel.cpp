@@ -656,8 +656,11 @@ void PlanModel::run()
       clSetKernelArg(kConcat_, 8, sizeof(dy), &dy);
       clSetKernelArg(kConcat_, 9, sizeof(outer), &outer);
       clSetKernelArg(kConcat_, 10, sizeof(inner), &inner);
-      const size_t g = static_cast<size_t>(outer) * (ca + cb + cc + cd) * inner;
-      timed("concat4", kConcat_, 1, &g, nullptr);
+      const int csum = ca + cb + cc + cd;
+      const size_t g[3] = {
+        static_cast<size_t>(inner), static_cast<size_t>(csum),
+        static_cast<size_t>(outer)};
+      timed("concat4", kConcat_, 3, g, nullptr);
     }
     else if (n.op == "maxpool")
     {

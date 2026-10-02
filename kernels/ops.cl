@@ -83,24 +83,25 @@ __kernel void slice_axis(__global const half *restrict x, __global half *restric
 }
 
 // ---- concat up to 4 inputs along an axis (outer, inner) with axis dims ca..cd ----
+// R23: 3-D grid (r, ax, o) removes the per-element integer div/mod of the original
+// 1-D version; gid0 (inner) stays contiguous so reads/writes remain coalesced.
 __kernel void concat4(__global const half *restrict a, const int ca,
                       __global const half *restrict b, const int cb,
                       __global const half *restrict c, const int cc,
                       __global const half *restrict d, const int cd,
                       __global half *restrict y, const int outer, const int inner) {
+  const int r  = get_global_id(0);
+  const int ax = get_global_id(1);
+  const int o  = get_global_id(2);
+  if (r >= inner || o >= outer) return;
   const int sum = ca + cb + cc + cd;
-  const int total = outer * sum * inner;
-  const int i = get_global_id(0);
-  if (i >= total) return;
-  const int o = i / (sum * inner);
-  const int rem = i % (sum * inner);
-  const int ax = rem / inner, r = rem % inner;
-  half v = (half)0;
+  if (ax >= sum) return;
+  half v;
   if (ax < ca) v = a[(o * ca + ax) * inner + r];
   else if (ax < ca + cb) v = b[(o * cb + (ax - ca)) * inner + r];
   else if (ax < ca + cb + cc) v = c[(o * cc + (ax - ca - cb)) * inner + r];
   else v = d[(o * cd + (ax - ca - cb - cc)) * inner + r];
-  y[i] = v;
+  y[(o * sum + ax) * inner + r] = v;
 }
 
 // ---- max pool (K,K) stride S pad P ----
