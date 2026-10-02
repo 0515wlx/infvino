@@ -99,6 +99,11 @@ int main(int argc, char ** argv)
       double total = 0;
       for (auto & kv : model.opProfile()) total += kv.second.first;
       std::printf("device: %s\n", model.device().describe().c_str());
+      const size_t req = model.poolRequestedBytes(), alc = model.poolAllocatedBytes();
+      std::printf(
+        "activation pool: requested %.1f MB -> allocated %.1f MB (%zu buffers, reuse %.0f%%)\n",
+        req / 1e6, alc / 1e6, model.poolBufferCount(),
+        req ? 100.0 * (1.0 - static_cast<double>(alc) / static_cast<double>(req)) : 0.0);
       std::printf("total kernel time: %.3f ms (iters=%d)\n", total / iters, iters);
       std::vector<std::pair<std::string, std::pair<double, int>>> v(
         model.opProfile().begin(), model.opProfile().end());

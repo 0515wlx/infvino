@@ -204,6 +204,7 @@ void PlanModel::parse()
     return T_[name] = t;
   };
 
+  act_names_.clear();
   while (std::getline(iss, line))
   {
     if (line.empty() || line[0] == '#') continue;
@@ -245,6 +246,7 @@ void PlanModel::parse()
       int64_t v;
       while (ls >> v) d.push_back(v);
       alloc(name, d);
+      act_names_.push_back(name);
     }
     else if (kind == "node")
     {
@@ -279,6 +281,9 @@ void PlanModel::parse()
   // CAT4 B-staging（B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量），
   // 省掉 concat 的物化（写+再读），同时保留 gemm_f16 的 tile/流水。
   fuseConcatConv1x1();
+
+  // P0：把激活张量改分配到按生存期复用的缓冲池（须在 fusion 之后，节点列表已定稿）。
+  allocateActivations();
 
   // 预取权重到设备后无需再保留主机侧数据；rt_.write 为阻塞写。
 }
@@ -362,6 +367,149 @@ void PlanModel::fuseConcatConv1x1()
   for (size_t i = 0; i < nodes_.size(); ++i)
     if (!remove[i]) kept.push_back(std::move(nodes_[i]));
   nodes_ = std::move(kept);
+}
+
+void PlanModel::allocateActivations()
+{
+  const size_t N = nodes_.size();
+  if (std::getenv("INFVINO_NO_POOL")) return;   // 诊断开关：退回到每张量一块
+
+  // 1) 每个张量的 [birth, death]（拓扑序 = 执行序）。
+  std::unordered_map<std::string, int> birth, death;
+  auto touch = [&](const std::string & t, int i, bool write) {
+    if (t == "-") return;
+    if (write) {
+      if (!birth.count(t)) birth[t] = i;
+      death[t] = i;
+    } else {
+      if (!birth.count(t)) birth[t] = i;   // 常量/输入被当输入读
+      death[t] = i;
+    }
+  };
+  for (size_t i = 0; i < N; ++i)
+  {
+    for (const auto & in : nodes_[i].ins) touch(in, static_cast<int>(i), false);
+    for (const auto & o : nodes_[i].outs) touch(o, static_cast<int>(i), true);
+  }
+
+  // 1b) reshape/flatten 是零拷贝视图：run() 里把 out.mem 指向 in.mem。因此视图与其源
+  //     必须**共享生存期**——否则源 buffer 会在视图仍被读取时被池复用掉（这是 R-P0 第一版
+  //     的数值 FAIL 根因）。这里用并查集把视图链合并，取区间并集。
+  std::unordered_map<std::string, std::string> alias_parent;
+  for (const auto & n : nodes_)
+    if ((n.op == "reshape" || n.op == "flatten") && !n.ins.empty() && n.ins[0] != "-" &&
+        !n.outs.empty() && n.outs[0] != "-")
+      alias_parent[n.outs[0]] = n.ins[0];
+  auto root_of = [&](std::string t) {
+    int guard = 0;
+    while (alias_parent.count(t) && guard++ < 1000) t = alias_parent[t];
+    return t;
+  };
+  // 把同名视图的区间并入根；活动张量统一用根名登记。
+  {
+    std::unordered_map<std::string, std::pair<int, int>> merged;
+    for (const auto & name : act_names_)
+    {
+      auto bit = T_.find(name);
+      if (bit == T_.end()) continue;
+      int b = birth.count(name) ? birth[name] : 0;
+      int d = death.count(name) ? death[name] : static_cast<int>(N ? N - 1 : 0);
+      std::string r = root_of(name);
+      auto it = merged.find(r);
+      if (it == merged.end()) merged[r] = {b, d};
+      else { it->second.first = std::min(it->second.first, b);
+             it->second.second = std::max(it->second.second, d); }
+    }
+    // 用根的并集区间覆盖每个成员的 birth/death，保证同根张量占据同一生存期。
+    for (const auto & name : act_names_)
+      if (birth.count(name) || death.count(name) || merged.count(root_of(name)))
+      {
+        auto it = merged.find(root_of(name));
+        if (it != merged.end()) { birth[name] = it->second.first; death[name] = it->second.second; }
+      }
+  }
+
+  std::unordered_map<std::string, int> out_set;
+  for (size_t i = 0; i < outputs_.size(); ++i) out_set[outputs_[i]] = 1;
+
+  // 2) 标记哪些 activation 张量参与复用；给每个一个 id。
+  struct Live { int id, birth, death; int64_t bytes; std::string name; };
+  std::vector<Live> lives;
+  std::unordered_map<std::string, int> id_of;
+  for (const auto & name : act_names_)
+  {
+    auto bit = T_.find(name);
+    if (bit == T_.end()) continue;
+    int b = birth.count(name) ? birth[name] : 0;
+    int d = death.count(name) ? death[name] : static_cast<int>(N ? N - 1 : 0);
+    if (out_set.count(name)) d = static_cast<int>(N ? N - 1 : 0);   // 输出活到最后
+    int id = static_cast<int>(lives.size());
+    id_of[name] = id;
+    lives.push_back({id, b, d, bit->second.numel() * 2, name});
+  }
+
+  // 3) 冲突集：生存期重叠（闭区间相交）的 id 集合。
+  std::vector<std::vector<int>> conflict(lives.size());
+  for (size_t i = 0; i < lives.size(); ++i)
+    for (size_t j = 0; j < lives.size(); ++j)
+      if (i != j && lives[i].birth <= lives[j].death && lives[j].birth <= lives[i].death)
+        conflict[i].push_back(lives[j].id);
+
+  // 4) 逐个 acquire；旧 buffer 释放（从 owned_ 中摘除）。
+  //    按 footprint 降序分配，让大块优先占据紧凑区域（减少碎片/浪费）。
+  std::vector<size_t> order(lives.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return lives[a].bytes > lives[b].bytes; });
+
+  // 诊断：分配后校验「共享同一 buffer 的任意两张量生存期不相交」。
+  auto verify = [&]() {
+    for (const auto & s : act_pool_.debugSharing())
+    {
+      std::vector<int> ids;
+      size_t p = s.find("users=");
+      std::string u = s.substr(p + 6);
+      std::stringstream ss(u);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) ids.push_back(std::atoi(tok.c_str()));
+      for (size_t a = 0; a < ids.size(); ++a)
+        for (size_t b = a + 1; b < ids.size(); ++b)
+        {
+          const Live & x = lives[ids[a]], &y = lives[ids[b]];
+          if (x.birth <= y.death && y.birth <= x.death)
+            std::fprintf(stderr, "[pool][BUG] overlap share: %s [%d,%d] <-> %s [%d,%d]\n",
+                         x.name.c_str(), x.birth, x.death, y.name.c_str(), y.birth, y.death);
+        }
+    }
+  };
+
+  std::unordered_map<cl_mem, int> old_ref;
+  for (auto & l : lives)
+    old_ref[T_[l.name].mem] = id_of[l.name];
+
+  // 诊断：INFVINO_POOL_LIMIT=k → 只对前 k 个（声明序）张量做池化，其余保持独立 buffer。
+  size_t pool_limit = lives.size();
+  if (const char * lim = std::getenv("INFVINO_POOL_LIMIT"))
+    pool_limit = static_cast<size_t>(std::atoi(lim));
+
+  for (size_t k : order)
+  {
+    auto & l = lives[k];
+    if (static_cast<size_t>(l.id) >= pool_limit) continue;
+    cl_mem m = act_pool_.acquire(
+      [&](size_t bytes) { return rt_.alloc(bytes, CL_MEM_READ_WRITE); }, l.bytes,
+      conflict[l.id], l.id);
+    // 旧 buffer 释放 + 从 owned_ 移除
+    cl_mem old = T_[l.name].mem;
+    if (old)
+    {
+      auto oit = std::find(owned_.begin(), owned_.end(), old);
+      if (oit != owned_.end()) owned_.erase(oit);
+      if (old_ref.count(old) == 1) { clReleaseMemObject(old); old_ref.erase(old); }
+    }
+    T_[l.name].mem = m;
+  }
+  verify();
 }
 
 void PlanModel::buildKernels()

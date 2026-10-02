@@ -83,6 +83,11 @@ public:
   /** @brief 调优缓存（只读；由构造时按 INFVINO_TUNING_CACHE / config/tuning.json 加载）。*/
   const TuningCache & tuning() const { return tuning_; }
 
+  /** @brief P0: 激活缓冲池统计（requested = 朴素总量；allocated = 真正 clCreateBuffer）。*/
+  size_t poolRequestedBytes() const { return act_pool_.requestedBytes(); }
+  size_t poolAllocatedBytes() const { return act_pool_.allocatedBytes(); }
+  size_t poolBufferCount() const { return act_pool_.bufferCount(); }
+
   /**
    * @brief 对计划里的节点做离线自动调优（枚举候选 + GPU 计时），返回结果并按需合并进
    *        `tuning_`。仅在 profiling=true 的 ClRuntime 上有意义。
@@ -142,6 +147,8 @@ private:
   };
 
   void    parse();
+  /** @brief P0: assign activation tensors to the shared buffer pool by liveness. */
+  void    allocateActivations();
   /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
   void    fuseConcatConv1x1();
   void    buildKernels();
@@ -179,6 +186,10 @@ private:
 
   std::unordered_map<std::string, Tensor> T_;
   std::vector<cl_mem>                     owned_;
+  // P0: activation buffer pool + per-tensor liveness (static plan ⇒ assigned once in
+  // parse(), zero runtime cost).  Weights/input/output are kept out of the pool.
+  ActPool                                act_pool_;
+  std::vector<std::string>               act_names_;   // P0: activation tensors in the pool
   // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;

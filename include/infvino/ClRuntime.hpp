@@ -21,6 +21,108 @@
 namespace gk
 {
 
+/**
+ * @brief 激活缓冲池（P0）：把「每个中间张量一块常驻 cl_mem」改成「按生存期复用」。
+ *
+ * 与 OpenVINO `memory_pool` 同思路：先按尺寸找一块够大的空闲 buffer，若它的占用集合
+ * 与调用方给的「冲突集」（生存期重叠的张量 id）不相交则复用，否则新建。所有 buffer
+ * 由池持有并在析构时释放；`owned` 是新建计数，用于度量复用率。
+ *
+ * 全 fp16、行主序，因此无需关心元素类型/对齐差异。
+ *
+ * 用法（静态计划，分配在 parse 期一次完成，run 期零开销）：
+ *   ActPool pool;
+ *   cl_mem m = pool.acquire(bytes, conflict_ids);  // conflict_ids = 已占用该 buffer 的组
+ */
+class ActPool
+{
+public:
+  ActPool() = default;
+  ~ActPool()
+  {
+    for (auto & b : bufs_)
+      if (b.mem) clReleaseMemObject(b.mem);
+  }
+  ActPool(const ActPool &) = delete;
+  ActPool & operator=(const ActPool &) = delete;
+
+  /**
+   * @param alloc       底层分配器（clCreateBuffer）。
+   * @param bytes       需要的字节数。
+   * @param conflict    本块一旦复用后会与哪些「张量 id」重叠；用于判断能否共享。
+   * @param id          当前张量的 id（用于把它记入被复用 buffer 的占用集合）。
+   */
+  cl_mem acquire(const std::function<cl_mem(size_t)> & alloc, size_t bytes,
+                 const std::vector<int> & conflict, int id)
+  {
+    // 找一块「够大、且占用集合与 conflict 不相交」的现成 buffer。
+    Buffer * best = nullptr;
+    for (auto & b : bufs_)
+    {
+      if (b.mem == nullptr || b.bytes < bytes) continue;
+      if (intersects(b.users, conflict)) continue;
+      if (best == nullptr || b.bytes < best->bytes) best = &b;  // 最省（尺寸最小的够用块）
+    }
+    if (best == nullptr)
+    {
+      Buffer nb;
+      nb.bytes = bytes;
+      nb.mem   = alloc(bytes);
+      bufs_.push_back(nb);
+      best = &bufs_.back();
+      newlyAllocatedBytes_ += bytes;
+      ++allocCount_;
+    }
+    best->users.push_back(id);
+    std::sort(best->users.begin(), best->users.end());
+    requestedBytes_ += bytes;
+    return best->mem;
+  }
+
+  size_t requestedBytes() const { return requestedBytes_; }
+  size_t allocatedBytes() const { return newlyAllocatedBytes_; }
+  size_t bufferCount() const { return bufs_.size(); }
+  size_t allocCount() const { return allocCount_; }
+
+  /** @brief 调试：每个 buffer 共享了哪些张量 id。 */
+  std::vector<std::string> debugSharing() const
+  {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < bufs_.size(); ++i)
+    {
+      std::string s = "buf" + std::to_string(i) + " bytes=" + std::to_string(bufs_[i].bytes) +
+                      " users=";
+      for (int u : bufs_[i].users) s += std::to_string(u) + ",";
+      out.push_back(s);
+    }
+    return out;
+  }
+
+private:
+  struct Buffer
+  {
+    cl_mem           mem{nullptr};
+    size_t           bytes{0};
+    std::vector<int> users;  // 共享过此 buffer 的张量 id（排序）
+  };
+
+  static bool intersects(const std::vector<int> & a, const std::vector<int> & b)
+  {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size())
+    {
+      if (a[i] == b[j]) return true;
+      if (a[i] < b[j]) ++i; else ++j;
+    }
+    return false;
+  }
+
+  std::vector<Buffer> bufs_;
+  size_t              requestedBytes_{0};
+  size_t              newlyAllocatedBytes_{0};
+  size_t              allocCount_{0};
+};
+
 struct DeviceInfo
 {
   std::string     name;
