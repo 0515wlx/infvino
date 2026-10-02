@@ -242,6 +242,17 @@ config/
   tuning.json       # 调优缓存（随仓库携带一份与本机匹配的）
 ```
 
+### R28 新增/变更（代码）
+
+| 文件 | 内容 |
+|---|---|
+| `include/infvino/Tuning.hpp` / `src/Tuning.cpp` | `OpSignature::params` + `custom()`；小算子 `expected_ops` 正期望 |
+| `include/infvino/Autotuner.hpp` / `src/Autotuner.cpp` | `candidatesSmall()`；`candidatesConv3x3` 自动加 `-DFIT_*`；gemm 小 tile |
+| `kernels/ops.cl` | `ew_binary_v/ew_unary_v/concat4_v/copy_c2/slice_axis3/maxpool3/resize_nn3/permute_0213_3d/bmm2/ew_binary_ch` |
+| `kernels/conv_ov.cl` / `conv_blk.cl` / `conv.cl` | `-DFIT_WH/FIT_COUT/FIT_CIN/FIT_CB` 编译期形状特化 |
+| `src/PlanModel.cpp` | `smallSig()` / `smallLaunch()` / `onlineTuneMissing()`；小算子走调优查表 |
+| `src/tools/tuning_test.cpp` | 新增 custom 签名 + 小算子候选自检 |
+
 ---
 
 ## 9. 落地节奏
@@ -249,9 +260,10 @@ config/
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **P0（已完成）** | TuningCache + OpSignature + ExpectedOps + conv3x3/conv1x1/depthwise 候选枚举 + kernel_autotune + PlanModel 查表 + bake + tuning_test | 三模型调优表生成；yolov8 busy −7.4%；数值逐位不变 |
-| P1 | gemm 独立候选实测（本代模型 1×1 已折叠成 conv1x1，gemm 节点少）| — |
-| P2 | JIT 形状特化（Wout/Hout 整块、Cin 整除）| 大层 +x% |
-| P3 | 在线 autotune（首推断按需调优子集，带缓存）| 部署端自适应 |
+| **P1（已完成）** | gemm/conv1x1-N>1 独立候选谱系（新增大块 + 小 M/N tile）| 由调优器按 shape 选；本代模型 1×1 已折叠成 conv1x1，gemm 节点少 |
+| **P2（已完成）** | JIT 形状特化（`FIT_WH/FIT_CIN/FIT_CB/FIT_COUT`，conv_ov/conv_blk/conv native）| 编译期（非运行时）去谓词；候选自动按签名对齐设置 |
+| **P3（已完成）** | 在线 autotune（`INFVINO_TUNING=online`，首推断按需调优未命中子集，带缓存）| 部署端自适应；默认关（开发板安全） |
+| **R28 扩展** | 小算子纳入调优（ew/copy/slice/concat/pool/resize/permute/bmm/gap 的数值等价变体）| 见 §9.2 |
 
 ### 9.1 P0 实测结果
 
@@ -319,6 +331,14 @@ INFVINO_TUNING=off ./build/kernel_run --plan models/yolov8n-pose/model.plan --re
 # 5) 单节点扫候选（调试用；一条命令少量配置）
 ./build/kernel_autotune --plan models/yolov8n-pose/model.plan --cache /tmp/t.json \
     --op conv3x3 --limit 1 --iters 10 --report --expected
+
+# 6) 小算子调优（R28）：每个 op 一批
+./build/kernel_autotune --plan models/yolov8n-pose/model.plan --cache config/tuning.json \
+    --op resize_nn --op permute_0213 --op concat4 --limit 1 --iters 8 --expected
+
+# 7) 在线调优（P3，仅部署端按需；开发板默认关闭）
+INFVINO_TUNING=online INFVINO_ONLINE_BUDGET=4 ./build/kernel_run \
+    --plan models/yolov8n-pose/model.plan --report --iters 3
 ```
 
 ### 关键环境变量
@@ -327,6 +347,10 @@ INFVINO_TUNING=off ./build/kernel_run --plan models/yolov8n-pose/model.plan --re
 |---|---|
 | `INFVINO_TUNING_CACHE` | 调优缓存路径（默认 `config/tuning.json`，相对 cwd / 源码树）|
 | `INFVINO_TUNING=off` | 强制禁用查表（走内置启发式，用于 A/B 对照）|
+| `INFVINO_TUNING=online` | **P3** 在线调优：加载模型时对「未命中」的签名按需 benchmark 并 merge（需 `profiling=true`）|
+| `INFVINO_ONLINE_BUDGET` | 在线调优的签名数上限（默认 4；开发板请保持小）|
+| `INFVINO_ONLINE_ITERS` | 在线调优每候选计时迭代数（默认 5）|
+| `INFVINO_ONLINE_OPS` | 在线调优的 op 子集（默认 `conv3x3,conv1x1,depthwise`）|
 
 ### 接入点一览（代码）
 
@@ -336,6 +360,7 @@ INFVINO_TUNING=off ./build/kernel_run --plan models/yolov8n-pose/model.plan --re
 | `include/infvino/Autotuner.hpp` / `src/Autotuner.cpp` | 候选枚举 + `autotuneOp` 计时选优 |
 | `src/PlanModel.cpp` `autotune()` / `tuningTargets()` | 复用 PlanModel 自己的缓冲/OSV 权重重排，按签名调优 |
 | `src/PlanModel.cpp` `dispatch` 各分支 | 查表命中 → 用缓存 kernel/options；未命中 → 内置启发式 |
+| `src/PlanModel.cpp` `smallSig()` / `smallLaunch()` | **R28** 小算子签名/接线的唯一来源，run 与 autotune 共用 |
 | `src/tools/kernel_autotune.cpp` | 离线工具（`--list/--limit/--iters/--report/--expected/--cache/--bake`）|
 | `src/tools/tuning_test.cpp` | 离线自检（CTest）|
 | `scripts/autotune.py` | 容器安全分批驱动（timeout + GPU HANG 自检 + merge 缓存）|
@@ -352,3 +377,91 @@ INFVINO_TUNING=off ./build/kernel_run --plan models/yolov8n-pose/model.plan --re
 
 P0 的判定标准：**在不动 kernel 源码的前提下**，仅靠自动选择配置，整网 kernel busy
 不劣于 R23 基线，且调优缓存能解释每个 shape 的「实测 vs 期望」余量。
+
+---
+
+## 11. Round 28：P1/P2/P3 + 小算子调优
+
+> 目标：把「自动调优基础设施」补全（P1/P2/P3），并把**小算子**（launch/带宽受限的
+> copy/slice/concat/ew/pool/resize/permute/bmm/gap）也纳入同一套候选枚举 + 中间标准。
+> 数值判据同 `docs/kernel.md`（`model_check` mean_rel<2e-2 & max_rel<5e-2）。
+
+### 11.1 P1 —— gemm / conv1x1-N>1 独立候选谱系
+
+`gemm` 节点在本代三个模型里已被 `onnx2plan` 折叠进 `conv1x1`，但 `conv1x1` 的 N>1 分支
+仍复用 `candidatesGemm`。R28 补上**小 M/N tile**（`BM=32/BN=64`、`BM=64/BN=32`），
+减少小层（mobilenet 的 96×49×576 类）的尾部浪费。`candidatesGemm` 就是唯一入口，
+`gemm` 节点若回归也会自动受益。
+
+### 11.2 P2 —— JIT 形状特化（编译期去谓词）
+
+关键点：**必须是编译期常量**。R24 试过运行时 `interior` 分支，热循环里更贵
+（40×40 8.77→7.30）而回退。R28 换成 `-DFIT_*` 宏，由**调用方在 build 时**决定：
+
+| kernel | 宏 | 条件 | 去掉的谓词 |
+|---|---|---|---|
+| `conv3x3_ov` | `FIT_WH` | `Wout%OBW==0 && Hout%OBH==0` | 输出 oy/ox 边界 |
+| `conv3x3_ov` | `FIT_COUT` | `Cout%(2·SG)==0` | 输出通道 leftover |
+| `conv3x3_blk` | `FIT_WH` | `Wout%OBW==0` | 输出列边界 |
+| `conv3x3_blk` | `FIT_COUT/FIT_CIN` | `Cout%16==0 / Cin%16==0` | 通道 leftover（含输入行快路径）|
+| `conv3x3_f16` | `FIT_WH/FIT_CIN/FIT_CB` | `Wout%TX / Hout%TY / Cin%CINC / Cout%CB` | 输出/staging 谓词 |
+
+`candidatesConv3x3` 按签名自动加 `-DFIT_*`（只有真的整除才加，语义不变），调优器逐 shape 实测。
+因为不同 FIT 组合产生不同 `options` 字符串，它们天然被 `TuningCache` 作为**独立变体**记录。
+
+**R28 实测**：31 个 conv3×3 签名只有少数 shape 整除，其中这些改选了 `fit` 变体（同会话）：
+
+| shape | 旧 | R28 | Δ |
+|---|---|---|---|
+| `112×112 s2 3→16` | `OBW=5` | `OBW=8` + fit | 单层 ~+5% |
+| `320×320 s2 3→16` | `OBW=4,OBH=4` | 同 + fit | 单层 ~+2% |
+| `160×160 s2 16→32` | — | `OBW=8,OBH=2` + fit | 单层 ~+3% |
+
+大层（`80×80 s1 64→64` 等）**不整除**（80 % 8 == 0 但 80×80 的 OBH=2 整除、已受益；
+真正的瓶颈仍是 R24 的延迟/波量化），因此 P2 的整网收益小于小算子调优。
+P2 的价值在于**基础设施**：调优器现在能对「形状整除」的层自动去掉谓词变体，
+且随模型/size 自动生效。
+
+### 11.3 P3 —— 在线调优（opt-in）
+
+`PlanModel` 构造时若 `INFVINO_TUNING=online` 且队列开了 profiling，就调用
+`onlineTuneMissing(budget, iters, ops)`：只处理**缓存未命中**的签名，按 `budget` 限量，
+结果 merge 进内存缓存。默认**关闭**（开发板长 GPU 任务的 hang 风险，见
+`docs/benchmark_protocol.md`），部署端若要自适应再显式打开。
+
+### 11.4 小算子纳入调优
+
+**基础设施**：`OpSignature` 增加通用 `std::vector<int> params` + `OpSignature::custom(op, params)`，
+以后加一个小算子不必再改结构体字段。`PlanModel::smallSig(node)` 是 (dispatch / autotune /
+tuningTargets) 三者共用的**唯一签名来源**；`smallLaunch(...)` 统一设置参数与网格几何。
+
+**候选**（`candidatesSmall`，全部**数值等价**——逐元素表达式与归约顺序不变）：
+
+| op | 变体 | 依据 |
+|---|---|---|
+| `ew_binary` / `ew_unary` | scalar vs `_v`(VEC 2/4/8) | 每 work-item 多个连续元素 |
+| `ew_binary` (bdims) | 通用 bcast vs `ew_binary_ch`（通道特化）| 通道标量 × 空间（SE Mul）|
+| `concat4` | scalar vs `_v`(VEC 2/4/8) | 同上 |
+| `copy_c` / `slice_axis` / `maxpool` / `resize_nn` | 1-D vs 2-D/3-D 网格 | 去 per-element div/mod |
+| `permute_0213` | 1-D vs `_3d` | 同上 |
+| `bmm` | 1-D vs `bmm2`(3-D) | 同上 |
+| `gap` | `gap_r` WGS 64/128/256 | 归约粒度 |
+
+**R28 实测**（一次小算子 sweep，196 条缓存；同会话 A/B）：
+
+| 模型 | baseline(off) | **R28 缓存** | 加速 |
+|---|---|---|---|
+| yolov8n-pose | 17.10 ms | **14.68 ms** | −14.2% |
+| yolo11n-pose | 19.92 ms | **17.04 ms** | −14.5% |
+| mobilenetv3-small | 3.07 ms | **2.83 ms** | −7.9% |
+
+单算子亮点（yolov8 per-run）：`resize_nn` 0.227→**0.114**（选 `resize_nn3`）、
+`permute` 0.063→**0.032**（`_3d`）、`gap`/`copy_c` 全形状改选 2-D/3-D 网格。
+
+**数值**：`model_check.py`（vs onnxruntime，缓存生效）
+yolov8 `mean_rel=5.28e-4 / max_rel=8.87e-3`、yolo11 `8.97e-4 / 1.96e-2`、
+mobilenet `1.31e-2 / 1.09e-2`，**三模型 PASS**。
+
+> `bmm`/`softmax` 仍偏慢（yolo11 0.80/0.54 ms）：`bmm2` 只是去索引开销，
+> 计算仍是「1 WI/输出 + 串行 K」，本质是 R22 记的 attention 网格饥饿，属 kernel 本体待改。
+
