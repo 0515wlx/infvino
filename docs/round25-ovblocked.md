@@ -92,3 +92,49 @@
 # 强制 blk 整网（审计）：把 plan 的 conv3x3 节点加 blk=1，INFVINO_TUNING=off 跑 kernel_run
 # 接入后逐层选：kernel_autotune --plan ... --op conv3x3 --limit N --iters M
 ```
+
+---
+
+## 7. 逐层 autotune 重扫结果（R26）
+
+用新候选集（OV 块谱系 + `conv3x3_blk` OBW 2/4/8 + native）重扫三个模型全部 31 个
+conv3×3 签名（`scripts/autotune.py --ops conv3x3 --batch 3 --iters 10`，逐批 HANG 自检）。
+**31 条里 13 条改选 `conv3x3_blk`、13 条 OV、5 条 native。**
+
+单层最大收益（blk 相对旧最优）：
+
+| shape | 旧 | 新(blk) | Δ |
+|---|---:|---:|---:|
+| 20×20 s1 256→64 | 3.62 | **6.77** | **+87%** |
+| 20×20 s1 256→51 | 2.91 | **5.44** | **+87%** |
+| 20×20 s1 64→64 | 3.17 | **5.31** | **+68%** |
+| 20×20 s1 51→51 | 2.46 | **3.40** | **+38%** |
+| 20×20 s2 128→128 | 4.45 | **5.97** | **+34%** |
+| 40×40 s1 64→32 | 5.24 | **6.95** | **+33%** |
+| 20×20 s1 128→128 | 6.19 | **7.27** | +18% |
+| 40×40 s1 32→32 | 4.14 | **4.87** | +18% |
+| 40×40 s2 128→128 | 8.76 | **9.88** | +13% |
+| 40×40 s2 64→128 | 8.01 | **8.97** | +12% |
+| 160×160 s1 16→8 | 3.79 | **3.99** | +5% |
+
+**整网 kernel busy（同会话 A/B，`kernel_run --report --iters 3`）**：
+
+| 模型 | 旧缓存 | **R26 新缓存** | 加速 |
+|---|---|---|---|
+| yolov8n-pose | 15.19 ms | **14.40 ms** | **−5.2%** |
+| yolo11n-pose | 17.96 ms | **17.04 ms** | **−5.1%** |
+| mobilenetv3-small | ~3.37 ms | **3.29 ms** | ~−2% |
+
+**数值**（`scripts/model_check.py`，vs onnxruntime，三个模型）：
+
+| 模型 | mean_rel | max_rel(amax) | 判定 |
+|---|---|---|---|
+| yolov8n-pose | 5.28e-04 | 8.87e-03 | PASS |
+| yolo11n-pose | 8.97e-04 | 1.96e-02 | PASS |
+| mobilenetv3-small | 1.31e-02 | 1.09e-02 | PASS |
+
+> 纯配置收益（不改 kernel），来源就是把 OV 阻塞式 conv 作为按 size 可选的第三条通路，
+> 且它专治 20×20 这类被波量化卡死的层。调优表 `config/tuning.json` 共 117 条。
+> 复现：`python3 scripts/autotune.py --model yolov8n-pose --ops conv3x3`（已 tuned 的会跳过；
+> 需要重扫先删对应 `conv3x3|...` 条目，或用 `kernel_autotune --retune` 单签名重扫）。
+

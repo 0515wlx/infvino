@@ -172,6 +172,13 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > 两条 OV 通路的现实天花板都在 **~12–14 ops**，差距是延迟/占用而非指令数。
 > 详见 [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md)。
 >
+> **R26（逐层重扫）**：用新候选集（OV 块 + blk OBW2/4/8 + native）重扫 31 个 conv3×3
+> 签名，**13 条改选 blk**（其余 13 OV / 5 native），最大单层 **+87%**（20×20 s1 256→64）。
+> 整网 kernel busy 同会话 A/B：**yolov8n 15.19→14.40 ms（−5.2%）**、
+> **yolo11n 17.96→17.04 ms（−5.1%）**；`model_check` 三模型 **ALL PASS**。
+> 纯配置收益（不改 kernel），来源就是让 OV 阻塞式 conv 按 size 可选。详见
+> [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) §7。
+>
 > **自动调优（P0）**：引入分层自动调优体系（[`docs/autotuning.md`](docs/autotuning.md)）：
 > `OpSignature` + `TuningCache`（按设备/op/shape）+ 候选枚举 + **中间标准 `expected_ops`**。
 > 不改任何 kernel 源码，仅靠自动选择配置，yolov8n conv3×3 分项 **10.98→9.71 ms（−11.6%）**、
@@ -190,7 +197,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 - [x] concat 3-D 网格 + 主机侧 kernel 缓存（R23）
 - [x] 分层自动调优体系（P0）：TuningCache + 候选枚举 + 中间标准 expected_ops + `kernel_autotune`
 - [x] conv3×3 阻塞式 kernel（R25 完整移植 OV `convolution_gpu_bfyx_f16`）+ 接入 autotune 候选；两条 OV 通路现实上限 ~12–14 ops
-- [ ] conv3×3 逐层 autotune 重扫（blk 候选 + R24 中间标准）；当前 osv32 已到 ~8–13 ops
+- [x] conv3×3 逐层 autotune 重扫（blk 候选 + R24 中间标准）：yolov8n/yolo11n −5%；osv32 大层 ~8–13、blk 小层 +13–87%
 - [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟；busy 17.2 vs 墙钟 22.3 ms）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）
