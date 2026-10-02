@@ -50,7 +50,7 @@ struct OpSignature
   static OpSignature conv1x1(int Cout, int N, int Cin, int act, int res);
   /** @brief R30c: fused `concat4 -> conv1x1` (Cin split into ca/cb/cc/cd). */
   static OpSignature conv1x1Cat4(int Cout, int N, int Cin, int ca, int cb, int cc, int cd,
-                                 int act, int res);
+                                 const int *off, int act, int res);
   static OpSignature depthwise(int Wout, int Hout, int stride, int pad, int Cin, int K, int act);
   static OpSignature gap(int C, int HW);
   /** @brief 通用小算子签名（Round 28）：op 名 + 有序维度列表。*/

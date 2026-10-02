@@ -140,11 +140,13 @@ OpSignature OpSignature::conv1x1(int Cout, int N, int Cin, int act, int res)
   return s;
 }
 OpSignature OpSignature::conv1x1Cat4(int Cout, int N, int Cin, int ca, int cb, int cc, int cd,
-                                     int act, int res)
+                                     const int *off, int act, int res)
 {
   OpSignature s;
   s.op = "conv1x1_cat4"; s.Cout = Cout; s.N = N; s.Cin = Cin; s.act = act;
+  // 分段 + 每段的源内 offset（offset 只影响取址，不影响性能；不入签名以复用调优项）。
   s.params = {ca, cb, cc, cd};
+  (void)off;
   if (res) s.groups = 2;
   return s;
 }

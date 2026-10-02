@@ -309,25 +309,46 @@ void PlanModel::fuseConcatConv1x1()
     if (attrInt(cat, "outer", 1) != 1) continue;
     int ca = attrInt(cat, "ca", 0), cb = attrInt(cat, "cb", 0),
         cc = attrInt(cat, "cc", 0), cd = attrInt(cat, "cd", 0);
-    // 允许尾部的 cd==0 / cc==0（concat 只用了 2–3 路）：对应的源写成 "-"。
     if (ca <= 0) continue;
-    if (cb <= 0 && cc == 0 && cd == 0) { /* single-source concat: skip (点到点 copy) */ }
-    // 4 个槽位：缺失（cnt==0 或 "-"）的源用一个非空张量占位（内核不会索引它）。
-    bool ok = true;
+    // 4 个槽位；缺失（cnt==0 或 "-"）的源用占位（内核不会索引它）。
     std::string s0 = cat.ins[0], s1 = cat.ins[1], s2 = cat.ins[2], s3 = cat.ins[3];
-    auto real = [&](const std::string & s) { return s != "-" && T_.count(s); };
-    if (!real(s0)) { ok = false; }
-    if (cb > 0 && !real(s1)) ok = false;
-    if (cc > 0 && !real(s2)) ok = false;
-    if (cd > 0 && !real(s3)) ok = false;
+    int o0 = 0, o1 = 0, o2 = 0, o3 = 0;   // 源内的 channel offset
+    const int cnts[4] = {ca, cb, cc, cd};
+    std::string * ss[4] = {&s0, &s1, &s2, &s3};
+    int * offs[4] = {&o0, &o1, &o2, &o3};
+    bool ok = true;
+    for (int j = 0; j < 4; ++j)
+    {
+      if (cnts[j] <= 0) continue;
+      std::string & s = *ss[j];
+      if (s == "-" || !T_.count(s)) { ok = false; break; }
+      // 源若是一个 copy_c(X, c0, cnt) 且 cnt==本段，则可直接用 X 本身 + offset c0，
+      // 省掉这次 copy（Split 的一半往往就是父张量的一段）。
+      auto cp = producer.find(s);
+      if (cp != producer.end() && nodes_[cp->second].op == "copy_c" &&
+          useCount[s] == 1 &&
+          attrInt(nodes_[cp->second], "cnt", 0) == cnts[j] &&
+          attrInt(nodes_[cp->second], "dst_off", 0) == 0 &&
+          T_.count(nodes_[cp->second].ins[0]))
+      {
+        *offs[j] = attrInt(nodes_[cp->second], "c0", 0);
+        s = nodes_[cp->second].ins[0];
+        remove[cp->second] = 1;
+      }
+    }
     if (!ok) continue;
-    if (!real(s1)) s1 = s0;
-    if (!real(s2)) s2 = s0;
-    if (!real(s3)) s3 = s0;
+    // 占位：缺失源用 s0，cnt=0 保证不被索引。
+    if (cb <= 0) { s1 = s0; o1 = 0; }
+    if (cc <= 0) { s2 = s0; o2 = 0; }
+    if (cd <= 0) { s3 = s0; o3 = 0; }
     n.attr["cat_ca"] = std::to_string(ca);
     n.attr["cat_cb"] = std::to_string(cb);
     n.attr["cat_cc"] = std::to_string(cc);
     n.attr["cat_cd"] = std::to_string(cd);
+    n.attr["cat_o0"] = std::to_string(o0);
+    n.attr["cat_o1"] = std::to_string(o1);
+    n.attr["cat_o2"] = std::to_string(o2);
+    n.attr["cat_o3"] = std::to_string(o3);
     n.ins[1] = s0;
     n.ins.insert(n.ins.begin() + 2, s1);
     n.ins.insert(n.ins.begin() + 3, s2);
@@ -984,8 +1005,11 @@ void PlanModel::run()
       const int Cin  = static_cast<int>(w.dims[1]);
       const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
                 cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
-      const int64_t anum = in(1).numel();
-      const int HW = (ca > 0) ? static_cast<int>(anum / ca) : 0;
+      const int o0 = attrInt(n, "cat_o0", 0), o1 = attrInt(n, "cat_o1", 0),
+                o2 = attrInt(n, "cat_o2", 0), o3 = attrInt(n, "cat_o3", 0);
+      // HW 从**输出**张量取（源可能是父张量、比一段大）。
+      const int64_t onumel = out.numel();
+      const int HW = (Cout > 0) ? static_cast<int>(onumel / Cout) : 0;
       cl_mem dA = w.mem, dC = out.mem;
       cl_mem dB0 = in(1).mem, dB1 = in(2).mem, dB2 = in(3).mem, dB3 = in(4).mem;
       cl_mem db = (n.ins.size() > 5 && n.ins[5] != "-") ? in(5).mem : nullptr;
@@ -1000,8 +1024,9 @@ void PlanModel::run()
       if (Cin < 32) t.SG = 0;
       t.EPI = 1; t.ACT = act; t.ASYNC = 0; t.PF = 0; t.GN = 0;
       std::string gopts = t.options() + " -DCAT4=1";
-      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act,
-                                                       dres ? 1 : 0);
+      const int coff[4] = {o0, o1, o2, o3};
+      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
+                                                       act, dres ? 1 : 0);
       if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
       cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
       auto optInt = [&](const char * key, int def) {
@@ -1024,6 +1049,10 @@ void PlanModel::run()
       clSetKernelArg(kg, 11, sizeof(ca), &ca);
       clSetKernelArg(kg, 12, sizeof(cb), &cb);
       clSetKernelArg(kg, 13, sizeof(cc), &cc);
+      clSetKernelArg(kg, 14, sizeof(o0), &o0);
+      clSetKernelArg(kg, 15, sizeof(o1), &o1);
+      clSetKernelArg(kg, 16, sizeof(o2), &o2);
+      clSetKernelArg(kg, 17, sizeof(o3), &o3);
       const size_t lws[2] = {t.localX(), t.localY()};
       const size_t gws[2] = {
         static_cast<size_t>((HW + t.BN - 1) / t.BN) * lws[0],
@@ -1654,9 +1683,11 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
       const int Cout = (int)wd[0], Cin = (int)wd[1];
       const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
                 cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
-      const int HW = ca > 0 ? (int)(T_.at(n.ins[1]).numel() / ca) : 0;
+      const int HW = Cout > 0 ? (int)(T_.at(n.outs[0]).numel() / Cout) : 0;
       const bool res = n.ins.size() > 6 && n.ins[6] != "-";
-      add(OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act, res ? 1 : 0));
+      const int coff[4] = {attrInt(n, "cat_o0", 0), attrInt(n, "cat_o1", 0),
+                           attrInt(n, "cat_o2", 0), attrInt(n, "cat_o3", 0)};
+      add(OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff, act, res ? 1 : 0));
     } else if (n.op == "conv1x1" && want("conv1x1")) {
       const int act = attrInt(n, "act", 0);
       const auto & wd = T_.at(n.ins[0]).dims;
@@ -1883,15 +1914,18 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       const int Cin  = static_cast<int>(w.dims[1]);
       const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
                 cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
-      const int64_t anum = ref(n.ins[1]).numel();
-      const int HW = (ca > 0) ? static_cast<int>(anum / ca) : 0;
+      const int o0 = attrInt(n, "cat_o0", 0), o1 = attrInt(n, "cat_o1", 0),
+                o2 = attrInt(n, "cat_o2", 0), o3 = attrInt(n, "cat_o3", 0);
+      const int64_t onumel = ref(n.outs[0]).numel();
+      const int HW = (Cout > 0) ? static_cast<int>(onumel / Cout) : 0;
       cl_mem dA = w.mem, dC = ref(n.outs[0]).mem;
       cl_mem dB0 = ref(n.ins[1]).mem, dB1 = ref(n.ins[2]).mem,
              dB2 = ref(n.ins[3]).mem, dB3 = ref(n.ins[4]).mem;
       cl_mem db = (n.ins.size() > 5 && n.ins[5] != "-") ? ref(n.ins[5]).mem : nullptr;
       cl_mem dres = (n.ins.size() > 6 && n.ins[6] != "-") ? ref(n.ins[6]).mem : nullptr;
-      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act,
-                                                       dres ? 1 : 0);
+      const int coff[4] = {o0, o1, o2, o3};
+      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
+                                                       act, dres ? 1 : 0);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
       if (!shouldTune(sig)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(HW) * Cin;
@@ -1923,6 +1957,10 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         clSetKernelArg(kg, 11, sizeof(ca), &ca);
         clSetKernelArg(kg, 12, sizeof(cb), &cb);
         clSetKernelArg(kg, 13, sizeof(cc), &cc);
+        clSetKernelArg(kg, 14, sizeof(o0), &o0);
+        clSetKernelArg(kg, 15, sizeof(o1), &o1);
+        clSetKernelArg(kg, 16, sizeof(o2), &o2);
+        clSetKernelArg(kg, 17, sizeof(o3), &o3);
         const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
         const size_t gws[2] = {
           static_cast<size_t>((HW + BN - 1) / BN) * lws[0],

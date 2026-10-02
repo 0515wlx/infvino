@@ -187,16 +187,17 @@ __kernel void gemm_f16(__global const half *restrict A,
                        , __global const half *restrict B2
                        , __global const half *restrict B3
                        , const int ca, const int cb, const int cc
+                       , const int o0, const int o1, const int o2, const int o3
 #endif
                        ) {
 #if CAT4
   // R30c: logical B row `gr` -> source buffer + row-in-source.  Sources are
   // contiguous channel slices; ca/cb/cc are the channel counts of b0/b1/b2 (b3 = rest).
 // (macro, not a function/lambda — OpenCL C 1.2 has neither lambdas nor function ptrs)
-#define brow(gr) ((gr) < ca ? (B + (size_t)(gr) * N) : \
-                  ((gr) < ca + cb ? (B1 + (size_t)((gr) - ca) * N) : \
-                   ((gr) < ca + cb + cc ? (B2 + (size_t)((gr) - ca - cb) * N) : \
-                    (B3 + (size_t)((gr) - ca - cb - cc) * N))))
+#define brow(gr) ((gr) < ca ? (B + (size_t)(o0 + (gr)) * N) : \
+                  ((gr) < ca + cb ? (B1 + (size_t)(o1 + (gr) - ca) * N) : \
+                   ((gr) < ca + cb + cc ? (B2 + (size_t)(o2 + (gr) - ca - cb) * N) : \
+                    (B3 + (size_t)(o3 + (gr) - ca - cb - cc) * N))))
 #endif
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
