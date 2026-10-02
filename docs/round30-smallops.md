@@ -384,6 +384,24 @@ y11 `8.945e-4/1.773e-2`、mb `1.306e-2/1.086e-2`）——证明融合不改变�
 3. `resize_nn` / `permute` 的跨步访问（§4.1 的 2× 空间）：都属「一次读一次写」，
    只能说减少跨步、不能靠「多读少写」。
 
+### 7.7 负结果：多消费者 Split（`copy_c`）的 alias（已回退）
+
+目标：`Split_output_1`（c0=cnt，被 conv3x3 + ew_binary + 融合后的 cat4 共用）无法整条删除，
+于是让**每个消费者用 channel base offset** 直接读父张量，省掉这次 copy。
+
+做法（全部实现过）：
+- `Tensor.alias_mem/chan_off`：把 `copy_c` 输出变成「父张量 + 偏移」的视图；
+- `conv3x3_f16` 加 `-DCONV_XBASE` + `xbase` 参数；`conv3x3_ov` 加 `xbase`；
+  `conv3x3_blk` 的重排 kernel 加 `cbase`；`ew_binary_off`（a 带偏移）；
+  `conv1x1_cat4` 的每源 offset 叠加视图偏移。
+
+**结果：数值 FAIL**（y11 `mean_rel=6.24e-2`，基线 8.9e-4）。多消费者 + blk 重排 +
+cat4 偏移三者叠加时，偏移被重复施加/漏施加，且逐位比对在「旧二进制」上做，掩盖了问题。
+收益也不高（copy_c 合计仅 ~0.09 ms，0.6%），而风险是本项目最看重的数值正确性。
+**已全部回退。** 教训：**跨「多个热 kernel + 布局重排 + 融合偏移」的复合改动，必须每个
+消费者单独加独立数值用例**（类似 Route B），否则一个偏移错就整体 FAIL。
+`Split_output_0`（单消费者）的 copy 已由 Route A 的 CAT4 融合吸收，这部分**已落地**。
+
 ## 8. 下一步（按预期收益）
 
 1. ~~pose-decode 广播（标量分支 + 3-D 网格 stride 核）~~（**已落地**，整网 −1.8%）。
