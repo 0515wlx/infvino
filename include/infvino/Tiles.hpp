@@ -127,6 +127,15 @@ struct Conv3x3Cfg
   int PROBE = 0;
   // Round 15: SIMD width override (0 = IGC decides; 16 avoids the SIMD8 cliff).
   int SG = 0;
+  // Round 18: double-buffered CINC software pipeline (kernels/conv.cl:conv3x3_db).
+  int DB = 0;
+  // Round 18: coalesced weight staging loop order (kernels/conv.cl: -DWCOAL).
+  // On by default — pure loop reorder, numerically identical, +5–12% on s1.
+  int WC = 1;
+  // Round 18: skip input SLM staging, read strips directly from global (-DXGN).
+  int XG = 0;
+  // Round 19: skip weight SLM tile, read repacked weights from GPU L3 (-DWGL).
+  int WGL = 0;
 
   std::string options() const
   {
@@ -137,6 +146,9 @@ struct Conv3x3Cfg
       << " -DPAD=" << PAD << " -DACT=" << ACT << " -DUNROLL_CI=" << UNROLL_CI
       << " -DVECC=" << VECC << " -DSG=" << SG << " -DVECO=" << VECO
       << " -DWVEC=" << WVEC << " -DPROBE=" << PROBE
+      << " -DWCOAL=" << WC
+      << " -DXGN=" << XG
+      << " -DWGL=" << WGL
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -145,7 +157,7 @@ struct Conv3x3Cfg
     std::ostringstream o;
     o << "TX" << TX << " TY" << TY << " TM" << TM << " TN" << TN << " CB" << CB
       << " CINC" << CINC << " s" << STRIDE << " act" << ACT << " u" << UNROLL_CI
-      << " v" << VECC << " sg" << SG << " veco" << VECO << (RT ? " rt" : "") << (OSV ? " osv" : "") << (SGK ? " sgk" : "");
+      << " v" << VECC << " sg" << SG << " veco" << VECO << (RT ? " rt" : "") << (OSV ? " osv" : "") << (SGK ? " sgk" : "") << (DB ? " db" : "");
     return o.str();
   }
 };
@@ -176,6 +188,10 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 15) c.SGK = v[15];
   if (v.size() > 16) c.WVEC = v[16];
   if (v.size() > 17) c.PROBE = v[17];
+  if (v.size() > 18) c.DB = v[18];
+  if (v.size() > 19) c.WC = v[19];
+  if (v.size() > 20) c.XG = v[20];
+  if (v.size() > 21) c.WGL = v[21];
   return c;
 }
 

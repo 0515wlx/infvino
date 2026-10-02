@@ -155,8 +155,12 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
       k = rt.buildKernel("conv_sg", "conv3x3_sg", c.options());
     else if (c.OSV)
       k = rt.buildKernel("conv_osv", "conv3x3_osv", c.options());
+    else if (c.RT)
+      k = rt.buildKernel("conv", "conv3x3_rt", c.options());
+    else if (c.DB)
+      k = rt.buildKernel("conv", "conv3x3_db", c.options());
     else
-      k = rt.buildKernel("conv", c.RT ? "conv3x3_rt" : "conv3x3_f16", c.options());
+      k = rt.buildKernel("conv", "conv3x3_f16", c.options());
   } catch (const std::exception & e) {
     std::fprintf(stderr, "[build-fail] %s\n", e.what());
     return 1;
@@ -175,7 +179,20 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   cl_mem dB = rt.alloc((size_t)s.Cout * 2, CL_MEM_READ_ONLY);
   cl_mem dY = rt.alloc((size_t)s.Cout * Hout * Wout * 2, CL_MEM_WRITE_ONLY);
   rt.write(dX, (size_t)s.Cin * s.H * s.W * 2, hX.data());
-  rt.write(dW, (size_t)s.Cout * s.Cin * 9 * 2, hWt.data());
+  if (c.WGL || c.SGK) {
+    // Repack [Cout][Cin][KHKW] -> [Cin][KHKW][Cout] so the CB weights for one
+    // (ci,kk) are contiguous. Round 19: also used by the lane=channel OV-style
+    // kernel (conv3x3_sg), whose per-lane weight reads were otherwise strided by
+    // Cin*KHKW -> 16 different cache lines per load.
+    std::vector<uint16_t> hWg((size_t)s.Cin * 9 * s.Cout);
+    for (int oc = 0; oc < s.Cout; ++oc)
+      for (int ci = 0; ci < s.Cin; ++ci)
+        for (int kk = 0; kk < 9; ++kk)
+          hWg[((size_t)ci * 9 + kk) * s.Cout + oc] = hWt[((size_t)oc * s.Cin + ci) * 9 + kk];
+    rt.write(dW, hWg.size() * 2, hWg.data());
+  } else {
+    rt.write(dW, (size_t)s.Cout * s.Cin * 9 * 2, hWt.data());
+  }
   rt.write(dB, (size_t)s.Cout * 2, hB.data());
   clSetKernelArg(k, 0, sizeof(dX), &dX);
   clSetKernelArg(k, 1, sizeof(dW), &dW);
@@ -603,10 +620,11 @@ int main(int argc, char ** argv)
       Shape g{s.Cout, s.H * s.W, s.Cin, "conv1x1"};
       rc |= benchGemm(rt, tiles, g, iters, verify);
     }
-  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg") {
+  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;
     if (op == "conv3x3sg") conv.SGK = 1;
+    if (op == "conv3x3db") conv.DB = 1;
     std::printf("[%s] %s\n", op.c_str(), conv.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "p3-3x3"}, {64, 64, 40, 40, "p4-3x3"}};
     for (const auto & s : conv_shapes) rc |= benchConv(rt, conv, s, iters, verify);

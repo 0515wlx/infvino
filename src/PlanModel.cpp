@@ -322,6 +322,7 @@ void PlanModel::run()
       cfg.PAD    = attrInt(n, "pad", 1);
       cfg.ACT    = attrInt(n, "act", cfg.ACT);
       cfg.SG     = 16;  // Round 15: pin SIMD16 (see Tiles.hpp / docs R15)
+      cfg.WC     = 1;   // Round 18: coalesced weight staging (+5% on 3x3)
       const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
       // Round 15: adaptive spatial tile. The old fixed TX=64 wasted up to 3x on
       // the small (20x20) stages and left too few work-groups; per-shape sweeps
@@ -329,13 +330,22 @@ void PlanModel::run()
       cfg.TX = (Wout >= 40) ? 40 : (Wout >= 20 ? 20 : 16);
       if (cfg.TX > Wout) cfg.TX = Wout;
       cfg.TY = 8;
-      cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
       const auto & id = in(0).dims;
       const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
       int Cin  = static_cast<int>(id[base]), H = static_cast<int>(id[base + 1]);
       int W    = static_cast<int>(id[base + 2]);
       const auto & od = out.dims;
       int Cout = static_cast<int>(od[od.size() >= 3 ? od.size() - 3 : 0]);
+      // Round 18: adaptive output-channel block. CB=32 stages/accumulates 32
+      // channels per work-group; when Cout<=16 that wastes half the block, and
+      // when the spatial grid is small the total work-group count is too low to
+      // fill 80 EUs. Measured rule: CB=16 if Cout<=16 or the CB=32 grid has <16
+      // work-groups (e.g. 64->64@40 6.2->7.8, 16->16@160 4.8->7.0, 256->64@20
+      // 1.6->2.5 ops/EU/cyc).
+      const int spatial = ((Wout + cfg.TX - 1) / cfg.TX) * ((Hout + cfg.TY - 1) / cfg.TY);
+      const int wgs32   = spatial * ((Cout + 31) / 32);
+      if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;
+      cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
       cl_mem dx = in(0).mem, dw = in(1).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
       clSetKernelArg(kk, 0, sizeof(dx), &dx);
@@ -355,7 +365,10 @@ void PlanModel::run()
         static_cast<size_t>((Wout + cfg.TX - 1) / cfg.TX) * lws[0],
         static_cast<size_t>((Hout + cfg.TY - 1) / cfg.TY) * lws[1],
         static_cast<size_t>((Cout + cfg.CB - 1) / cfg.CB)};
-      timed("conv3x3", kk, 3, gws, lws);
+      timed("conv3x3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+              std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
+              std::to_string(Cout),
+            kk, 3, gws, lws);
       clReleaseKernel(kk);
     }
     else if (n.op == "gemm")

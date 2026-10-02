@@ -1290,6 +1290,285 @@ bit2=跳过 staging、bit3=跳过 barrier。**关键：必须反汇编确认执�
 > （`convolution_gpu_bfyx_os_iyx_osv32`，direct conv，非 Winograd），
 > gemm = 10.4；infvino gemm 13.9（见上一轮横评，脚本 `/tmp/opencode/ov_ops.py`）。
 
+## Round 18 —— ISA 视角收口：staging 指令化 + 网格饥饿，以及 ops/EU/cyc 的理论/物理极限
+
+### 18.1 一句话
+
+conv（占整网 68–73%）的 ~30% 效率由**两堵墙**构成：
+**(1) global→SLM staging 的非 mad 指令 + 延迟暴露**——本机 ISA 没有通用 L1
+（[`xe-lp-isa.md`](xe-lp-isa.md)），全局复用只能显式进 SLM/GRF；
+**(2) 小空间层（20×20/40×40）的 work-group 网格饥饿**——80 EU 只喂到 6–12 个 WG。
+本轮用**权重 staging 合并访存（WCOAL）**与**自适应输出通道块（adaptive CB）**把
+conv3x3 从 15.0→12.5 ms（yolov8，−17%），整网 yolov8 **22.1→19.6 ms（−11%）**、
+yolo11 **24.8→22.3 ms（−10%）**，数值全 PASS。同时用新探针把「理论 32 / 纯 FMA 27–30 /
+staging-free 16.4 / GEMM 13.7 / conv 整核 10.3」这条标尺钉死。
+
+### 18.2 瓶颈再分解：staging 到底是「延迟」还是「指令」？
+
+R17.5 用 `PROBE` 得到「跳过 staging = 16.44」，但分不清 staging 里是**全局读延迟**还是
+**索引/边界/SLM 写指令**。R18 给 `conv.cl` 加了 `PROBE & 16`：保留 staging 的 div/mod、
+边界判断与 SLM 写，只把 `X[…]`/`Wt[…]` 的全局读换成寄存器常量（完全不碰全局内存）。
+@64→64 80×80 s1（WC=0）：
+
+| build | ops/EU/cyc | 含义 |
+|---|---|---|
+| normal | 9.81 | 全量 |
+| `PROBE=16`（staging 只写 SLM，无全局读）| 11.85 | 去掉全局读 **+21%** |
+| `PROBE=4`（完全跳过 staging）| 16.30 | 再去掉 div/mod/边界/SLM 写 **+38%** |
+| 纯寄存器 half2 FMA（R13/R17）| 27.4 | 结构上限 |
+
+→ staging 的损失里**全局读约 21%**，**索引/边界/SLM 写占更大头（相对再 +38%）**；
+两段不是简单相加。这直接解释了 18.6 的负结果：**双缓冲藏延迟对「指令那部分」无效**。
+
+### 18.3 优化一：WCOAL —— 权重 staging 合并访存（默认开启）
+
+权重是 `Wt[Cout][Cin][3][3]`。原 staging 让 `t`（输出通道）做最快下标，于是同一 sub-group
+内相邻 lane 读 `Wt[gout][gc][kk]` 的**步长 = Cin·KHKW·2 B**——每个 lane 命中不同 cache
+line（完全非合并），且每个 (gx,gy) 空间 WG 都重来一遍（20×）。改成 `(ci,kk)` 做最快下标后，
+一个 lane 群读的是**单输出通道连续的 `Cin·KHKW` 块**，合并访存；纯循环重排、逐位不变。
+
+| shape | WC=0 | **WC=1** | |
+|---|---|---|---|
+| 64→64@80 s1 | 9.84 | **10.31** | +5% |
+| 128→128@40 s1 | 9.77 | **10.39** | +6% |
+| 32→32@80 s1 | 7.50 | **8.37** | +12% |
+| 64→128@80 s2 | 6.55 | 6.65 | +1.5% |
+
+已设为默认（`Conv3x3Cfg::WC=1`）。
+
+### 18.4 优化二：自适应输出通道块 —— 治网格饥饿
+
+把 profile tag 细化为 `conv3x3@Wout×Hout s…_Cin…_Cout…` 后可见：**20×20 层占 conv 的
+38%**，而它们只有 1.4–3.1 ops。原因不是指令而是 **work-group 太少**：`CB=32` 时
+128→128@20 只有 `1×3×4 = 12` 个 WG，80 EU 严重饥饿。把 `CB` 降到 16 让 gz 翻倍：
+
+| shape | CB=32 | **CB=16** | 增益 |
+|---|---|---|---|
+| 16→16@160 s1 | 4.81 | **6.96** | +45% |
+| 256→64@20 s1 | 1.62 | **2.50** | +54% |
+| 64→64@20 s1 | 1.41 | **2.20** | +56% |
+| 128→128@20 s1 | 3.07 | **3.68** | +20% |
+| 64→64@40 s1 | 6.18 | **7.77** | +26% |
+| 128→64@40 s1 | 6.97 | **8.17** | +17% |
+| 3→16@320 s2 | 1.23 | **1.59** | +29% |
+| 64→64@80 s1 | **10.32** | 8.72 | CB=32 保持 |
+| 128→128@40 s1 | **10.38** | 8.52 | CB=32 保持 |
+
+落地规则（`PlanModel` 的 conv3x3 分支；`CB=32` 为默认）：
+
+```
+spatial = ceil(Wout/TX) * ceil(Hout/TY);
+wgs32   = spatial * ceil(Cout/32);
+if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;   // 否则保持 32
+```
+
+`Cout<=16` 治「半个通道块被浪费」（3→16@320、16→16@160）；`wgs32<16` 治网格饥饿。
+
+### 18.5 端到端
+
+| 模型 | R17 | **R18** | conv3x3 分项 |
+|---|---|---|---|
+| yolov8n-pose | 22.12 ms | **19.64 ms（−11.2%）** | 15.00 → **12.51 ms（−17%）** |
+| yolo11n-pose | 24.76 ms | **22.33 ms（−9.8%）** | — |
+| mobilenetv3-small | 6.29 ms | 6.27 ms（持平）| conv 占比小 |
+
+`numerical_check.py` 三模型 **ALL PASS**（yolov8 mean_rel=5.37e-4 / max_rel=1.87e-2；
+yolo11 9.91e-4 / 3.12e-2；mobilenet 1.20e-2 / 1.12e-2）。
+
+### 18.6 负结果（已实测，代码保留为记录）
+
+| 尝试 | 结果 | 原因 |
+|---|---|---|
+| **CINC 双缓冲软件流水**（新 `conv3x3_db`：chunk 循环 2× 展开、编译期缓冲下标、预取下一 chunk）| CINC8 **8.64**、CINC16 **5.91**（均 < 9.86）| IGC 在**单缓冲**里已把 global→SLM 与 compute 交织（反汇编里 global send 穿插在 mad 之间），所以双缓冲没有额外收益；而它把 SLM 翻倍 → occupancy 掉，净负。与 R12 GEMM「`SG=16` 后双缓冲不再必要」同源 |
+| **XGN**（输入 halo 不进 SLM，strip 直读全局）| **6.85** | 全局读延迟暴露在 mad 依赖链上；再次坐实 R12 `GN` 与 R17.3 |
+| CINC=32 | build-fail（SLM）| — |
+| CINC=8 / `UNROLL_CI`=1/5 | 9.82 / 9.95 / 9.76 | 不如 CINC=16 / U=3（10.31）|
+| TY=4/5/16、TX=80 | 5.8 / 3.7 / build-fail | 行 halo / 寄存器 / SLM |
+
+### 18.7 ops/EU/cyc 的理论极限与物理限制（本轮收口）
+
+**模型**：本机（Iris Xe 80 EU / 1.3 GHz）EU **每周期只发射 1 条向量指令**，FP16 靠
+packed half2 提供 **16 FMA/EU/cyc**。于是
+
+```
+ops/EU/cyc = 32 × (MAD 指令数 / 总发射指令数) × (实际 SIMD 宽度 / 16)
+```
+
+这一条式子把三类损失全部量化：**非 mad 指令**（load/地址/控制/barrier 争同一个发射槽）、
+**IGC 把 SIMD 降到 8（×0.5）**、以及**槽位停顿**。conv/GEMM 的优化本质就是
+「让每个发射槽都变成 SIMD16 的 mad」。R18.2 的探针正是该式子的直接证据。
+
+**层级标尺（本机实测）：**
+
+| 层级 | ops/EU/cyc | % of 32 | 卡在哪 |
+|---|---|---|---|
+| 理论峰值 | **32** | 100% | 16 packed FMA/EU/cyc |
+| 纯寄存器 FMA（h1/h2/h8，SG16）| 27.4–29.6 | 86–92% | 指令槽 + 循环开销（**结构上限**）|
+| GEMM compute-only（skipstage）| 17.7 | 55% | SLM 操作数 feed / 依赖链 |
+| **GEMM 整核（BK32 SG16）** | **13.7** | 43% | staging 31% + loads 17% + 寄存器占用 24% |
+| conv3x3 staging-free | 16.4 | 51% | SLM 权重块读延迟 |
+| **conv3x3 整核（R18，大层）** | **10.3** | 32% | staging + 网格饥饿（小层 2–8）|
+| OpenVINO 2025.2 conv3x3 | 16.0 | 50% | OV 不做 SLM staging |
+
+**物理限制（全部有 ISA 证据，见 [`xe-lp-isa.md`](xe-lp-isa.md)）：**
+
+1. **SIMD 宽度 = 寄存器大小压力**：只有 `intel_reqd_sub_group_size(16)` 才能在 staging
+   的寄存器压力下阻止 IGC 退到 SIMD8（R12/R13）。128 GRF/线程 × 32 B × 7 线程 =
+   **28 KB/EU 是硬墙**；寻址/调度/中间值就吃掉约 90 个寄存器，留给累加器 `TM×TN` 的只够
+   算术强度 ≈ 32，`TM=16/TN=8` 必 spill（R14）。
+2. **SLM 容量 ↔ 带宽 ↔ occupancy 耦合**：64 KB/WG、128 KB/DSS；带宽随常驻 WG 数上升
+   （4 KB/WG 时 558 GB/s，16 KB/WG 只 300 GB/s，R11）。双缓冲/大 tile 会同时推高容量、
+   降低并发、腰斩带宽——三者是同一约束。
+3. **没有通用 L1**：全局数据只在 **3.75 MB L3**（~300 GB/s）或 **DRAM ~19 GB/s** 之间；
+   「读一次用一次」（AI≈1）可用 L3，大 K 必须分块在 L3 内。**任何全局复用都必须显式进
+   SLM/寄存器**，这是 conv staging 存在的根本原因。
+4. **延迟**：FP16 FMA 延迟 ~29 cyc（FP32 ~54），需 ~29 条独立链填满；SEND/block-read
+   延迟数十 cyc。7 线程/EU 的 SMT 决定可并行 sub-group 数上限。
+5. **发射**：每周期 1 条向量指令 → 非 mad 指令与 mad 争槽，这是 staging 指令直接折损
+   吞吐的机制，也是「双缓冲无效」的根因（它藏延迟、不省指令）。
+
+**结论**：在不改算法（direct conv + SLM tile）的前提下，conv 的现实上限就是
+**~16 ops/EU/cyc（staging-free，≈OV）**；本轮把整核从 9.9 推到 10.3（大层），网格
+饥饿层 +20–56%。要再往上只能换数据通路（sub-group block-read / 寄存器交换）或换算法
+（Winograd 减少乘数）；而按 R14 的推导，前者只是把「寄存器墙」换成「SLM 带宽墙」，
+天花板同量级。
+
+### 18.8 复现
+
+```bash
+# staging 探针：normal / 无全局读(PROBE16) / 完全跳过(PROBE4)
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,0,0  --iters 30
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,16,0,0  --iters 30
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,4,0,0   --iters 30
+# WCOAL 对照（末三位 = WC,DB,XG）
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,0,0 --iters 30
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,1,0 --iters 30
+# 自适应 CB：同一 shape 扫 CB=32 / 16
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,40,40 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,1,0 --iters 30
+./build/kernel_bench --op conv3x3 --conv-shape 64,64,40,40 --conv 40,8,1,16,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,1,0 --iters 30
+# 负结果：双缓冲
+./build/kernel_bench --op conv3x3db --conv-shape 64,64,80,80 --conv 40,8,1,32,8,1,1,0,3,1,16,8,0,0,2,0,2,0,0,0,1 --iters 20
+# 端到端
+./build/kernel_run --plan models/yolov8n-pose/model.plan --report --iters 5
+```
+
+## Round 19 —— 「用 L2 带宽减轻 SLM 压力」的验证（负结果）+ 命名澄清
+
+**问题**：能不能调整算法，用（记得带宽挺高的）L2 去减轻 SLM 压力？
+
+**命名澄清（重要）**：这台机器 compute-API 里显示的 **"L2" 就是 GPU L3**
+（3.75 MiB，270–345 GB/s），不是 L1/L2/L3 三级里的 L2；Xe-LP **通用 L1 = 0**，
+HDC L1 只在驱动 MOCS 命中的小窗口启用（kernel 不可控）。真正 650–780 GB/s 的高带宽
+存储是 **SLM**（可编程 scratchpad），它**不是 cache**。所以字面意义上没有「高带宽 L2」
+可供 kernel 使用——之前笔记里那个「挺高的」要么是 SLM，要么是把 GPU L3（330）记成了 L2。
+
+**实验**：把最值得挪的一部分（**权重**）从 SLM 放到 GPU-L3。权重预重排成
+`[Cin][KHKW][Cout]`（输出通道连续 → 可合并/广播块读），跳过 `Ws` 的 SLM staging，
+内循环直接读 L3（新开关 `-DWGL`）。@64→64 80×80 s1：
+
+| 方案 | ops/EU/cyc |
+|---|---|
+| 权重+输入都在 SLM（R18 基线）| **10.26** |
+| 权重在 GPU-L3（WGL）| 8.93 |
+| WGL + CB16 | 8.28 |
+| WGL + CINC8 | 8.87 |
+| 输入+权重都在 GPU-L3（XGN+WGL，OV 式零 SLM）| **6.63** |
+
+**为什么带宽够也没用**：这一层的权重+输入总流量约 3.6 MB/层、0.46 ms 内 ≈ 8 GB/s，
+L3 的 330 GB/s 绰绰有余——**瓶颈不是带宽，是延迟**。`--op memlat` 实测全局
+pointer-chase 延迟在 16 KB–64 MB 全落在 **~140–190 cyc**（没有低延迟档），而 SLM 是
+几十 cyc。内循环一个 block read 只喂 16 条 mad，要藏住 ~150 cyc 需要每线程几十条独立
+操作，**128 GRF 放不下**。所以 SLM 的价值在「低延迟」，330 GB/s 的 L3 顶不上。
+
+**结论**：L3 带宽其实**已经在被利用**（staging 的全局读本来就命中 L3），但它不能替代
+SLM 作为**内循环操作数**的供给。这从数据通路角度再次坐实 R14/R17：本机可编程、低延迟
+的存储只有 **GRF + SLM** 两级；想突破 conv 的效率，只能改**数据通路**（sub-group
+block-read / 寄存器交换）或改**算法**（Winograd 减少乘数），而不是换缓存层。
+`-DWGL` 保留为负结果记录。
+
+## Round 20 —— OpenVINO conv 策略剖析 + 修正 R17.3 的误判
+
+### 20.1 OV 的 conv 用了什么
+
+对 `yolov8n-pose` 这类 3×3 s1 fp16/bfyx 层，OV 2025.2 单节点计时选中的是
+`convolution_gpu_bfyx_os_iyx_osv32`（源码 `~/openvino/src/plugins/intel_gpu/src/kernel_selector/
+cl_kernels/convolution_gpu_bfyx_os_iyx_osv32.cl`）。它的结构与我们的 `conv3x3_f16` 完全相反：
+
+| 维度 | OV `os_iyx_osv32` | 我们 `conv3x3_f16` |
+|---|---|---|
+| **lane 对应** | **输出通道**（`feature_idx = fmg*OSV_SIZE + lid`，每 lane 2 通道，`OSV_SIZE=32`）| **空间位置**（lane=列，通道在寄存器里展开 CB=32）|
+| 输入 | 每个 kd 把 `OBW×OBH` 的输入块**直接载入寄存器**（lane=空间 x，合并读），再用 `sub_group_broadcast` 把标量发给所有通道 lane | 先 global→**SLM** halo，再逐 (ci,kh) 读 strip |
+| 权重 | 预**swizzle** 成块读格式，每个 (kd,kr,kc) 一次 `UNIT_BLOCK_READ` 给每个 lane 自己 2 个通道 | SLM 通道连续块读（WCOAL 后合并）|
+| SLM / barrier | **零 SLM、零 barrier** | SLM 双层 + 每 chunk 2 个 barrier |
+| 网格 | `gws = (W/OBW, H/OBH, ceil(Cout/32))`，**一个 WG = 一个 sub-group**，WG 数极大（K3S1 默认 OBW=8、OBH=2）| WG=TX/TM×TY=320 work-item，WG 少（80×80 只有 40 个）|
+
+要点：**OV 用「lane=通道 + 输入块驻寄存器 + 广播」换掉了整个 staging 层**，代价是每个 mad
+前有一条 `sub_group_broadcast`（把某个空间输入广播给所有通道 lane）。所以它的内循环是
+**1 broadcast : 1 mad**，理论上限 ≈ 32/2 = 16——这正好等于它实测的 16.0。
+
+### 20.2 修正 R17.3：我们复刻失败的真因是「权重非合并」，不是「全局延迟」
+
+R17.3 的 `conv3x3_sg`（lane=通道、无 SLM）只有 **1.5**，当时归因于「全局输入延迟暴露」。
+R20 反汇编后**证伪**：kernel 里出现了 64 条 `send.dc0 byte scattering write 16b` + 21 条
+gather read —— 权重读 `Wt[oc*Cin*9 + kr*3+kc]` 相邻 lane 步长 `Cin*9`，**每个 lane 命中
+不同 cache line**，一次 load = 16 个 64 B 事务，整核根本不是算不动而是被权重的
+非合并全局读拖死。
+
+修法：把权重预重排成 **`[Cin][KHKW][Cout]`**（输出通道连续），lane 读变成 contiguous /
+可广播。同一 kernel、同一 shape：
+
+| conv3x3_sg @64→64 80×80 | ops/EU/cyc |
+|---|---|
+| R17.3（自然 `[Cout][Cin][9]` 布局）| 1.50 |
+| **R20（重排 `[Cin][9][Cout]`）** | **8.20**（OBW8/OBH4/VECO2）|
+
+反汇编确认已是 **SIMD16、`in[]` 在寄存器里（无 spill）**，`mad` 用寄存器标量广播
+（`r4.x<0>:hf`）。所以 R17.3 的结论要改：失败点是**访存布局**，不是「无 SLM 必然暴露延迟」。
+
+### 20.3 但 OV 策略在**本机、本模型**上仍然不如我们的 kernel
+
+修好合并访存后，把 OV 式 kernel 与 R18 的 `conv3x3_f16`（WCOAL+自适应 CB）逐 shape 对比：
+
+| shape | 我们（R18）| OV 式（R20，最好 OBW8/OBH4）|
+|---|---|---|
+| 64→64@80 s1 | **10.31** | 8.20 |
+| 128→128@20 s1 | **3.71** | 1.45 |
+| 256→64@20 s1 | **2.49** | 0.74 |
+| 16→16@160 s1 | **7.00** | 4.32 |
+
+**为什么**：两种结构的 16 上限来源不同——
+- **OV 式**：内循环 **1 broadcast : 1 mad**（静态 576 `mad` vs 715 `mov`），发射槽一半给了广播；
+  唯一突破办法是每 lane 多放通道（VECO4/8），但马上 spill（实测 0.2–5.1）。大块（OBW≥12）
+  也 spill/浪费。所以它稳定在 ~8。
+- **我们**：内循环 **输入/权重都是 ~1:16**（strip 被 3 kw×16 通道复用、权重块读喂 16 mad），
+  inner loop 的 staging-free 上限有 **16.4**；短板是 staging（R18.2 探针：全局读 +21%、
+  索引/边界/SLM 写 +38%）。
+
+换句话说：**OV 是「用广播费换掉 staging」，我们用「用 staging 费换掉广播」**，两者都撞在
+~16 的天花板，只是撞的位置不同。而在这台「无 L1、SLM 带宽-occupancy 耦合」的机器上，
+**lane=空间 + SLM** 这个角落比 **lane=通道 + 广播** 更划算（10.3 vs 8.2；小空间层差距更大，
+因为我们的自适应 CB 还能加网格，OV 的块粒度反而浪费）。
+
+### 20.4 重新分析后的结论与下一步
+
+> **核心现实：两条数据通路（lane=空间+SLM 的我们，lane=通道+广播的 OV）在
+> ops/EU/cyc 上的上限都是 ~16**——一条被 staging 卡在 16.4（staging-free），
+> 一条被 1 broadcast : 1 mad 卡在 16.0。想真正突破 16，只能减少**乘数**或换数据通路。
+
+1. **R18 的结论不变且被这轮加强**：WCOAL + 自适应 CB 是当前最优；OV 的路径不是更优解。
+2. **R17.3/R17.5 关于 OV 的两处判断要修正**：
+   - 「OV 快是因为不做 staging」——对；但「我们复刻不了是因为全局延迟」——错，是权重布局。
+   - OV 的 16.0 不是遥不可及的下限，而是它自己的 **broadcast 上限**；我们的 staging-free
+     上限（16.4）与它同量级。
+3. **真正能突破 ~16 的只有两条**：
+   - **减少乘数**：Winograd F(2×2,3×3)（MAC ↓2.25×）或 F(4×4,3×3)（↓4×）；OV 自己也有
+     `convolution_gpu_winograd_2x3_s1`，但它的 selector 在本机这些形状上没选 Winograd
+     （选了 direct），说明在低算术强度 + 8 宽 SIMD 上未必划算——这是下一轮值得实测的点。
+   - **换数据通路**：sub-group block-read / 寄存器交换（R14 判定只是把「寄存器墙」换成
+     「SLM 带宽墙」）。
+4. `conv3x3_sg`（OV 式）与 `-DWGL` 一起保留为**实验/负结果**工具，带正确的 `[Cin][9][Cout]`
+   权重布局要求；生产路径仍走 `conv3x3_f16`。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

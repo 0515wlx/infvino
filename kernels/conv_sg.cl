@@ -74,7 +74,7 @@ __attribute__((intel_reqd_sub_group_size(SG)))
 __attribute__((reqd_work_group_size(SG, 1, 1)))
 __kernel void conv3x3_sg(
   __global const half *restrict X,     // [Cin][H][W]
-  __global const half *restrict Wt,    // [Cout][Cin][3][3]
+  __global const half *restrict Wt,    // [Cin][3][3][Cout] (repacked; see bench/Plan)
   __global const half *restrict Bias,  // [Cout] or null
   __global half *restrict Y,           // [Cout][Hout][Wout]
   const int Cin, const int H, const int W,
@@ -116,7 +116,10 @@ __kernel void conv3x3_sg(
 #pragma unroll
         for (int v = 0; v < VECO; ++v) {
           const int oc = ocbase + v * SG + lane;
-          wv[v] = (oc < Cout) ? Wt[((size_t)oc * Cin + ci) * 9 + kr * 3 + kc] : (half)0;
+          // Weights arrive repacked as [Cin][KHKW][Cout]: for a fixed (ci,kk) the
+          // SG*VECO channel weights are contiguous, so the per-lane read is
+          // coalesced (was stride Cin*KHKW -> one cache line per lane).
+          wv[v] = (oc < Cout) ? Wt[((size_t)ci * 9 + kr * 3 + kc) * Cout + oc] : (half)0;
         }
 #pragma unroll
         for (int br = 0; br < OBH; ++br) {
