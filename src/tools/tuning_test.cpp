@@ -68,9 +68,14 @@ int main()
   // --- expected_ops：单调 + 上界 ---
   DeviceInfo d = dev();
   const double big = expectedOps(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1), d);
+  const double mid = expectedOps(OpSignature::conv3x3(40, 40, 1, 1, 64, 64, 1), d);
   const double small = expectedOps(OpSignature::conv3x3(20, 20, 1, 1, 64, 64, 1), d);
   CHECK(big > small, "larger grid -> higher expected (grid factor)");
-  CHECK(big <= kConvStagingFreeCeiling + 1e-9, "conv expected <= staging-free ceiling");
+  // R24: the middle standard now targets the issue-mix ceiling (~20.3), not the old
+  // ~16 "1 broadcast : 1 mad" reading (the broadcast is folded into the mad).
+  CHECK(mid <= kConvOvIssueCeiling + 1e-9, "conv expected <= OV issue ceiling");
+  CHECK(big <= kConvOvIssueCeiling + 1e-9, "conv expected <= OV issue ceiling");
+  CHECK(big > kConvStagingFreeCeiling, "R24: middle standard no longer anchored ~16");
   const double g = expectedOps(OpSignature::gemm(1024, 1024, 1024, 0), d);
   CHECK(g > 5.0 && g <= 17.7 + 1e-9, "gemm expected within (5, compute-only 17.7]");
   CHECK(expectedOps(c, d) >= 1.0, "expected has a positive floor");

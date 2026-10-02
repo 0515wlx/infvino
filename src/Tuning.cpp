@@ -306,13 +306,6 @@ double gridFactor(long n_wg, int eu)
   const double target = std::max(1.0, static_cast<double>(eu) * 2.0);  // R18: ~2 WG/EU 才喂饱
   return std::min(1.0, static_cast<double>(n_wg) / target);
 }
-
-// staging / 非 mad 指令对发射槽的折损。R18.2：conv staging 里全局读 +21%、
-// 索引/边界/SLM 写再 +38% → 合计 ~1/(1+0.6)。R14: GEMM staging 31% + loads 17%。
-double slotFraction(double stagingLoss)
-{
-  return 1.0 / (1.0 + stagingLoss);
-}
 }  // namespace
 
 double expectedOps(const OpSignature & s, const DeviceInfo & dev)
@@ -320,22 +313,23 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
   const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
 
   if (s.op == "conv3x3") {
-    // OV 式（lane=通道 + block-read 权重）：R20/R23 判定为 1 broadcast : 1 mad，
-    // 发射上限 ≈ 32/2 = 16；再乘网格占用。
-    // native direct conv：staging-free 16.4（R18），整核 ≈ 16.4 × slotFraction(0.6) ≈ 10.3。
-    const bool large = (s.Cout >= 32) && (s.Cin >= 32);
-    double ceiling = large ? kConvStagingFreeCeiling : 16.0;  // 小层复用不足，同样撞 ~16
-    // block 数：OV 的 gws = ceil(W/OBW)*ceil(H/OBH)*ceil(Cout/2/16)
+    // R24 修正：**不再把上限定成实测**。移植的 OV 内循环 ISA 是 288 packed mad /
+    // 453 指令（mad 占 63.6%，broadcast 已折进 mad 操作数），指令配额上限 ≈ 20.3，
+    // 而不是 R20/R23 的「1 broadcast : 1 mad → 16」。
+    //   expected = 32 × mad_frac × prologue_amort × grid_factor
+    // 其中 prologue_amort 摊薄每 WG 的固定开销（清零/存储/激活/尾部），短层吃亏；
+    // grid_factor 是 R18.4 的网格占用修正。缺口 = 尚未榨干的流水/延迟。
     const int obw = (s.stride == 2) ? 5 : 8;
     const int obh = (s.stride == 2) ? 4 : 2;
     const long n_wg = static_cast<long>((s.W + obw - 1) / obw) *
                       static_cast<long>((s.H + obh - 1) / obh) *
                       static_cast<long>(((s.Cout + 1) / 2 + 15) / 16);
-    // 发射上限来自 broadcast 结构，与网格无关；网格饥饿单独乘。
-    // 大层无饥饿时 16 × slotFraction(0.35) ≈ 12–13.6（与 R22 实测吻合）。
-    double e = (large ? ceiling * slotFraction(0.35) : ceiling * slotFraction(0.55));
+    const double work = static_cast<double>(s.Cin) * 9.0 * obw * obh;   // mads / WG
+    const double fixed = 24.0 + 6.0 * obw * obh;                        // 每 WG 固定指令
+    const double amort = work / (work + fixed);
+    double e = kPeakOpsPerEuCycle * kConvOvMadFraction * amort;
     e *= std::max(0.25, gridFactor(n_wg, eu));
-    e = std::min(e, kConvStagingFreeCeiling);
+    e = std::min(e, kConvOvIssueCeiling);
     return std::max(1.0, e);
   }
 

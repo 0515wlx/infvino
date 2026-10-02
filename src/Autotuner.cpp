@@ -24,7 +24,8 @@ std::string ovOptions(int obw, int obh, int stride, int pad, int act, int res)
 {
   std::ostringstream o;
   o << "-DOBW=" << obw << " -DOBH=" << obh << " -DSTRIDE=" << stride << " -DPAD=" << pad
-    << " -DACT=" << act << " -DRES=" << res << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+    << " -DACT=" << act << " -DRES=" << res
+    << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
   return o.str();
 }
 }  // namespace
@@ -33,6 +34,9 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
 {
   std::vector<Candidate> out;
   // OV osv32 的 block 谱系（R23 扫描过 8x2/5x2/6x2/4x4；再加 s2 的候选）。
+  // R24：ISA 反汇编显示 OV 内循环是 288 packed mad / 453 指令（mad 占 63.6%），
+  // `sub_group_broadcast` 已折进 mad 操作数——上限 ≈ 20，缺口在延迟/流水（见
+  // docs/kernel.md Round 24）。block 仍是主要可调维度。
   std::vector<std::pair<int, int>> blocks;
   if (sig.stride == 2) {
     blocks = {{5, 4}, {4, 4}, {5, 2}, {6, 2}, {8, 2}, {3, 4}};
@@ -49,22 +53,23 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
     c.config = ovConfig(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0);
     out.push_back(std::move(c));
   }
-  // native conv3x3_f16 作为回退候选（R18 自适应 tile 谱系），只在非 2-stride 时。
-  if (sig.stride != 2) {
-    for (int tx : {40, 20}) {
-      if (sig.W > 0 && tx > sig.W) continue;
-      for (int cb : {32, 16}) {
-        Conv3x3Cfg cfg;
-        cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = 16;
-        cfg.STRIDE = sig.stride; cfg.PAD = sig.pad; cfg.ACT = sig.act;
-        cfg.SG = 16; cfg.WC = 1;
-        Candidate c;
-        c.kernel = "conv3x3_f16";
-        c.source = "conv";
-        c.options = cfg.options();
-        c.config = cfg.label();
-        out.push_back(std::move(c));
-      }
+  // native conv3x3_f16（R18 自适应 tile 谱系）作为第二条通路候选——所有 shape 都枚举
+  //（含 stride=2），让调优器按 size 在「lane=通道 OV」与「lane=空间 SLM native」之间选。
+  // R22 起 OV 通常赢，但小通道 shape 上 native 偶尔更优（如 40×40 Cin32 Cout64、
+  // 160×160 Cin16 Cout16）；R23 记录 stride-2 native 用 TX=40 可 build。
+  for (int tx : {40, 20}) {
+    if (sig.W > 0 && tx > sig.W) continue;
+    for (int cb : {32, 16}) {
+      Conv3x3Cfg cfg;
+      cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = 16;
+      cfg.STRIDE = sig.stride; cfg.PAD = sig.pad; cfg.ACT = sig.act;
+      cfg.SG = 16; cfg.WC = 1;
+      Candidate c;
+      c.kernel = "conv3x3_f16";
+      c.source = "conv";
+      c.options = cfg.options();
+      c.config = cfg.label();
+      out.push_back(std::move(c));
     }
   }
   return out;

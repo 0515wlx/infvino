@@ -122,6 +122,18 @@ constexpr double kPeakOpsPerEuCycle = 32.0;
 constexpr double kRegisterFmaCeiling = 27.4;
 /** @brief staging-free conv3x3 上限（R18）。*/
 constexpr double kConvStagingFreeCeiling = 16.4;
+/**
+ * @brief conv3x3 OV 数据通路的**指令发射**上限（R24 ISA 实测）。
+ *
+ * 对移植的 `conv_ov.cl` 反汇编（OBW=8/OBH=2/s1）：主内循环 288 条 packed `mad` /
+ * 453 条指令 = 63.6% mad（`sub_group_broadcast` 被 IGC 折进 mad 操作数，没有独立
+ * 广播指令）。因此「指令配额」上限 = 32 × 0.636 ≈ 20.3，而不是 R20/R23 按
+ * 「1 broadcast : 1 mad」推断的 16。实测 80×80 只有 13.8（≈68% 配额）、40×40
+ * 只有 8.5（≈42%），缺口是**流水/延迟/占用**，不是指令数——这是 R24 要压榨的部分。
+ */
+constexpr double kConvOvIssueCeiling = 20.3;
+/** @brief conv3x3 OV 主循环的 mad 指令占比（R24 ISA：288/453）。*/
+constexpr double kConvOvMadFraction = 0.636;
 
 }  // namespace gk
 
