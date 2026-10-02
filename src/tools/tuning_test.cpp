@@ -86,6 +86,20 @@ int main()
   CHECK(has3d, "copy_c candidate set includes the 2-D grid variant");
   CHECK(expectedOps(ew1, d) > 0.0, "small-op expected_ops is positive");
 
+  // --- Round 30: 剩余 kernel 的内存 roofline 中间标准 ---
+  const auto cp1 = OpSignature::custom("copy_c", {25600, 16});
+  const auto cp2 = OpSignature::custom("copy_c", {400, 128});
+  CHECK(expectedOps(cp1, d) > expectedOps(cp2, d), "R30: bigger copy -> higher expected");
+  const double eb = expectedOps(OpSignature::custom("ew_binary_bcast", {285600, 2, 0, 0}), d);
+  CHECK(eb > 0.05 && eb < 1.0, "R30: bcast expected in memory-roofline range");
+  const double bm = expectedOps(OpSignature::custom("bmm", {1, 2, 64, 400, 400}), d);
+  CHECK(bm > 0.0 && bm < 0.1, "R30: bmm expected is compute/grid bounded");
+  const double dw = expectedOps(OpSignature::depthwise(80, 80, 1, 1, 64, 3, 1), d);
+  CHECK(dw > 0.5 && dw < 4.0, "R30: depthwise expected = ISA instruction quota (~2.8)");
+  CHECK(expectedOps(OpSignature::gap(120, 196), d) > 0.0, "R30: gap expected positive");
+  CHECK(expectedOps(OpSignature::custom("softmax_axis", {1, 16, 33600}), d) > 0.0,
+        "R30: softmax expected positive");
+
   // --- expected_ops：单调 + 上界 ---
   const double big = expectedOps(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1), d);
   const double mid = expectedOps(OpSignature::conv3x3(40, 40, 1, 1, 64, 64, 1), d);

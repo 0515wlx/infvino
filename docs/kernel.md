@@ -1892,6 +1892,51 @@ R24 三个方向（split-K、双累加集、内部块 fast path）全部实测�
 [`docs/round24-analysis.md`](round24-analysis.md) §3/§5。
 
 
+## Round 30 —— 剩下的 kernel（非 conv/gemm）的瓶颈与物理模型
+
+> 完整分析见 [`docs/round30-smallops.md`](round30-smallops.md)。用 R1–R29 的流程
+> （profile → 离线 ISA → 硬件模型 → 上限标定）分析剩余算子。
+
+### 30.1 为什么要换标尺
+
+剩余算子（`concat4/copy_c/slice/permute/resize/maxpool/ew_*/softmax/gap/depthwise/bmm`）
+算术强度只有 ~0.25–0.5 FLOP/byte，碰不到 FMA 发射。它们的上限是**内存 roofline**：
+`T_min = launch + bytes/BW(footprint)`。剩余算子合计占整网 GPU busy **17.4% / 24.1% / 24.3%**
+（yolov8 / yolo11 / mobilenet）。
+
+### 30.2 本机内存 roofline（R30 实测）
+
+copy(read+write) 带宽-足迹：1 MB **89.7 GB/s**（L3 峰）、2 MB 62.4、4 MB 44.6、8 MB 21.0、
+**DRAM 64 MB 19.4 GB/s**；read-only 1 MB **320 GB/s**、DRAM 22.8。launch floor ≈ **3.5 µs**。
+换算到 ops/EU/cyc 尺度：搬运算子上限 L3 ≈ **0.43**、DRAM ≈ **0.093**（峰值 32 的 0.3–1.3%）。
+
+### 30.3 结论：哪堵墙
+
+| 算子 | 实测 | 上限 / 墙 |
+|---|---|---|
+| `concat4`（占整网 ~10%）| 22–24 GB/s | **DRAM copy 19.4 GB/s → 已到物理极限** |
+| `copy_c` / `slice` / `permute` | 40–54 GB/s | L3 copy 90 + **launch floor**（单节点 0.1–0.6 MB）|
+| `ew_binary` / `ew_unary` | 20–25 GB/s | L3 + launch |
+| `ew_binary_bcast`（pose 解码 n=285600）| ~12 GB/s | **整数 div/mod 延迟**（ISA 4×iqot+4×irem，0 mad）|
+| `softmax` / `gap` | 27–31 / 7 | 3 趟串行 + 网格饥饿 |
+| `maxpool` | 4.9 GB/s* | issue-bound（0 mad，K² 谓词）|
+| `depthwise` | 0.3–0.5 ops | **ISA 配额 2.8**（`depthwise_v` 1485 指令/128 mad，mad=8.6%）|
+| `bmm` | 2.1 ops | FP32 配额 8.1（K 循环 mad=50.8%）；网格饥饿 |
+
+\* 最小流量口径。**物理极限只有 concat4（DRAM）与搬运类的 launch floor**；其余差 1.5–5×，
+卡在指令数/网格/延迟，不是带宽。
+
+### 30.4 落地
+
+1. **标量广播快路径（正结果）**：`b_scalar=1` 即使带 `bdims` 也走标量 `ew_binary` 核
+   （原来走通用 rank 核，每元素 4×整数 div/mod）。输出逐位相同；同会话 A/B：
+   yolov8 `ew_binary` 0.500→**0.430** ms、busy 14.584→**14.539**；
+   yolo11 0.594→**0.500** ms、busy 15.974→**15.720**（−1.6%）。
+2. **中间标准真实模型**：小算子占位 `return 8.0` 换成内存 roofline（`kBwCurve` +
+   `smallMemCeiling`）+ depthwise/bmm 的 ISA 配额（只影响 ratio/报告，不影响选优）。
+   `tuning_test` 新增 6 条断言。
+3. 新增 `scripts/analyze_smallops.py`（逐节点流量 vs 内存上限，不需要 GPU）。
+
 ## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
   `outer=800, axdim=400, inner=320000` → **2.56 亿工作项 → 假死**（表现为开发板卡死）。
   已修（axis 归一化为非负），并在 `kernel_run` 加 **gws 安全阀**（>3e8 直接报错退出）。

@@ -318,6 +318,59 @@ double gridFactor(long n_wg, int eu)
   const double target = std::max(1.0, static_cast<double>(eu) * 2.0);  // R18: ~2 WG/EU 才喂饱
   return std::min(1.0, static_cast<double>(n_wg) / target);
 }
+
+// ---------------------------------------------------------------------------
+// Round 30：**剩下的 kernel**（非 conv/gemm）的中间标准。
+//
+// conv/gemm 的上限由「指令配额 = 32 × mad 占比」给出；但搬运/逐元素/归约类算子
+// 的算术强度 ≈ 0.25–0.5 FLOP/byte，根本碰不到 FMA 发射，其物理上限是**内存 roofline**
+// （bytes/EU/cyc），再叠加每个 dispatch 的固定开销。本机（Iris Xe / 单通道 LPDDR）
+// R30 用 kernel_bench 实测的 copy(read+write) 带宽-足迹曲线为：
+//   4KB 3.0 | 16KB 8.1 | 64KB 22.7 | 256KB 46.4 | 512KB 63.3 | 1MB 89.7
+//   | 2MB 62.4 | 4MB 44.6 | 8MB 21.0 GB/s（DRAM memcpy 墙 = 19.4 GB/s）
+// 每个 dispatch 的 launch floor ≈ 3.5 µs（membw 4KB copy = 0.003 ms）。
+//
+// 调优器对小算子传入的 `flops = 2 × 输出元素数`，因此这里的「期望」也用同一 proxy
+// 量纲：expected = 2·out / (EU·clk·T)，T = launch + bytes/BW(footprint)。
+// 它单调、按 shape 自洽，能直接读出「离物理上限多远」。
+// ---------------------------------------------------------------------------
+struct BwPoint { double bytes; double gbps; };
+const BwPoint kBwCurve[] = {
+  {4e3, 3.0}, {16e3, 8.1}, {64e3, 22.7}, {256e3, 46.4}, {512e3, 63.3},
+  {1e6, 89.7}, {2e6, 62.4}, {4e6, 44.6}, {8e6, 21.0}};
+constexpr double kSmallLaunchUs = 3.5;
+
+// 由足迹插值 copy 带宽（log-log 线性；端点外取端点值）。
+double copyBwGbps(double footprint)
+{
+  const int n = static_cast<int>(sizeof(kBwCurve) / sizeof(kBwCurve[0]));
+  if (footprint <= kBwCurve[0].bytes) return kBwCurve[0].gbps;
+  if (footprint >= kBwCurve[n - 1].bytes) return kBwCurve[n - 1].gbps;
+  for (int i = 0; i + 1 < n; ++i)
+  {
+    if (footprint <= kBwCurve[i + 1].bytes)
+    {
+      const double lx = std::log(footprint / kBwCurve[i].bytes) /
+                        std::log(kBwCurve[i + 1].bytes / kBwCurve[i].bytes);
+      return kBwCurve[i].gbps * std::pow(kBwCurve[i + 1].gbps / kBwCurve[i].gbps, lx);
+    }
+  }
+  return 20.0;
+}
+
+// 内存受限算子的期望 proxy（= 2·out 元素 / EU / cyc，与 autotune 的 `ops` 同量纲）。
+double smallMemCeiling(double outElems, double bytes, int eu, double clkMhz)
+{
+  if (outElems <= 0.0 || bytes <= 0.0) return 0.0;
+  const double bw = copyBwGbps(bytes) * 1e9;  // bytes/s
+  const double t  = kSmallLaunchUs * 1e-6 + bytes / bw;
+  return 2.0 * outElems / (static_cast<double>(eu) * clkMhz * 1e6 * t);
+}
+
+double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
+{
+  return i < v.size() ? static_cast<double>(v[i]) : dflt;
+}
 }  // namespace
 
 double expectedOps(const OpSignature & s, const DeviceInfo & dev)
@@ -364,24 +417,82 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
     return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev);
   }
 
+  const double clk = dev.clock_mhz > 0 ? static_cast<double>(dev.clock_mhz) : 1300.0;
+
   if (s.op == "depthwise" || s.op == "conv_general") {
-    // R16: depthwise coalesced 标量版，1 WI = 1 输出；不吃 packed 吞吐。
-    const long n = static_cast<long>(s.Cout) * s.W * s.H;
-    return std::max(0.5, 8.0 * gridFactor(n / std::max(1, s.K * s.K), eu));
+    // R30：depthwise 的物理墙**不是** FMA，而是地址/边界谓词指令。反汇编
+    // depthwise_v（DW_TW=8,K=3）为 1485 条指令 / 128 mad（mad_frac=8.6%）→ 指令配额
+    // 32×0.086 ≈ 2.8 ops/EU/cyc（FLOPs 已含 K×K，不再除）。grid 饥饿再乘 gridFactor。
+    const long n = static_cast<long>(s.Cout) * s.W * s.H;  // gws（标量版 1 WI/输出）
+    return std::max(0.3, 32.0 * 0.086 * gridFactor(n, eu));
   }
 
-  if (s.op == "gap") {
-    // R22: 并行树归约，受 SLM 与 C 数限制。
-    return std::max(0.5, 6.0 * gridFactor(static_cast<long>(s.Cin), eu));
+  // Round 30：**剩下的 kernel** —— 内存 roofline（见文件上方 kBwCurve 说明）。
+  // 调优器对它们统一传 flops = 2·输出元素数，故 expected 用同一 proxy 量纲。
+  const std::vector<int> & v = s.params;
+  if (s.op == "bmm") {
+    // 计算受限：FP32、K 循环 ISA mad_frac=50.8%（R30），配额 16×0.508 ≈ 8.1。
+    // 期望 proxy = 配额 / K；网格饥饿（M/TM·N/TN·B）再打折。
+    const double B0 = paramAt(v, 0, 1), B1 = paramAt(v, 1, 1), M = paramAt(v, 2, 1),
+                 K = std::max(1.0, paramAt(v, 3, 1)), N = paramAt(v, 4, 1);
+    const long   grid = static_cast<long>((N + 3) / 4) * static_cast<long>((M + 3) / 4) *
+                      static_cast<long>(B0 * B1);
+    const double e = (16.0 * 0.508 / K) * std::max(0.25, gridFactor(grid, eu));
+    return std::max(0.01, e);
   }
-
-  // Round 28：小算子（launch/带宽受限）没有严格的 roofline 语义；给一个稳定的正
-  // 期望值，使 ratio 在同一量纲下可比。调优器实际按最小 ms 选优。
-  if (s.op == "ew_binary" || s.op == "ew_binary_bcast" || s.op == "ew_unary" ||
-      s.op == "concat4" || s.op == "copy_c" || s.op == "slice_axis" ||
-      s.op == "maxpool" || s.op == "resize_nn" || s.op == "permute_0213" ||
-      s.op == "bmm" || s.op == "bias_add" || s.op == "softmax_axis")
-    return 8.0;
+  if (s.op == "ew_binary") {  // {n, op, b_scalar}
+    const double n = paramAt(v, 0), bs = paramAt(v, 2);
+    const double bytes = 2.0 * (2.0 * n + (bs > 0 ? 0.0 : n));
+    return std::max(0.02, smallMemCeiling(n, bytes, eu, clk));
+  }
+  if (s.op == "ew_binary_bcast") {  // {n, op, b_scalar, C}
+    const double n = paramAt(v, 0), C = paramAt(v, 3);
+    const double bd = C > 0 ? C : n;  // 通道特化有 C 个不同值；通用版保守按 n 计
+    return std::max(0.02, smallMemCeiling(n, 2.0 * (2.0 * n + bd), eu, clk));
+  }
+  if (s.op == "ew_unary") {  // {n, op}
+    const double n = paramAt(v, 0);
+    return std::max(0.02, smallMemCeiling(n, 4.0 * n, eu, clk));
+  }
+  if (s.op == "concat4") {  // {outer, inner, ca, cb, cc, cd}
+    const double outer = paramAt(v, 0, 1), inner = paramAt(v, 1, 1);
+    const double out = (paramAt(v, 2) + paramAt(v, 3) + paramAt(v, 4) + paramAt(v, 5)) * outer * inner;
+    return std::max(0.02, smallMemCeiling(out, 4.0 * out, eu, clk));
+  }
+  if (s.op == "copy_c") {  // {HW, cnt}
+    const double out = paramAt(v, 0) * paramAt(v, 1);
+    return std::max(0.02, smallMemCeiling(out, 4.0 * out, eu, clk));
+  }
+  if (s.op == "slice_axis") {  // {outer, axdim, inner, start, len}
+    const double out = paramAt(v, 0, 1) * paramAt(v, 4) * paramAt(v, 2, 1);
+    return std::max(0.02, smallMemCeiling(out, 4.0 * out, eu, clk));
+  }
+  if (s.op == "permute_0213") {  // {D1, D2, I, mode}
+    const double out = paramAt(v, 0, 1) * paramAt(v, 1, 1) * paramAt(v, 2, 1);
+    return std::max(0.02, smallMemCeiling(out, 4.0 * out, eu, clk));
+  }
+  if (s.op == "resize_nn") {  // {C, H, W, S}
+    const double C = paramAt(v, 0), H = paramAt(v, 1), W = paramAt(v, 2), S = paramAt(v, 3, 1);
+    const double out = C * H * S * W * S;
+    return std::max(0.02, smallMemCeiling(out, 2.0 * (C * H * W + out), eu, clk));
+  }
+  if (s.op == "maxpool") {  // {C, H, W, Hout, Wout, K, S, P}
+    const double C = paramAt(v, 0), ho = paramAt(v, 3), wo = paramAt(v, 4),
+                 K = paramAt(v, 5, 1);
+    const double out = C * ho * wo;
+    // 每个输出做 K×K 次带边界谓词的读（R30 ISA：0 mad，纯索引/比较指令）。
+    return std::max(0.02, smallMemCeiling(out, 2.0 * (out * K * K + out), eu, clk));
+  }
+  if (s.op == "softmax_axis") {  // {outer, axdim, inner}
+    const double n = paramAt(v, 0, 1) * paramAt(v, 1) * paramAt(v, 2, 1);
+    // 三趟读（max / exp-sum / 写回读）+ 一趟写 = 8n 字节。
+    return std::max(0.02, smallMemCeiling(n, 8.0 * n, eu, clk));
+  }
+  if (s.op == "gap") {  // 专用字段：Cin = C, N = HW
+    const double C = static_cast<double>(s.Cin), HW = static_cast<double>(s.N);
+    return std::max(0.01, smallMemCeiling(C, 2.0 * (C * HW + C), eu, clk));
+  }
+  if (s.op == "bias_add") return 1.0;
 
   return 1.0;
 }

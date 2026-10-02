@@ -342,7 +342,10 @@ OpSignature PlanModel::smallSig(const Node & n) const
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0),
               bs = attrInt(n, "b_scalar", 0);
-    if (n.attr.count("bdims"))
+    // R30: 若 b 是**真标量**（b_scalar=1），即使 plan 里带了 bdims，也应走标量核，
+    // 而不是通用 rank 核（后者每元素 4×整数 div/mod）。数值等价：a 与 out 同形且连续，
+    // aidx==i、bidx==0。
+    if (n.attr.count("bdims") && bs != 1)
     {
       int C = 0;
       const Tensor & ta = T_.at(n.ins[0]);
@@ -429,7 +432,7 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     return static_cast<size_t>((count + v - 1) / v);
   };
 
-  if (n.op == "ew_binary" && !n.attr.count("bdims"))
+  if (n.op == "ew_binary" && (!n.attr.count("bdims") || attrInt(n, "b_scalar", 0) == 1))
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
     cl_mem da = inMem(0), db = inMem(1);

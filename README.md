@@ -128,6 +128,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
 | [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
 | [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) | **R25 OV 阻塞式 conv 完整移植**：逐 size 对照 / 第三条 autotune 通路 |
+| [`docs/round30-smallops.md`](docs/round30-smallops.md) | **R30 剩余 kernel（非 conv/gemm）的物理模型**：内存 roofline / ISA 配额 / 哪堵墙 |
 | [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
@@ -199,6 +200,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 - [x] 分层自动调优体系（P0）：TuningCache + 候选枚举 + 中间标准 expected_ops + `kernel_autotune`
 - [x] conv3×3 阻塞式 kernel（R25 完整移植 OV `convolution_gpu_bfyx_f16`）+ 接入 autotune 候选；两条 OV 通路现实上限 ~12–14 ops
 - [x] conv3×3 逐层 autotune 重扫（blk 候选 + R24 中间标准）：yolov8n/yolo11n −5%；osv32 大层 ~8–13、blk 小层 +13–87%
+- [x] 剩余 kernel（非 conv/gemm）物理模型：内存 roofline + ISA 配额；concat4 已到 DRAM 墙；标量广播快路径 + `expectedOps` 真实模型（R30）
 - [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟；busy 17.2 vs 墙钟 22.3 ms）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）
