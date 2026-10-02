@@ -72,6 +72,10 @@ output <name>                        # 可多行
 `gk::ClRuntime` 枚举平台/设备，默认**优先含 GPU 的平台**，无 GPU 时退回任一可用设备；
 `DeviceInfo` 记录 `available / requested / resolved / fell_back_to_cpu`。
 
+> Xe-LP(Gen12) 的实际 cache 层级与 EU 寄存器（128 GRF/线程、ARF 专用寄存器、无通用 L1、
+> 3.75 MB L3、SLM 64 KB/WG）见 [`xe-lp-isa.md`](xe-lp-isa.md)——kernel 分块与寄存器
+> 预算的硬件事实基准。
+
 > 与旧版不同：不再有「CPU/GPU/NPU」多后端选择，`device` 仅作日志；`AUTO` 即自动优选 GPU。
 
 ## 6. 关键设计决策

@@ -29,6 +29,10 @@
 
 ### 硬件实测（寄存器 FMA + 各层 cache 带宽）
 
+> **ISA 逆向全貌**（cache 层级、EU 寄存器、SEND/cache 控制字段）见
+> [`xe-lp-isa.md`](xe-lp-isa.md)。关键事实：Xe-LP **没有通用 L1**，可编程缓存只有
+> GRF(128/线程) 与 SLM(64 KB/WG)，硬件缓存只有一块不可编程的 3.75 MB L3。
+
 用独立 OpenCL 微基准测得（寄存器内多条独立 FMA 链 + 大 work-item 数；访存用 float4
 扫工作集，每趟固定 ~512 MB 流量以消除计时误差）：
 
