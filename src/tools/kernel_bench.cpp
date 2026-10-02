@@ -151,7 +151,9 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
   cl_kernel k;
   try {
-    if (c.SGK)
+    if (c.OV)
+      k = rt.buildKernel("conv_ov", "conv3x3_ov", c.options());
+    else if (c.SGK)
       k = rt.buildKernel("conv_sg", "conv3x3_sg", c.options());
     else if (c.OSV)
       k = rt.buildKernel("conv_osv", "conv3x3_osv", c.options());
@@ -174,12 +176,32 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   for (auto & v : hWt) v = gk::f32_to_f16(dud(rng456));
   for (auto & v : hB) v = gk::f32_to_f16(dud(rng456));
 
+  const size_t wbytes = c.OV
+    ? (size_t)((s.Cout + 31) / 32) * s.Cin * 9 * 32 * 2
+    : (size_t)s.Cout * s.Cin * 9 * 2;
   cl_mem dX = rt.alloc((size_t)s.Cin * s.H * s.W * 2, CL_MEM_READ_ONLY);
-  cl_mem dW = rt.alloc((size_t)s.Cout * s.Cin * 9 * 2, CL_MEM_READ_ONLY);
+  cl_mem dW = rt.alloc(wbytes, CL_MEM_READ_ONLY);
   cl_mem dB = rt.alloc((size_t)s.Cout * 2, CL_MEM_READ_ONLY);
   cl_mem dY = rt.alloc((size_t)s.Cout * Hout * Wout * 2, CL_MEM_WRITE_ONLY);
   rt.write(dX, (size_t)s.Cin * s.H * s.W * 2, hX.data());
-  if (c.WGL || c.SGK) {
+  if (c.OV) {
+    // OpenVINO os_iyx_osv32 weight layout: [ceil(Cout/32)][Cin][3][3][32] with
+    // block position p = (o % 32) (see GET_FILTER_OS_IYX_OSV_INDEX with
+    // sub_group_size=32). The strided block read gives lane l positions (l, l+16),
+    // which the kernel maps to channels (fmg*32+l, fmg*32+16+l).
+    const int fmgroups = (s.Cout + 31) / 32;
+    std::vector<uint16_t> hWo((size_t)fmgroups * s.Cin * 9 * 32, 0);
+    for (int fmg = 0; fmg < fmgroups; ++fmg)
+      for (int ci = 0; ci < s.Cin; ++ci)
+        for (int kk = 0; kk < 9; ++kk) {
+          uint16_t *dst = &hWo[(((size_t)fmg * s.Cin + ci) * 9 + kk) * 32];
+          for (int p = 0; p < 32; ++p) {
+            const int oc = fmg * 32 + p;
+            dst[p] = (oc < s.Cout) ? hWt[((size_t)oc * s.Cin + ci) * 9 + kk] : (uint16_t)0;
+          }
+        }
+    rt.write(dW, hWo.size() * 2, hWo.data());
+  } else if (c.WGL || c.SGK) {
     // Repack [Cout][Cin][KHKW] -> [Cin][KHKW][Cout] so the CB weights for one
     // (ci,kk) are contiguous. Round 19: also used by the lane=channel OV-style
     // kernel (conv3x3_sg), whose per-lane weight reads were otherwise strided by
@@ -197,17 +219,32 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   clSetKernelArg(k, 0, sizeof(dX), &dX);
   clSetKernelArg(k, 1, sizeof(dW), &dW);
   clSetKernelArg(k, 2, sizeof(dB), &dB);
-  clSetKernelArg(k, 3, sizeof(dY), &dY);
   int Cin = s.Cin, H = s.H, W = s.W, Cout = s.Cout, ho = Hout, wo = Wout;
-  clSetKernelArg(k, 4, sizeof(Cin), &Cin);
-  clSetKernelArg(k, 5, sizeof(H), &H);
-  clSetKernelArg(k, 6, sizeof(W), &W);
-  clSetKernelArg(k, 7, sizeof(Cout), &Cout);
-  clSetKernelArg(k, 8, sizeof(ho), &ho);
-  clSetKernelArg(k, 9, sizeof(wo), &wo);
+  if (c.OV) {
+    cl_mem dRes = nullptr;
+    clSetKernelArg(k, 3, sizeof(dRes), &dRes);
+    clSetKernelArg(k, 4, sizeof(dY), &dY);
+    clSetKernelArg(k, 5, sizeof(Cin), &Cin);
+    clSetKernelArg(k, 6, sizeof(H), &H);
+    clSetKernelArg(k, 7, sizeof(W), &W);
+    clSetKernelArg(k, 8, sizeof(Cout), &Cout);
+    clSetKernelArg(k, 9, sizeof(ho), &ho);
+    clSetKernelArg(k, 10, sizeof(wo), &wo);
+  } else {
+    clSetKernelArg(k, 3, sizeof(dY), &dY);
+    clSetKernelArg(k, 4, sizeof(Cin), &Cin);
+    clSetKernelArg(k, 5, sizeof(H), &H);
+    clSetKernelArg(k, 6, sizeof(W), &W);
+    clSetKernelArg(k, 7, sizeof(Cout), &Cout);
+    clSetKernelArg(k, 8, sizeof(ho), &ho);
+    clSetKernelArg(k, 9, sizeof(wo), &wo);
+  }
 
   size_t lxThreads, lyThreads;
-  if (c.SGK) {
+  if (c.OV) {
+    lxThreads = 1;
+    lyThreads = 1;
+  } else if (c.SGK) {
     lxThreads = static_cast<size_t>(c.SG);
     lyThreads = 1;
   } else if (c.OSV) {
@@ -218,11 +255,12 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
     lyThreads = c.RT ? static_cast<size_t>(c.TY) * (c.CB / c.TN)
                      : static_cast<size_t>(c.TY);
   }
-  const size_t lws[3] = {lxThreads, lyThreads, 1};
+  const size_t lws[3] = {lxThreads, lyThreads, c.OV ? static_cast<size_t>(c.SG) : 1};
   const size_t gws[3] = {
-    static_cast<size_t>((Wout + c.TX - 1) / c.TX) * lws[0],
-    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * lws[1],
-    static_cast<size_t>((Cout + c.CB - 1) / c.CB)};
+    static_cast<size_t>((Wout + c.TX - 1) / c.TX) * lxThreads,
+    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * lyThreads,
+    c.OV ? static_cast<size_t>((((s.Cout + 1) / 2 + 15) / 16) * 16)
+         : static_cast<size_t>((Cout + c.CB - 1) / c.CB)};
 
   const double med = rt.timeMs(
     [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
@@ -266,6 +304,151 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   std::printf("\n");
   clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dB); clReleaseMemObject(dY);
   clReleaseKernel(k);
+  return 0;
+}
+
+// Specialized 1x1 conv (pointwise) kernel: fused bias + activation.
+int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
+{
+  const int Cin = s.Cin, Cout = s.Cout, HW = s.H * s.W;
+  cl_kernel k;
+  try {
+    k = rt.buildKernel("conv1x1", "conv1x1_f16", c.options());
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "[build-fail] %s\n", e.what());
+    return 1;
+  }
+  std::vector<uint16_t> hW((size_t)Cout * Cin), hX((size_t)Cin * HW), hB((size_t)Cout), hY((size_t)Cout * HW);
+  std::mt19937 rngW(11), rngX(22), rngB(33);
+  std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
+  for (auto & v : hW) v = gk::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = gk::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = gk::f32_to_f16(disB(rngB));
+
+  cl_mem dW = rt.alloc((size_t)Cout * Cin * 2, CL_MEM_READ_ONLY);
+  cl_mem dX = rt.alloc((size_t)Cin * HW * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
+  cl_mem dY = rt.alloc((size_t)Cout * HW * 2, CL_MEM_WRITE_ONLY);
+  {  // repack W [Cout][Cin] -> [Cin][Cout] (contiguous output-channel reads)
+    std::vector<uint16_t> hWt((size_t)Cin * Cout);
+    for (int oc = 0; oc < Cout; ++oc)
+      for (int ci = 0; ci < Cin; ++ci) hWt[(size_t)ci * Cout + oc] = hW[(size_t)oc * Cin + ci];
+    rt.write(dW, (size_t)Cout * Cin * 2, hWt.data());
+  }
+  rt.write(dX, (size_t)Cin * HW * 2, hX.data());
+  rt.write(dB, (size_t)Cout * 2, hB.data());
+
+  cl_mem dRes = nullptr;
+  clSetKernelArg(k, 0, sizeof(dW), &dW);
+  clSetKernelArg(k, 1, sizeof(dX), &dX);
+  clSetKernelArg(k, 2, sizeof(dB), &dB);
+  clSetKernelArg(k, 3, sizeof(dRes), &dRes);
+  clSetKernelArg(k, 4, sizeof(dY), &dY);
+  int CinA = Cin, CoutA = Cout, HWA = HW;
+  clSetKernelArg(k, 5, sizeof(CinA), &CinA);
+  clSetKernelArg(k, 6, sizeof(CoutA), &CoutA);
+  clSetKernelArg(k, 7, sizeof(HWA), &HWA);
+
+  const size_t lws[2] = {16, 1};
+  const size_t gws[2] = {
+    static_cast<size_t>(((HW + c.TN - 1) / c.TN + lws[0] - 1) / lws[0] * lws[0]),
+    static_cast<size_t>((Cout + c.TM - 1) / c.TM)};
+
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
+  const double flops = 2.0 * Cout * Cin * (double)HW;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  conv1x1 %-20s Cin=%-4d Cout=%-4d HW=%-6d %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), Cin, Cout, HW, med, flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+
+  if (verify) {
+    rt.read(dY, (size_t)Cout * HW * 2, hY.data());
+    double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    for (int oc = 0; oc < Cout; ++oc)
+      for (int n = 0; n < HW; ++n) {
+        float acc = gk::f16_to_f32(hB[oc]);
+        for (int ci = 0; ci < Cin; ++ci)
+          acc += gk::f16_to_f32(hW[(size_t)oc * Cin + ci]) * gk::f16_to_f32(hX[(size_t)ci * HW + n]);
+        const double got = gk::f16_to_f32(hY[(size_t)oc * HW + n]);
+        const double d = std::fabs(got - acc);
+        sumabs += d; sumref += std::fabs((double)acc);
+        maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs((double)acc));
+      }
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e",
+      sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dW); clReleaseMemObject(dX); clReleaseMemObject(dB);
+  clReleaseMemObject(dY); clReleaseKernel(k);
+  return 0;
+}
+
+// Specialized split-K GEMV for 1x1 conv / fc with HW==1 (fused bias + activation).
+int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
+{
+  const int Cin = s.Cin, Cout = s.Cout;
+  cl_kernel k;
+  try {
+    k = rt.buildKernel("conv1x1", "conv1x1_gemv_f16", c.options());
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "[build-fail] %s\n", e.what());
+    return 1;
+  }
+  std::vector<uint16_t> hW((size_t)Cout * Cin), hX((size_t)Cin), hB((size_t)Cout), hY((size_t)Cout);
+  std::mt19937 rngW(11), rngX(22), rngB(33);
+  std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
+  for (auto & v : hW) v = gk::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = gk::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = gk::f32_to_f16(disB(rngB));
+
+  cl_mem dW = rt.alloc((size_t)Cout * Cin * 2, CL_MEM_READ_ONLY);
+  cl_mem dX = rt.alloc((size_t)Cin * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
+  cl_mem dY = rt.alloc((size_t)Cout * 2, CL_MEM_WRITE_ONLY);
+  rt.write(dW, (size_t)Cout * Cin * 2, hW.data());
+  rt.write(dX, (size_t)Cin * 2, hX.data());
+  rt.write(dB, (size_t)Cout * 2, hB.data());
+
+  cl_mem dRes = nullptr;
+  clSetKernelArg(k, 0, sizeof(dW), &dW);
+  clSetKernelArg(k, 1, sizeof(dX), &dX);
+  clSetKernelArg(k, 2, sizeof(dB), &dB);
+  clSetKernelArg(k, 3, sizeof(dRes), &dRes);
+  clSetKernelArg(k, 4, sizeof(dY), &dY);
+  int CinA = Cin, CoutA = Cout;
+  clSetKernelArg(k, 5, sizeof(CinA), &CinA);
+  clSetKernelArg(k, 6, sizeof(CoutA), &CoutA);
+
+  const size_t lws[1] = {16};
+  const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws); }, 3, iters);
+  const double flops = 2.0 * Cout * Cin;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  gemv    %-20s Cin=%-4d Cout=%-4d           %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), Cin, Cout, med, flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+  if (verify) {
+    rt.read(dY, (size_t)Cout * 2, hY.data());
+    double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    for (int oc = 0; oc < Cout; ++oc) {
+      float acc = gk::f16_to_f32(hB[oc]);
+      for (int ci = 0; ci < Cin; ++ci)
+        acc += gk::f16_to_f32(hW[(size_t)oc * Cin + ci]) * gk::f16_to_f32(hX[ci]);
+      const double got = gk::f16_to_f32(hY[oc]);
+      const double d = std::fabs(got - acc);
+      sumabs += d; sumref += std::fabs((double)acc);
+      maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs((double)acc));
+    }
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e",
+      sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dW); clReleaseMemObject(dX); clReleaseMemObject(dB);
+  clReleaseMemObject(dY); clReleaseKernel(k);
   return 0;
 }
 
@@ -536,6 +719,7 @@ int main(int argc, char ** argv)
   std::string op = "gemm", kernel_dir = INFVINO_KERNEL_DIR;
   gk::Tiles tiles;
   gk::Conv3x3Cfg conv;
+  gk::Conv1x1Cfg c1x1;
   std::vector<ConvShape> conv_shapes;
   std::vector<Shape> shapes;
   int iters = 100;
@@ -566,6 +750,8 @@ int main(int argc, char ** argv)
       tiles = gk::parseTiles(next());
     } else if (a == "--conv") {
       conv = gk::parseConv(next());
+    } else if (a == "--conv1x1") {
+      c1x1 = gk::parseConv1x1(next());
     } else if (a == "--conv-shape") {
       auto v = parseInts(next());
       if (v.size() != 4) { std::fprintf(stderr, "--conv-shape needs Cin,Cout,H,W\n"); return 2; }
@@ -620,11 +806,20 @@ int main(int argc, char ** argv)
       Shape g{s.Cout, s.H * s.W, s.Cin, "conv1x1"};
       rc |= benchGemm(rt, tiles, g, iters, verify);
     }
-  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db") {
+  } else if (op == "conv1x1k") {
+    std::printf("[conv1x1k] %s\n", c1x1.label().c_str());
+    if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "c1x1"}, {96, 576, 7, 7, "c1x1-mb"}};
+    for (const auto & s : conv_shapes) rc |= benchConv1x1(rt, c1x1, s, iters, verify);
+  } else if (op == "conv1x1g") {
+    std::printf("[conv1x1g] gemv %s\n", c1x1.label().c_str());
+    if (conv_shapes.empty()) conv_shapes = {{576, 1024, 1, 1, "fc"}, {1024, 1000, 1, 1, "cls"}};
+    for (const auto & s : conv_shapes) rc |= benchConv1x1Gemv(rt, c1x1, s, iters, verify);
+  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;
     if (op == "conv3x3sg") conv.SGK = 1;
     if (op == "conv3x3db") conv.DB = 1;
+    if (op == "conv3x3ov") conv.OV = 1;
     std::printf("[%s] %s\n", op.c_str(), conv.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "p3-3x3"}, {64, 64, 40, 40, "p4-3x3"}};
     for (const auto & s : conv_shapes) rc |= benchConv(rt, conv, s, iters, verify);

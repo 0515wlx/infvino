@@ -60,6 +60,32 @@ PlanModel::~PlanModel()
   releaseKernels();
   for (cl_mem m : owned_)
     if (m) clReleaseMemObject(m);
+  for (cl_mem m : owned_ov_)
+    if (m) clReleaseMemObject(m);
+}
+
+cl_mem PlanModel::ovWeight(const std::string & name, Tensor & w, int Cout, int Cin)
+{
+  auto it = ov_w_.find(name);
+  if (it != ov_w_.end()) return it->second;
+  const int fmg = (Cout + 31) / 32;
+  std::vector<uint16_t> host(static_cast<size_t>(w.numel()));
+  rt_.read(w.mem, host.size() * 2, host.data());
+  std::vector<uint16_t> sw(static_cast<size_t>(fmg) * Cin * 9 * 32, 0);
+  for (int g = 0; g < fmg; ++g)
+    for (int ci = 0; ci < Cin; ++ci)
+      for (int kk = 0; kk < 9; ++kk) {
+        uint16_t * dst = &sw[((static_cast<size_t>(g) * Cin + ci) * 9 + kk) * 32];
+        for (int p = 0; p < 32; ++p) {
+          const int oc = g * 32 + p;
+          dst[p] = (oc < Cout) ? host[(static_cast<size_t>(oc) * Cin + ci) * 9 + kk] : (uint16_t)0;
+        }
+      }
+  cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
+  rt_.write(m, sw.size() * 2, sw.data());
+  ov_w_[name] = m;
+  owned_ov_.push_back(m);
+  return m;
 }
 
 size_t PlanModel::inputNumel() const
@@ -259,7 +285,75 @@ void PlanModel::run()
     const int64_t nout = out_numel();
     const size_t  g1   = static_cast<size_t>(out_numel());
 
-    if (n.op == "conv_general")
+    if (n.op == "conv1x1")
+    {
+      // Round 22: dedicated 1x1 conv / fc path.
+      //   * N==1 (HW==1): split-K GEMV (one sub-group per output channel) — the
+      //     generic GEMM wastes 63/64 lanes and starves the grid on N=1.
+      //   * N>1: tuned GEMM with a fused bias+activation epilogue (no separate
+      //     bias_add / ew_unary launches).
+      const int act = attrInt(n, "act", 0);
+      auto & w = in(0);                        // [Cout][Cin]
+      const int Cout = static_cast<int>(w.dims[0]);
+      const int Cin  = static_cast<int>(w.dims[1]);
+      const int64_t xnumel = in(1).numel();
+      const int N = (Cin > 0) ? static_cast<int>(xnumel / Cin) : 0;
+      cl_mem dw = w.mem, dx = in(1).mem, dy = out.mem;
+      cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? in(3).mem : nullptr;
+      if (N == 1) {
+        Conv1x1Cfg cfg;
+        cfg.ACT = act;
+        cfg.RES = dres ? 1 : 0;
+        cfg.SG  = 16;
+        cl_kernel kg = rt_.buildKernel("conv1x1", "conv1x1_gemv_f16", cfg.options());
+        clSetKernelArg(kg, 0, sizeof(dw), &dw);
+        clSetKernelArg(kg, 1, sizeof(dx), &dx);
+        clSetKernelArg(kg, 2, sizeof(db), &db);
+        clSetKernelArg(kg, 3, sizeof(dres), &dres);
+        clSetKernelArg(kg, 4, sizeof(dy), &dy);
+        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kg, 6, sizeof(Cout), &Cout);
+        const size_t lws[1] = {16};
+        const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+        timed("conv1x1g@" + std::to_string(Cout) + "x" + std::to_string(Cin), kg, 1, gws, lws);
+        clReleaseKernel(kg);
+      } else {
+        Tiles t;
+        const long grid = static_cast<long>((Cout + t.BM - 1) / t.BM) *
+                          static_cast<long>((N + t.BN - 1) / t.BN);
+        if (Cout <= 64) {
+          t.BM = 64;
+        } else if (Cin >= 192 && grid >= 64) {
+          t.BK = 32;
+          t.DBUF = 0;
+        } else {
+          t.BK = 8;
+          t.DBUF = 0;
+        }
+        if (Cin < 32) t.SG = 0;
+        t.EPI = 1;
+        t.ACT = act;
+        cl_kernel kg = rt_.buildKernel("gemm", "gemm_f16", t.options());
+        clSetKernelArg(kg, 0, sizeof(dw), &dw);
+        clSetKernelArg(kg, 1, sizeof(dx), &dx);
+        clSetKernelArg(kg, 2, sizeof(dy), &dy);
+        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
+        clSetKernelArg(kg, 4, sizeof(N), &N);
+        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kg, 6, sizeof(db), &db);
+        clSetKernelArg(kg, 7, sizeof(dres), &dres);
+        const size_t lws[2] = {t.localX(), t.localY()};
+        const size_t gws[2] = {
+          static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0],
+          static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1]};
+        timed("conv1x1@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
+                std::to_string(Cin),
+              kg, 2, gws, lws);
+        clReleaseKernel(kg);
+      }
+    }
+    else if (n.op == "conv_general")
     {
       const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
                 G = attrInt(n, "G", 1), act = attrInt(n, "act", 0);
@@ -315,61 +409,100 @@ void PlanModel::run()
     }
     else if (n.op == "conv3x3")
     {
-      Conv3x3Cfg cfg;
-      auto       it = n.attr.find("cfg");
-      if (it != n.attr.end()) cfg = parseConv(it->second);
-      cfg.STRIDE = attrInt(n, "stride", 1);
-      cfg.PAD    = attrInt(n, "pad", 1);
-      cfg.ACT    = attrInt(n, "act", cfg.ACT);
-      cfg.SG     = 16;  // Round 15: pin SIMD16 (see Tiles.hpp / docs R15)
-      cfg.WC     = 1;   // Round 18: coalesced weight staging (+5% on 3x3)
+      const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1),
+                act = attrInt(n, "act", 0);
       const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
-      // Round 15: adaptive spatial tile. The old fixed TX=64 wasted up to 3x on
-      // the small (20x20) stages and left too few work-groups; per-shape sweeps
-      // on the model shapes pick TX=40 (>=40) / TX=20 (small W), TY=8.
-      cfg.TX = (Wout >= 40) ? 40 : (Wout >= 20 ? 20 : 16);
-      if (cfg.TX > Wout) cfg.TX = Wout;
-      cfg.TY = 8;
       const auto & id = in(0).dims;
       const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
       int Cin  = static_cast<int>(id[base]), H = static_cast<int>(id[base + 1]);
       int W    = static_cast<int>(id[base + 2]);
       const auto & od = out.dims;
       int Cout = static_cast<int>(od[od.size() >= 3 ? od.size() - 3 : 0]);
-      // Round 18: adaptive output-channel block. CB=32 stages/accumulates 32
-      // channels per work-group; when Cout<=16 that wastes half the block, and
-      // when the spatial grid is small the total work-group count is too low to
-      // fill 80 EUs. Measured rule: CB=16 if Cout<=16 or the CB=32 grid has <16
-      // work-groups (e.g. 64->64@40 6.2->7.8, 16->16@160 4.8->7.0, 256->64@20
-      // 1.6->2.5 ops/EU/cyc).
-      const int spatial = ((Wout + cfg.TX - 1) / cfg.TX) * ((Hout + cfg.TY - 1) / cfg.TY);
-      const int wgs32   = spatial * ((Cout + 31) / 32);
-      if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;
-      cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
-      cl_mem dx = in(0).mem, dw = in(1).mem, dy = out.mem;
+      cl_mem dx = in(0).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
-      clSetKernelArg(kk, 0, sizeof(dx), &dx);
-      clSetKernelArg(kk, 1, sizeof(dw), &dw);
-      clSetKernelArg(kk, 2, sizeof(db), &db);
-      clSetKernelArg(kk, 3, sizeof(dy), &dy);
-      clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-      clSetKernelArg(kk, 5, sizeof(H), &H);
-      clSetKernelArg(kk, 6, sizeof(W), &W);
-      clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-      int ho = Hout, wo = Wout;
-      clSetKernelArg(kk, 8, sizeof(ho), &ho);
-      clSetKernelArg(kk, 9, sizeof(wo), &wo);
-      const size_t lws[3] = {
-        static_cast<size_t>(cfg.TX / cfg.TM), static_cast<size_t>(cfg.TY), 1};
-      const size_t gws[3] = {
-        static_cast<size_t>((Wout + cfg.TX - 1) / cfg.TX) * lws[0],
-        static_cast<size_t>((Hout + cfg.TY - 1) / cfg.TY) * lws[1],
-        static_cast<size_t>((Cout + cfg.CB - 1) / cfg.CB)};
-      timed("conv3x3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
-              std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
-              std::to_string(Cout),
-            kk, 3, gws, lws);
-      clReleaseKernel(kk);
+
+      // Round 22: OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl) is the default
+      // 3x3 groups=1 path. Measured faster than the native direct conv on every
+      // model shape (e.g. 64->64@80 13.6 vs 10.3 ops/EU/cyc; s2 10.7 vs 7.1),
+      // because lane=channel + block-read weights removes the SLM staging cost.
+      // Set `ov=0` on the node to fall back to the native conv3x3_f16.
+      if (attrInt(n, "ov", 1))
+      {
+        int obw = (stride == 2) ? 5 : 8;
+        int obh = (stride == 2) ? 4 : 2;
+        if (obw > Wout) obw = Wout > 0 ? Wout : obw;
+        if (obh > Hout) obh = Hout > 0 ? Hout : obh;
+        char oo[192];
+        cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? in(3).mem : nullptr;
+        std::snprintf(oo, sizeof(oo),
+                      "-DOBW=%d -DOBH=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DRES=%d -DSG=16 "
+                      "-cl-mad-enable -cl-fast-relaxed-math",
+                      obw, obh, stride, pad, act, dres ? 1 : 0);
+        cl_kernel kk = rt_.buildKernel("conv_ov", "conv3x3_ov", oo);
+        cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
+        clSetKernelArg(kk, 0, sizeof(dx), &dx);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dres), &dres);
+        clSetKernelArg(kk, 4, sizeof(dy), &dy);
+        clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 6, sizeof(H), &H);
+        clSetKernelArg(kk, 7, sizeof(W), &W);
+        clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+        const size_t lws[3] = {1, 1, 16};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + obw - 1) / obw),
+          static_cast<size_t>((Hout + obh - 1) / obh),
+          static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+        timed("conv3x3ov@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout),
+              kk, 3, gws, lws);
+        clReleaseKernel(kk);
+      }
+      else
+      {
+        Conv3x3Cfg cfg;
+        auto       it = n.attr.find("cfg");
+        if (it != n.attr.end()) cfg = parseConv(it->second);
+        cfg.STRIDE = stride;
+        cfg.PAD    = pad;
+        cfg.ACT    = act;
+        cfg.SG     = 16;  // Round 15: pin SIMD16 (see Tiles.hpp / docs R15)
+        cfg.WC     = 1;   // Round 18: coalesced weight staging (+5% on 3x3)
+        // Round 15: adaptive spatial tile.
+        cfg.TX = (Wout >= 40) ? 40 : (Wout >= 20 ? 20 : 16);
+        if (cfg.TX > Wout) cfg.TX = Wout;
+        cfg.TY = 8;
+        const int spatial = ((Wout + cfg.TX - 1) / cfg.TX) * ((Hout + cfg.TY - 1) / cfg.TY);
+        const int wgs32   = spatial * ((Cout + 31) / 32);
+        if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;
+        cl_kernel kk = rt_.buildKernel("conv", "conv3x3_f16", cfg.options());
+        cl_mem dw = in(1).mem;
+        clSetKernelArg(kk, 0, sizeof(dx), &dx);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dy), &dy);
+        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 5, sizeof(H), &H);
+        clSetKernelArg(kk, 6, sizeof(W), &W);
+        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        const size_t lws[3] = {
+          static_cast<size_t>(cfg.TX / cfg.TM), static_cast<size_t>(cfg.TY), 1};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + cfg.TX - 1) / cfg.TX) * lws[0],
+          static_cast<size_t>((Hout + cfg.TY - 1) / cfg.TY) * lws[1],
+          static_cast<size_t>((Cout + cfg.CB - 1) / cfg.CB)};
+        timed("conv3x3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout),
+              kk, 3, gws, lws);
+        clReleaseKernel(kk);
+      }
     }
     else if (n.op == "gemm")
     {
@@ -410,7 +543,8 @@ void PlanModel::run()
       const size_t gws[2] = {
         static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0],
         static_cast<size_t>((M + t.BM - 1) / t.BM) * lws[1]};
-      timed("gemm", kg, 2, gws, lws);
+      timed("gemm@" + std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K),
+            kg, 2, gws, lws);
       clReleaseKernel(kg);
     }
     else if (n.op == "ew_binary")
@@ -600,12 +734,16 @@ void PlanModel::run()
     {
       int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
       cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kGap_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kGap_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kGap_, 2, sizeof(C), &C);
-      clSetKernelArg(kGap_, 3, sizeof(HW), &HW);
-      const size_t g = static_cast<size_t>(C);
-      timed("gap", kGap_, 1, &g, nullptr);
+      const int WGS = 128;
+      cl_kernel k = rt_.buildKernel("ops", "gap_r", "-DGAP_WGS=" + std::to_string(WGS));
+      clSetKernelArg(k, 0, sizeof(dx), &dx);
+      clSetKernelArg(k, 1, sizeof(dy), &dy);
+      clSetKernelArg(k, 2, sizeof(C), &C);
+      clSetKernelArg(k, 3, sizeof(HW), &HW);
+      const size_t lws[1] = {static_cast<size_t>(WGS)};
+      const size_t gws[1] = {static_cast<size_t>(C) * WGS};
+      timed("gap", k, 1, gws, lws);
+      clReleaseKernel(k);
     }
     else if (n.op == "bias_add")
     {

@@ -76,6 +76,20 @@ def main() -> int:
         c1x1_jobs.append((shape, px, pw, ref))
         print(f"[ref] conv1x1 {Cin}x{Cout}x{H}x{W} {label}")
 
+    gemv_jobs = []
+    for Cin, Cout, label in DEFAULT_GEMV:
+        shape = (Cin, Cout, 1, 1, label)
+        px, pw, ref = gen_conv1x1(shape, args.workdir)
+        gemv_jobs.append((shape, px, pw, ref))
+        print(f"[ref] conv1x1g {Cin}x{Cout} {label}")
+
+    ov_jobs = []
+    for shape in DEFAULT_CONVS_OV:
+        Cin, Cout, H, W, s, p, label = shape[:7]
+        px, pw, pb, ref = gen_conv(shape, args.workdir)
+        ov_jobs.append((shape, px, pw, pb, ref))
+        print(f"[ref] conv3x3ov {Cin}x{Cout}x{H}x{W}s{s} {label}")
+
     tiles_arg = f"--tiles {args.tiles}" if args.tiles else ""
     inner = [
         "set -e",
@@ -106,6 +120,24 @@ def main() -> int:
             f"/tmp/build/kernel_numtest --op conv1x1 --cin {Cin} --cout {Cout} --h {H} --w {W} "
             f"--input-x /work/x1x1_{tag}.bin --input-w /work/w1x1_{tag}.bin "
             f"--dump /work/out_c1x1_{tag}.bin || echo RUNFAIL conv1x1 {tag}"
+        )
+    for shape, px, pw, _ in gemv_jobs:
+        Cin, Cout, H, W, _ = shape
+        tag = f"{Cin}x{Cout}x{H}x{W}"
+        inner.append(
+            f"/tmp/build/kernel_numtest --op conv1x1g --cin {Cin} --cout {Cout} "
+            f"--input-x /work/x1x1_{tag}.bin --input-w /work/w1x1_{tag}.bin "
+            f"--dump /work/out_gemv_{tag}.bin || echo RUNFAIL conv1x1g {tag}"
+        )
+    for shape, px, pw, pb, _ in ov_jobs:
+        Cin, Cout, H, W, s, p, label = shape[:7]
+        tag = f"{Cin}x{Cout}x{H}x{W}s{s}"
+        inner.append(
+            f"/tmp/build/kernel_numtest --op conv3x3 --ov --cin {Cin} --cout {Cout} --h {H} --w {W} "
+            f"--stride {s} --pad {p} "
+            f"--input-x /work/{os.path.basename(px)} --input-w /work/{os.path.basename(pw)} "
+            f"--input-bias /work/{os.path.basename(pb)} --dump /work/out_convov_{tag}.bin "
+            f"|| echo RUNFAIL conv3x3ov {tag}"
         )
     run(["docker", "run", "--rm",
          "--memory=3g", "--memory-swap=3g",
@@ -145,6 +177,29 @@ def main() -> int:
         ok, msg = _cmp(got, ref)
         ok_all &= ok
         print(f"  conv1x1 {Cin}x{Cout}x{H}x{W} {label:20s} {msg} -> {'PASS' if ok else 'FAIL'}")
+    for shape, _, _, ref in gemv_jobs:
+        Cin, Cout, H, W, label = shape
+        path = os.path.join(args.workdir, f"out_gemv_{Cin}x{Cout}x{H}x{W}.bin")
+        if not os.path.exists(path):
+            ok_all = False
+            print(f"  conv1x1g {Cin}x{Cout} {label:20s} MISSING -> FAIL")
+            continue
+        got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
+        ok, msg = _cmp(got, ref)
+        ok_all &= ok
+        print(f"  conv1x1g {Cin}x{Cout} {label:20s} {msg} -> {'PASS' if ok else 'FAIL'}")
+    for shape, _, _, _, ref in ov_jobs:
+        Cin, Cout, H, W, s, p, label = shape[:7]
+        tag = f"{Cin}x{Cout}x{H}x{W}s{s}"
+        path = os.path.join(args.workdir, f"out_convov_{tag}.bin")
+        if not os.path.exists(path):
+            ok_all = False
+            print(f"  conv3x3ov {Cin}x{Cout}x{H}x{W}s{s} {label:16s} MISSING -> FAIL")
+            continue
+        got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
+        ok, msg = _cmp(got, ref)
+        ok_all &= ok
+        print(f"  conv3x3ov {Cin}x{Cout}x{H}x{W}s{s} {label:16s} {msg} -> {'PASS' if ok else 'FAIL'}")
     print("\nRESULT:", "ALL PASS" if ok_all else "SOME FAILED")
     return 0 if ok_all else 1
 
@@ -166,7 +221,7 @@ DEFAULT_CONVS = [
     (64, 64, 80, 80, 1, 1, "p3 head 3x3 s1"),
     (32, 64, 80, 80, 1, 1, "c2f 3x3 s1"),
     (64, 64, 40, 40, 1, 1, "p4 3x3 s1"),
-    (16, 32, 160, 160, 2, 1, "stem 3x3 s2", "64,8,2,16,8,2,1,0,3,1"),
+    (16, 32, 160, 160, 2, 1, "stem 3x3 s2", "40,8,1,32,8,2,1,0,3,1,16"),
 ]
 
 # 代表性 conv1x1 shape (Cin,Cout,H,W)。
@@ -174,6 +229,19 @@ DEFAULT_CONV1X1 = [
     (64, 64, 80, 80, "c2f 1x1"),
     (384, 128, 40, 40, "neck 1x1"),
     (512, 256, 20, 20, "sppf 1x1"),
+]
+
+# 代表性 HW==1 split-K GEMV shape (Cin,Cout) —— mobilenet SE / classifier。
+DEFAULT_GEMV = [
+    (576, 1024, "classifier.0"),
+    (1024, 1000, "classifier.3"),
+    (240, 64, "se fc1"),
+]
+
+# OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl) 代表性 shape (Cin,Cout,H,W,stride,pad,label)。
+DEFAULT_CONVS_OV = [
+    (64, 64, 80, 80, 1, 1, "p3 head 3x3 s1 ov"),
+    (16, 32, 160, 160, 2, 1, "stem 3x3 s2 ov"),
 ]
 
 

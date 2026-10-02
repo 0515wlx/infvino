@@ -113,6 +113,7 @@ private:
   void    dispatch(const Node & n);
   Tensor & ref(const std::string & name);
   int     attrInt(const Node & n, const char * key, int def) const;
+  cl_mem  ovWeight(const std::string & name, Tensor & w, int Cout, int Cin);
 
   ClRuntime         rt_;
   std::string       plan_path_;
@@ -122,6 +123,10 @@ private:
 
   std::unordered_map<std::string, Tensor> T_;
   std::vector<cl_mem>                     owned_;
+  // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
+  // (keyed by the plan init name), plus their owning handles.
+  std::unordered_map<std::string, cl_mem> ov_w_;
+  std::vector<cl_mem>                     owned_ov_;
   std::vector<Node>                       nodes_;
   std::vector<std::string>                outputs_;   // 输出张量名（按声明顺序）
   std::string                             input_name_;

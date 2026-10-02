@@ -45,6 +45,9 @@ struct Tiles
   int NOLOAD = 0;
   // Round 14: kk-level software pipeline (prefetch next kk's A/B during mads).
   int PIPE = 0;
+  // Round 22: fused bias+activation epilogue (see gemm.cl). EPI=1 adds a Bias
+  // kernel argument; ACT is the activation code (0 none/1 silu/2 hardswish/3 relu/4 hardsigmoid).
+  int EPI = 0, ACT = 0;
 
   std::string options() const
   {
@@ -57,6 +60,7 @@ struct Tiles
       << " -DAT=" << AT << " -DPF=" << PF << " -DGN=" << GN
       << " -DSKIP_BARRIER=" << SB << " -DSG=" << SG << " -DNOLOAD=" << NOLOAD
       << " -DPIPE=" << PIPE
+      << " -DEPI=" << EPI << " -DACT=" << ACT
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -103,6 +107,8 @@ inline Tiles parseTiles(const std::string & s)
   if (v.size() > 16) t.SG = v[16];
   if (v.size() > 17) t.NOLOAD = v[17];
   if (v.size() > 18) t.PIPE = v[18];
+  if (v.size() > 19) t.EPI = v[19];
+  if (v.size() > 20) t.ACT = v[20];
   return t;
 }
 
@@ -136,6 +142,8 @@ struct Conv3x3Cfg
   int XG = 0;
   // Round 19: skip weight SLM tile, read repacked weights from GPU L3 (-DWGL).
   int WGL = 0;
+  // Round 22: OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl). TX=OBW, TY=OBH.
+  int OV = 0;
 
   std::string options() const
   {
@@ -161,6 +169,55 @@ struct Conv3x3Cfg
     return o.str();
   }
 };
+
+/**
+ * @brief 1x1 卷积（pointwise）专用 kernel 配置（见 kernels/conv1x1.cl）。
+ *
+ * 每个 work-item 计算 TM 个输出通道 x TN 个空间位置的输出块，沿 Cin 归约；
+ * 融合 bias、激活与（可选）残差，取代「gemm + bias_add + ew_unary」三连击。
+ */
+struct Conv1x1Cfg
+{
+  int TM = 4;    // 每 work-item 输出通道数
+  int TN = 4;    // 每 work-item 空间位置数
+  int ACT = 0;   // 0=none 1=SiLU 2=Relu 3=Hardswish 4=Hardsigmoid 5=Sigmoid
+  int RES = 0;   // 1 = epilogue 加残差
+  int SG = 16;   // 强制子组宽度（0=IGC 决定）
+  int UNROLL = 4;  // Cin 循环展开因子（提升 load/FMA 重叠）
+
+  std::string options() const
+  {
+    std::ostringstream o;
+    o << "-DTM=" << TM << " -DTN=" << TN << " -DACT=" << ACT << " -DRES=" << RES
+      << " -DSG=" << SG << " -DUNROLL=" << UNROLL
+      << " -cl-mad-enable -cl-fast-relaxed-math";
+    return o.str();
+  }
+  std::string label() const
+  {
+    std::ostringstream o;
+    o << "TM" << TM << " TN" << TN << " act" << ACT << (RES ? " res" : "") << " sg" << SG
+      << " u" << UNROLL;
+    return o.str();
+  }
+};
+
+/** @brief 解析 "TM,TN[,ACT,RES,SG]"。 */
+inline Conv1x1Cfg parseConv1x1(const std::string & s)
+{
+  Conv1x1Cfg c;
+  std::vector<int> v;
+  std::stringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) v.push_back(std::atoi(tok.c_str()));
+  if (v.size() > 0) c.TM = v[0];
+  if (v.size() > 1) c.TN = v[1];
+  if (v.size() > 2) c.ACT = v[2];
+  if (v.size() > 3) c.RES = v[3];
+  if (v.size() > 4) c.SG = v[4];
+  if (v.size() > 5) c.UNROLL = v[5];
+  return c;
+}
 
 /** @brief 解析 "TX,TY,TM,CB,CINC[,STRIDE,PAD,ACT,UNROLL_CI,VECC]"。 */
 inline Conv3x3Cfg parseConv(const std::string & s)

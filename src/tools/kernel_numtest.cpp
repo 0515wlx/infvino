@@ -76,6 +76,7 @@ int main(int argc, char ** argv)
     else if (a == "--dump") dump = next();
     else if (a == "--tiles") tiles = gk::parseTiles(next());
     else if (a == "--conv") conv = gk::parseConv(next());
+    else if (a == "--ov") conv.OV = 1;
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
   }
   if (stride >= 0) conv.STRIDE = stride;
@@ -116,17 +117,21 @@ int main(int argc, char ** argv)
       }
       clReleaseMemObject(dA); clReleaseMemObject(dB); clReleaseMemObject(dC); clReleaseKernel(k);
     } else if (op == "conv1x1") {
-      // 1x1 conv == GEMM: C[Cout, HW] = W[Cout,Cin] * X[Cin, HW].
+      // 1x1 conv == GEMM: C[Cout, HW] = W[Cout,Cin] * X[Cin, HW], with the fused
+      // bias+activation epilogue used in production (EPI=1, bias=null here).
       if (Cin <= 0 || Cout <= 0 || H <= 0 || W <= 0)
         throw std::runtime_error("need --cin --cout --h --w");
       const int M = Cout, N = H * W, K = Cin;
       auto hW = readBin(in_w, static_cast<size_t>(Cout) * Cin);
       auto hX = readBin(in_x, static_cast<size_t>(Cin) * H * W);
 
+      tiles.EPI = 1;
+      tiles.ACT = 0;
       cl_kernel k = rt.buildKernel("gemm", "gemm_f16", tiles.options());
       cl_mem dA = rt.alloc(static_cast<size_t>(M) * K * 2, CL_MEM_READ_ONLY);
       cl_mem dB = rt.alloc(static_cast<size_t>(K) * N * 2, CL_MEM_READ_ONLY);
       cl_mem dC = rt.alloc(static_cast<size_t>(M) * N * 2, CL_MEM_WRITE_ONLY);
+      cl_mem dNull = nullptr;
       rt.write(dA, static_cast<size_t>(M) * K * 2, hW.data());
       rt.write(dB, static_cast<size_t>(K) * N * 2, hX.data());
       clSetKernelArg(k, 0, sizeof(dA), &dA);
@@ -135,6 +140,8 @@ int main(int argc, char ** argv)
       clSetKernelArg(k, 3, sizeof(M), &M);
       clSetKernelArg(k, 4, sizeof(N), &N);
       clSetKernelArg(k, 5, sizeof(K), &K);
+      clSetKernelArg(k, 6, sizeof(dNull), &dNull);
+      clSetKernelArg(k, 7, sizeof(dNull), &dNull);
       const size_t lws[2] = {tiles.localX(), tiles.localY()};
       const size_t gws[2] = {
         static_cast<size_t>((N + tiles.BN - 1) / tiles.BN) * lws[0],
@@ -150,6 +157,38 @@ int main(int argc, char ** argv)
           dump.c_str(), Cout, N);
       }
       clReleaseMemObject(dA); clReleaseMemObject(dB); clReleaseMemObject(dC); clReleaseKernel(k);
+    } else if (op == "conv1x1g") {
+      // HW==1 split-K GEMV (production path for N=1 pointwise / fc).
+      if (Cin <= 0 || Cout <= 0) throw std::runtime_error("need --cin --cout");
+      auto hW = readBin(in_w, static_cast<size_t>(Cout) * Cin);
+      auto hX = readBin(in_x, static_cast<size_t>(Cin));
+      cl_kernel k = rt.buildKernel("conv1x1", "conv1x1_gemv_f16",
+                                   "-DACT=0 -DRES=0 -DSG=16 -cl-mad-enable -cl-fast-relaxed-math");
+      cl_mem dW = rt.alloc(static_cast<size_t>(Cout) * Cin * 2, CL_MEM_READ_ONLY);
+      cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_READ_ONLY);
+      cl_mem dC = rt.alloc(static_cast<size_t>(Cout) * 2, CL_MEM_WRITE_ONLY);
+      cl_mem dNull = nullptr;
+      rt.write(dW, static_cast<size_t>(Cout) * Cin * 2, hW.data());
+      rt.write(dX, static_cast<size_t>(Cin) * 2, hX.data());
+      clSetKernelArg(k, 0, sizeof(dW), &dW);
+      clSetKernelArg(k, 1, sizeof(dX), &dX);
+      clSetKernelArg(k, 2, sizeof(dNull), &dNull);
+      clSetKernelArg(k, 3, sizeof(dNull), &dNull);
+      clSetKernelArg(k, 4, sizeof(dC), &dC);
+      clSetKernelArg(k, 5, sizeof(Cin), &Cin);
+      clSetKernelArg(k, 6, sizeof(Cout), &Cout);
+      const size_t lws[1] = {16};
+      const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+      for (int i = 0; i < iters; ++i)
+        gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws);
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hC(static_cast<size_t>(Cout));
+        rt.read(dC, static_cast<size_t>(Cout) * 2, hC.data());
+        writeBin(dump, hC);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (conv1x1g %d fp16)\n", dump.c_str(), Cout);
+      }
+      clReleaseMemObject(dW); clReleaseMemObject(dX); clReleaseMemObject(dC); clReleaseKernel(k);
     } else if (op == "conv3x3") {
       if (Cin <= 0 || Cout <= 0 || H <= 0 || W <= 0)
         throw std::runtime_error("need --cin --cout --h --w");
@@ -159,6 +198,63 @@ int main(int argc, char ** argv)
       auto hW = readBin(in_w, static_cast<size_t>(Cout) * Cin * 9);
       std::vector<uint16_t> hB;
       if (!in_bias.empty()) hB = readBin(in_bias, static_cast<size_t>(Cout));
+
+      if (conv.OV) {
+        // OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl), OSV-swizzled weights.
+        const int obw = (conv.STRIDE == 2) ? 5 : 8;
+        const int obh = (conv.STRIDE == 2) ? 4 : 2;
+        char oo[192];
+        std::snprintf(oo, sizeof(oo),
+                      "-DOBW=%d -DOBH=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DRES=0 -DSG=16 "
+                      "-cl-mad-enable -cl-fast-relaxed-math", obw, obh, conv.STRIDE, conv.PAD, conv.ACT);
+        cl_kernel k = rt.buildKernel("conv_ov", "conv3x3_ov", oo);
+        const int fmg = (Cout + 31) / 32;
+        std::vector<uint16_t> hWo(static_cast<size_t>(fmg) * Cin * 9 * 32, 0);
+        for (int g = 0; g < fmg; ++g)
+          for (int ci = 0; ci < Cin; ++ci)
+            for (int kk = 0; kk < 9; ++kk) {
+              uint16_t * dst = &hWo[((static_cast<size_t>(g) * Cin + ci) * 9 + kk) * 32];
+              for (int p = 0; p < 32; ++p) {
+                const int oc = g * 32 + p;
+                dst[p] = (oc < Cout) ? hW[(static_cast<size_t>(oc) * Cin + ci) * 9 + kk] : (uint16_t)0;
+              }
+            }
+        cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * H * W * 2, CL_MEM_READ_ONLY);
+        cl_mem dW = rt.alloc(hWo.size() * 2, CL_MEM_READ_ONLY);
+        cl_mem dB = nullptr, dRes = nullptr;
+        cl_mem dY = rt.alloc(static_cast<size_t>(Cout) * Hout * Wout * 2, CL_MEM_WRITE_ONLY);
+        rt.write(dX, static_cast<size_t>(Cin) * H * W * 2, hX.data());
+        rt.write(dW, hWo.size() * 2, hWo.data());
+        if (!hB.empty()) { dB = rt.alloc(static_cast<size_t>(Cout) * 2, CL_MEM_READ_ONLY); rt.write(dB, static_cast<size_t>(Cout) * 2, hB.data()); }
+        clSetKernelArg(k, 0, sizeof(dX), &dX);
+        clSetKernelArg(k, 1, sizeof(dW), &dW);
+        clSetKernelArg(k, 2, sizeof(dB), &dB);
+        clSetKernelArg(k, 3, sizeof(dRes), &dRes);
+        clSetKernelArg(k, 4, sizeof(dY), &dY);
+        clSetKernelArg(k, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(k, 6, sizeof(H), &H);
+        clSetKernelArg(k, 7, sizeof(W), &W);
+        clSetKernelArg(k, 8, sizeof(Cout), &Cout);
+        clSetKernelArg(k, 9, sizeof(Hout), &Hout);
+        clSetKernelArg(k, 10, sizeof(Wout), &Wout);
+        const size_t lws[3] = {1, 1, 16};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + obw - 1) / obw),
+          static_cast<size_t>((Hout + obh - 1) / obh),
+          static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
+        rt.finish();
+        if (!dump.empty()) {
+          std::vector<uint16_t> hY(static_cast<size_t>(Cout) * Hout * Wout);
+          rt.read(dY, static_cast<size_t>(Cout) * Hout * Wout * 2, hY.data());
+          writeBin(dump, hY);
+          std::fprintf(stderr, "[kernel_numtest] wrote %s (%dx%dx%d ov fp16)\n", dump.c_str(), Cout, Hout, Wout);
+        }
+        clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dY);
+        if (dB) clReleaseMemObject(dB);
+        clReleaseKernel(k);
+        return 0;
+      }
 
       cl_kernel k = rt.buildKernel("conv", "conv3x3_f16", conv.options());
     std::fprintf(stderr, "[kernel_numtest] conv options: %s\n", conv.options().c_str());

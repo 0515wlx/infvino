@@ -105,6 +105,8 @@ def main():
             consumers.setdefault(i, []).append(n)
     fused_sigmoid = set()
     fused_mul = set()
+    fused_act = set()   # Round 22: activation nodes fused into conv1x1/gemm
+    fused_add = set()   # Round 22: residual Add nodes fused into conv1x1/conv3x3
     conv_act = {}  # conv原始输出名 -> 融合后应写出的张量名(Mul输出)
     for n in g.node:
         if n.op_type != "Conv":
@@ -121,6 +123,44 @@ def main():
                 fused_mul.add(m.name)
                 break
 
+    # Round 22: fold a single trailing unary activation into a 1x1 conv / Gemm.
+    # Only when the producer output feeds exactly one node, that node is one of
+    # the supported activations, and its result is not a graph output.
+    graph_out_names = {o.name for o in g.output}
+    # kernel act codes: 1x1/gemm use the ew_unary codes; conv3x3 uses its own
+    # (1=SiLU, 2=Hardswish) so only HardSwish can be folded there.
+    ACT_CODE_1X1 = {"Sigmoid": 5, "Relu": 2, "HardSwish": 3, "HardSigmoid": 4}
+    ACT_CODE_CONV = {"HardSwish": 2}
+
+    def fuse_act(producer_out, allowed):
+        """producer_out -> (final_out, act_code). Fuses a sole activation consumer."""
+        cs = consumers.get(producer_out, [])
+        if len(cs) == 1 and cs[0].op_type in allowed and cs[0].output[0] not in graph_out_names:
+            node = cs[0]
+            fused_act.add(node.name)
+            return node.output[0], allowed[node.op_type]
+        return producer_out, 0
+
+    def fuse_residual(producer_out):
+        """Fuses a sole same-shape tensor Add consumer as a conv epilogue residual.
+
+        Measured (Round 22): net negative on all three models — the fused conv
+        epilogue grows an extra full-tensor global read + a branch and loses more
+        to register pressure than the standalone ew_binary Add cost. Kept behind
+        INFVINO_FUSE_RESIDUAL=1 as an experiment.
+        """
+        if os.environ.get("INFVINO_FUSE_RESIDUAL", "0") != "1":
+            return producer_out, None
+        cs = consumers.get(producer_out, [])
+        if len(cs) == 1 and cs[0].op_type == "Add":
+            a0, a1 = cs[0].input[0], cs[0].input[1]
+            other = a1 if a0 == producer_out else (a0 if a1 == producer_out else None)
+            if other is not None and other not in c.inits and \
+               list(c.shape(other)) == list(c.shape(producer_out)):
+                fused_add.add(cs[0].name)
+                return cs[0].output[0], other
+        return producer_out, None
+
     def emit_conv(n):
         x, w = n.input[0], n.input[1]
         b = n.input[2] if len(n.input) > 2 else None
@@ -132,49 +172,48 @@ def main():
         ph, pw = pads[0], pads[1]
         assert kh == kw, (kh, kw)
         raw_out = n.output[0]
-        fused = raw_out in conv_act
-        out = conv_act.get(raw_out, raw_out)
         oshape = c.shape(raw_out)
-        act = 1 if fused else 0
+        groups = c.attr(n, "group", 1)
         c.declare_init(w)
         if b:
             c.declare_init(b)
-        c.declare(out, oshape)
-        groups = c.attr(n, "group", 1)
         # 3x3 groups=1 走调优过的专用 kernel（含 stride2；s2 用更小的 CINC/TX
         # 以免输入 halo 超出 SLM）。其余走通用 kernel。
         use_direct = (kh == 3 and groups == 1 and sh in (1, 2))
         if use_direct:
+            if raw_out in conv_act:
+                out, act = conv_act[raw_out], 1
+            else:
+                out, act = fuse_act(raw_out, ACT_CODE_CONV)
+            out, res = fuse_residual(out)
+            c.declare(out, oshape)
             # cfg = TX,TY,TM,CB,CINC（STRIDE/PAD/ACT 由 PlanModel 从节点属性注入）
             # s2 的输入 halo 是 s1 的两倍：用 TM=1 / CB=32 提高通道复用、降低输入重读
             # 放大（Cout/CB），CINC=8 保证 halo 不超 SLM。
             cfg = None if sh == 1 else "64,8,1,32,8,2"
-            c.node_line("conv3x3", [x, w, b or "-"], [out], stride=sh, pad=ph,
+            c.node_line("conv3x3", [x, w, b or "-", res or "-"], [out], stride=sh, pad=ph,
                         Hout=oshape[2], Wout=oshape[3], act=(act or None), cfg=cfg)
             return
-        # 1x1 且 groups=1 -> gemm
+        # 1x1 且 groups=1 -> 融合 bias+激活+残差的 conv1x1（N=1 走 split-K GEMV）
         if kh == 1 and groups == 1:
-            cur = out
-            if b or fused:
-                cur = out + "__t1"
-                c.declare(cur, oshape)
-            c.node_line("gemm", [w, x], [cur])
-            if b:
-                dst = out if not fused else out + "__t2"
-                if fused:
-                    c.declare(dst, oshape)
-                c.node_line("bias_add", [cur, b], [dst], HW=oshape[2] * oshape[3])
-                cur = dst
-            if fused:
-                c.node_line("ew_unary", [cur], [out], op=1, n=int(np.prod(oshape)))
+            if raw_out in conv_act:
+                out, act = conv_act[raw_out], 1
+            else:
+                out, act = fuse_act(raw_out, ACT_CODE_1X1)
+            out, res = fuse_residual(out)
+            c.declare(out, oshape)
+            c.node_line("conv1x1", [w, x, b or "-", res or "-"], [out], act=(act or None))
             return
         # 通用（含 depthwise / 5x5 / stride2）
+        out = conv_act.get(raw_out, raw_out)
+        c.declare(out, oshape)
+        act = 1 if raw_out in conv_act else 0
         c.node_line("conv_general", [x, w, b or "-"], [out], K=kh, S=sh, P=ph,
                     G=groups, Hout=oshape[2], Wout=oshape[3], act=(act or None))
 
     for n in g.node:
         op = n.op_type
-        if n.name in fused_sigmoid or n.name in fused_mul:
+        if n.name in fused_sigmoid or n.name in fused_mul or n.name in fused_act or n.name in fused_add:
             continue
         if op == "Constant":
             continue
@@ -358,16 +397,15 @@ def main():
             K = xshape[1]
             N = wshape[0]
             c.declare_init(b)
-            c.declare(out, c.shape(out))
+            bi = None
             if len(n.input) > 2 and n.input[2] in c.inits:
                 bi = n.input[2]
                 c.declare_init(bi)
-                tmp = out + "__pre"
-                c.declare(tmp, c.shape(out))
-                c.node_line("gemm", [b, a], [tmp])
-                c.node_line("bias_add", [tmp, bi], [out], HW=1)
-            else:
-                c.node_line("gemm", [b, a], [out])
+            # Round 22: single fused conv1x1 (bias + optional activation + residual).
+            final_out, act = fuse_act(out, ACT_CODE_1X1)
+            final_out, res = fuse_residual(final_out)
+            c.declare(final_out, c.shape(out))
+            c.node_line("conv1x1", [b, a, bi or "-", res or "-"], [final_out], act=(act or None))
         else:
             raise NotImplementedError(f"{op} ({n.name})")
 

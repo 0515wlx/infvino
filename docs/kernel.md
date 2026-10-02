@@ -1646,6 +1646,113 @@ selector 在本模型这些形状上**没有选 Winograd，选的是 direct `os_
   （batch 足够大时 Winograd 域 GEMM 的 M 才够大）；在本机单流、小 batch 的现实下，
   **direct conv ~10.3（大层）/ 网格饥饿层 +20–56% 就是当前最优**。
 
+## Round 22 —— 1×1 专用 kernel（融合 + split-K GEMV）、OpenVINO conv3×3 移植、并行 GAP
+
+目标（本轮任务）：(1) 写 1×1 conv 专用 kernel 优化 mobilenetv3-small 端到端；
+(2) conv3×3 直接上 OpenVINO 的 kernel（引入代码、不引入依赖，处理 Apache-2.0）；
+(3) 用融合提升三个模型端到端。
+
+### 22.1 先给整网账本分维（profile tag 细化）
+
+把 `gemm` 的 profile tag 细化为 `gemm@MxNxK` 后，mobilenetv3-small 的 4.12 ms gemm 里
+**N=1（HW==1）的矩阵-向量积占 ~2.3 ms**（classifier 1024×1×576 / 1000×1×1024、SE 的
+fc1/fc2 全部 HW=1），而通用 GEMM 在 N=1 时 `BN=64` 浪费 63/64 lane、网格只有
+`ceil(M/BM)` 个 work-group（1000×1×1024 只有 8 个）——是纯粹的网格饥饿。
+
+### 22.2 1×1 conv：融合 bias+激活 + N=1 split-K GEMV
+
+新增 `kernels/conv1x1.cl`：
+
+- **`conv1x1_gemv_f16`（N==1）**：一个 work-group = 一个 sub-group（16 lane）= 一个输出
+  通道，lane 沿 K 归约，`sub_group_reduce_add` 收口。W 保持自然 `[Cout][Cin]`，相邻 lane
+  连续读（coalesced），X 广播；**fp32 累加**（数值反而更好，mean_rel ~1e-8）。
+- **N>1**：直接复用调好的 `gemm_f16`，但加了**融合 bias+激活的 epilogue**（`-DEPI=1`），
+  取代原来的 `gemm + bias_add + ew_unary` 三连击。
+- 另写了一版「lane=空间 + 输出通道在寄存器」的 `conv1x1_f16`（含 `[Cin][Cout]` 转置权重
+  宽载），实测在 N>1 上**全面慢于 `gemm_f16`**（gemm 的小 tile 网格饥饿反而不如它的 SLM
+  分块），保留为负结果/实验工具。
+
+`onnx2plan.py` 把 1×1 conv 与 `Gemm` 折叠成单节点 `conv1x1`（融合 bias + 尾部激活）。
+
+**效果（mobilenet，逐层）**：N=1 的 15 个层从 gemm 合计 ~2.3 ms → gemv ~0.46 ms
+（**5–27×**）；`bias_add`(42) + `ew_unary`(42) 两次 launch 全部消失。
+
+### 22.3 OpenVINO conv3×3（`convolution_gpu_bfyx_os_iyx_osv32`）移植
+
+把 OpenVINO 的 `convolution_gpu_bfyx_os_iyx_osv32.cl` **数据通路**移植为自包含的
+`kernels/conv_ov.cl`（Apache-2.0，见 `THIRD_PARTY_NOTICES.md` + `third_party/openvino/LICENSE`）：
+
+- lane=输出通道（OSV_SIZE=32，每 lane 2 通道）；输入块一次载入寄存器 + `sub_group_broadcast`；
+- 权重用 `intel_sub_group_block_read_us2` 从 **OSV swizzle 布局**读取（host 端
+  `PlanModel::ovWeight` 按 `GET_FILTER_OS_IYX_OSV_INDEX` 重排）；
+- **零 SLM、零 barrier**；bias+激活（+可选残差）在输出阶段融合。
+
+**关键修正**：R20 的自写 OV 式 kernel（`conv_sg`）用「逐 lane 合并读」，只到 8.2。本轮
+发现 `_sub_group_block_read*` 是**跨步**语义（lane l 取位置 `l, l+16`，不是 `2l,2l+1`），
+权重布局是 `o%32` 自然序——按此实现后 kernel **正确且明显更快**：
+
+| shape | native conv3x3（R18） | **OV 移植（本轮）** | 加速 |
+|---|---|---|---|
+| 64→64@80 s1 | 10.31 (0.440 ms) | **13.61 (0.333 ms)** | **1.32×** |
+| 128→128@40 s1 | 10.34 (0.439) | **12.61 (0.360)** | 1.22× |
+| 64→64@40 s1 | 6.16 (0.184) | **7.91 (0.143)** | 1.29× |
+| 16→16@160 s1 | 4.81 (0.236) | **5.75 (0.197)** | 1.20× |
+| 128→128@20 s1 | 3.09 (0.367) | **5.27 (0.215)** | **1.71×** |
+| 256→64@20 s1 | 1.63 (0.694) | **2.92 (0.388)** | **1.79×** |
+| 64→128@160 s2 | 7.07 (1.283) | **10.73 (0.846)** | **1.52×** |
+
+→ **在所有测试形状上 OV 移植都赢**，于是 `PlanModel` 的 conv3x3 默认走 OV（`ov=0` 可回退
+native）。这修正了 R20「OV 路径不如我们」的结论：**不是 OV 数据通路差，是当时的权重
+布局/块读语义没复刻对**。OV 的 13.6 也说明「lane=通道 + block-read 权重」这条通路在本机
+上能越过 native direct conv 的 staging 天花板（R18 的 staging-free 16.4 仍是更远的上限）。
+
+### 22.4 并行 GAP
+
+`ops.cl` 新增 `gap_r`：一个 work-group（128 lane）一个通道，SLM 树归约。mobilenet 10 个
+GAP 从 **0.857 ms → 0.119 ms（7.2×）**（原来每通道 1 个 work-item 串行扫 HW，C=16 时
+整机只有 16 个 work-item）。
+
+### 22.5 融合：已生效与负结果
+
+- **生效**：1×1 conv / Gemm 的 `bias+act` 融合（§22.2）；conv3×3 OV 的 `bias+act` 融合；
+  conv3×3 的尾部 HardSwish 折叠（`ACT_CODE_CONV`）。
+- **负结果（默认关闭，`INFVINO_FUSE_RESIDUAL=1` 可开）**：把 C2f/mobilenet 的残差 `Add`
+  折进 conv epilogue。三个模型**全部变慢**（yolo8 17.30→17.61、yolo11 19.93→20.88、
+  mobilenet 3.39→3.72 ms）：融合后的 conv 多了一次全张量残差读 + 一个分支，寄存器压力
+  上升的代价大于省下的 `ew_binary`。已在 `onnx2plan.py` 用开关封存。
+- **未做**：`concat4`（yolo 里 1.1–1.3 ms）是 DRAM 带宽受限的 C2f concat，真正要省必须把
+  concat 融进消费者 conv 的输入 staging（跨多输入 gather），本轮未做。
+
+### 22.6 端到端结果（单流，warm）
+
+kernel busy（`kernel_run --report`，同会话 HEAD 基线对照）：
+
+| 模型 | HEAD 基线 | **R22** | 加速 | 主要来源 |
+|---|---|---|---|---|
+| yolov8n-pose | 19.60 ms | **17.37 ms** | 1.13× | conv3×3 OV + 1×1 融合 |
+| yolo11n-pose | 22.40 ms | **20.27 ms** | 1.10× | conv3×3 OV + 1×1 融合 |
+| mobilenetv3-small | 6.28 ms | **3.46 ms** | **1.81×** | N=1 GEMV + 1×1 融合 + GAP |
+
+墙钟（`infvino_bench`，net only，含 launch 开销）：
+
+| 模型 | HEAD 基线 | **R22** | 加速 |
+|---|---|---|---|
+| yolov8n-pose | 24.09 ms | **22.34 ms** | 1.08× |
+| yolo11n-pose | 28.24 ms | **25.58 ms** | 1.10× |
+| mobilenetv3-small | 7.29 ms | **4.64 ms** | **1.57×** |
+
+数值：`kernel_check.py` **ALL PASS**（含新增 `conv1x1` / `conv1x1g` / `conv3x3ov`）；
+`model_check.py` 三模型 **ALL PASS**（yolov8 5.69e-4、yolo11 9.54e-4、mobilenet 1.31e-2）。
+
+### 22.7 结论
+
+1. mobilenet 的瓶颈是 **N=1 矩阵-向量积的网格饥饿**，split-K GEMV 一次拿下 ~5–27×；
+2. conv3×3 用 **OV 的 block-read 权重 + lane=通道** 通路能超过 native direct conv
+   （大层 1.2–1.8×），这是本轮最大的单 kernel 收益，且推翻了 R20 的误判；
+3. 融合只在「不把 conv kernel 变重」时才有正收益（bias+act 融合赢，残差融合输）；
+4. 剩余整网大头：yolo 的 `concat4`（DRAM 带宽）与 `bmm/softmax`（attention），
+   mobilenet 的 `depthwise`；都不是「换 kernel tile」能解决的，需要改数据通路/图融合。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

@@ -184,6 +184,30 @@ __kernel void gap(__global const half *restrict x, __global half *restrict y,
   y[c] = (half)(s / (float)HW);
 }
 
+// ---- parallel global average pool: one work-group per channel, tree reduction.
+// Round 22: the serial `gap` above launches only C work-items (e.g. C=16 for the
+// 56x56->1x1 stem GAP) and is latency-bound (mobilenet measured 0.86 ms across 10
+// GAPs). This version spreads each channel over GAP_WGS lanes and reduces in SLM.
+#ifndef GAP_WGS
+#define GAP_WGS 128
+#endif
+__kernel void gap_r(__global const half *restrict x, __global half *restrict y,
+                    const int C, const int HW) {
+  const int c = get_group_id(0);
+  const int lid = get_local_id(0);
+  if (c >= C) return;
+  __local float s[GAP_WGS];
+  float acc = 0.0f;
+  for (int i = lid; i < HW; i += GAP_WGS) acc += (float)x[c * HW + i];
+  s[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = GAP_WGS / 2; off > 0; off >>= 1) {
+    if (lid < off) s[lid] += s[lid + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) y[c] = (half)(s[0] / (float)HW);
+}
+
 // ---- broadcast add of a per-channel bias: y[c*HW+i] = x[c*HW+i] + b[c] ----
 __kernel void bias_add(__global const half *restrict x, __global const half *restrict b,
                        __global half *restrict y, const int HW) {

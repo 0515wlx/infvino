@@ -102,6 +102,39 @@
 #define SG 0
 #endif
 
+// Fused epilogue (Round 22): when EPI=1 the kernel takes an extra `Bias` argument
+// and applies `act(acc + bias)` at store time, so a 1x1 conv / fc no longer needs
+// separate `bias_add` + `ew_unary` launches. ACT codes:
+// 0=none 1=SiLU 2=Relu 3=Hardswish 4=Hardsigmoid 5=Sigmoid.
+#ifndef EPI
+#define EPI 0
+#endif
+#ifndef ACT
+#define ACT 0
+#endif
+#ifndef RES
+#define RES 0
+#endif
+
+inline half gemm_activate(half v) {
+#if ACT == 1
+  float f = (float)v;
+  return (half)(f / (1.0f + exp(-f)));
+#elif ACT == 2
+  return (half)fmax((float)v, 0.0f);
+#elif ACT == 3
+  float f = (float)v;
+  return (half)(f * fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f);
+#elif ACT == 4
+  float f = (float)v;
+  return (half)(fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f);
+#elif ACT == 5
+  return (half)(1.0f / (1.0f + exp(-(float)v)));
+#else
+  return v;
+#endif
+}
+
 #define LX (BN / TN)
 #define LY (BM / TM)
 #define NTHR (LX * LY)
@@ -136,7 +169,12 @@ __attribute__((reqd_work_group_size(LX, LY, 1)))
 __kernel void gemm_f16(__global const half *restrict A,
                        __global const half *restrict B,
                        __global half *restrict C,
-                       const int M, const int N, const int K) {
+                       const int M, const int N, const int K
+#if EPI
+                       , __global const half *restrict Bias
+                       , __global const half *restrict Res
+#endif
+                       ) {
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * LX + lx;
@@ -539,7 +577,18 @@ __kernel void gemm_f16(__global const half *restrict A,
     for (int j = 0; j < TN; ++j) {
       int gr = blockRow + ly * TM + i;
       int gc = blockCol + lx * TN + j;
-      if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
+      if (gr < M && gc < N) {
+#if EPI
+        half v = acc[i][j] + (Bias ? Bias[gr] : (half)0);
+        v = gemm_activate(v);
+#if RES
+        if (Res) v = v + Res[(size_t)gr * N + gc];
+#endif
+        C[gr * N + gc] = v;
+#else
+        C[gr * N + gc] = acc[i][j];
+#endif
+      }
     }
 #undef STAGE_VEC
 #undef STAGE_A

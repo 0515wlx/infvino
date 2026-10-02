@@ -123,12 +123,21 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
 | [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
+| [`docs/round22-status.md`](docs/round22-status.md) | **R22 现状分析**：1×1 kernel / OV conv3×3 / 融合 |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
 > **direct conv、OpenVINO 式（lane=通道 + broadcast）、Winograd 三条数据通路的
 > ops/EU/cyc 上限均为 ~16**（纯寄存器 FMA 结构上限 27.4–29.6，理论峰值 32）——
 > 这是不换硬件能力时卷积复用的现实天花板。生产路径 direct conv 大层 ~10.3，
 > 网格饥饿层经自适应分块 +20–56%。详见 [`docs/kernel.md`](docs/kernel.md)。
+>
+> **R22 更新**：把 OpenVINO `os_iyx_osv32` 的**真实数据通路**（lane=通道 +
+> `intel_sub_group_block_read` 权重 + OSV swizzle，见 `kernels/conv_ov.cl`）移植进来后，
+> conv3×3 大层从 ~10.3 提到 **12.6–13.6 ops/EU/cyc（+20–80%）**，全形状优于原 native
+> direct conv；1×1 的 N=1 层改走 split-K GEMV（+5–27×）。三模型 kernel busy
+> 1.10–1.81×、墙钟 1.08–1.57×（mobilenet 最大）。Apache-2.0 归属见
+> [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## 状态
 
