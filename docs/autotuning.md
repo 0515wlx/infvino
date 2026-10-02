@@ -18,9 +18,16 @@ infvino 已经用 `ops/EU/cyc` 建立了清晰的**物理极限标尺**（`docs/
 | 理论峰值 | 32 | 16 packed FP16 FMA/EU/cyc |
 | 纯寄存器 FMA | 27.4–29.6 | 结构上限（指令槽 + 循环开销） |
 | GEMM compute-only | 17.7 | SLM 操作数 feed |
-| conv3x3 staging-free | 16.4 | SLM 权重块读延迟 |
+| conv3x3 OV 指令配额（**R24**）| **20.3** | ISA：主循环 288 packed mad / 453 指令 = 63.6% |
+| conv3x3 staging-free（native）| 16.4 | SLM 权重块读延迟 |
 | GEMM 整核 | 13.7 | staging + loads + 寄存器占用 |
-| conv3x3 整核（大层）| 10.3 | staging + 网格饥饿 |
+| conv3x3 整核（大层，R18）| 10.3 | staging + 网格饥饿 |
+
+> **R24 更正**：上表 R18/R20 的 `conv3x3 ≈ 10–16` 是**旧口径**。离线反汇编 `conv_ov.cl`
+> 证明 `sub_group_broadcast` 被折进 `mad` 操作数，指令配额上限是 **20.3**（不是 16），
+> 实测大层 13.8 = 配额的 68%、40×40 = 42%，缺口在延迟/流水/占用。中间标准已据此改为
+> `32×0.636×prologue_amort×grid_factor`（上界 20.3）。见
+> [`round24-analysis.md`](round24-analysis.md)。
 
 问题在于：**只有「天花板」和「实测值」，缺少「这一层、这个 shape、在这台机器上应该能到多少」的
 中位标尺。** 于是每次调优都要靠人肉 reinterpret：
@@ -203,9 +210,13 @@ issue_bound = 32 × (mad_frac) × (SIMD/16)          # 每周期 1 条向量指�
   staging_frac ≈ 0.5（R18.2：全局读 +21%、索引/SLM 写 +38% 合计 ~1.67× → 1/(1+0.67)）
   weight/strip 复用 = CB 与 3×kw，得 inner-loop mad_frac ≈ 0.9。
   → expected ≈ 32 × 0.9 × (CB/(CB+overhead)) × SIMD_factor，对 64→64@80 ≈ 13–16。
-- **conv3x3（lane=通道 + block-read, OV）**：
-  `expected ≈ 32 / (1 + 1)` = **16**（1 broadcast : 1 mad，R20/R23 的发射上限），
-  再乘网格占用修正 `min(1, wgs / (EU × target_wg_per_eu))`。
+- **conv3x3（lane=通道 + block-read, OV）**：R20 曾按「1 broadcast : 1 mad」推断
+  `expected = 32/2 = 16`；**R24 更正**：ISA 反汇编显示 `sub_group_broadcast` 被折进 `mad`
+  操作数，主循环 mad 占 63.6%，所以
+  `expected = 32 × 0.636 × prologue_amort × grid_factor`，上界 **20.3**（不是 16）。缺口是
+  延迟/流水/占用（实测大层 13.8、40×40 8.5）。
+- **conv3x3（lane=空间 + SLM, native）**：staging-free 16.4（R18），整核受 staging + 网格
+  饥饿；调优器在 OV 与 native 之间按 size 取实测更优者（R24 起两者对所有 shape 都是候选）。
 - **gemm**：`expected = 32 × mad_frac × reg_occupancy`，
   `mad_frac = TM·TN / (TM·TN + TM + TN + addr_overhead)`；寄存器占用修正由 128 GRF 决定。
 - **网格饥饿修正**：`grid_factor = min(1, n_wg / (EU × k))`，k≈2（R18：<16 WG 时 +20–56% 可恢复）。
@@ -268,11 +279,16 @@ config/
 - `W80H80s1_Cin64_Cout51`：调优选 **`OBW=10,OBH=2`** → 11.27 ops（启发式固定 8）。
 - `W20H20s1_*` 系列普遍选 **`OBH=1`**（20 高时 OBH=2 会浪费一半）。
 
-**中间标准（`--expected`）暴露的真实差距**：
-- 大层 `80×80 Cin64 Cout64`：实测 13.77 / 期望 12.15 = **ratio 1.13**（超过期望，符合 R22）。
-- `40×40` 系列 ratio 0.55–0.70：网格/复用受限，正是 R18 说的「网格饥饿」。
-- `320×320 s2 Cin3 Cout16`：实测 1.73 / 期望 10.32 = **ratio 0.17**——**全模型离物理极限最远的一层**，
-  中间标准把它自动标出来了（以前只能靠人工 profile 发现）。
+**中间标准（`--expected`）暴露的真实差距**（P0 旧口径）：
+
+- 大层 `80×80 Cin64 Cout64`：实测 13.77 / 期望 12.15 = **ratio 1.13**。
+- `40×40` 系列 ratio 0.55–0.70：网格/复用受限。
+- `320×320 s2 Cin3 Cout16`：实测 1.73 / 期望 10.32 = **ratio 0.17**——离极限最远的一层。
+
+> **R24 修正口径**：ISA 证明指令配额上限是 20.3（不是 16），于是同一批实测变成：
+> `80×80` ratio **0.69**、`40×40` **0.42**、`320×320 s2 3→16` **0.11**——
+> 即连大层也只有配额的 ~68%。完整逐 size 表见
+> [`round24-analysis.md`](round24-analysis.md) §2。
 
 > 结论：P0 在不改任何 kernel 源码的前提下，仅靠自动选择配置就拿到整网 −5%～−12%，
 > 且中间标准能自动定位「离极限最远」的层，这正是之前缺失的「层级化自动调优」。

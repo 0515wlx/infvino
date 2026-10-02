@@ -126,13 +126,16 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
+| [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
-> **kernel 效率结论（R18–R21）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
-> **direct conv、OpenVINO 式（lane=通道 + broadcast）、Winograd 三条数据通路的
-> ops/EU/cyc 上限均为 ~16**（纯寄存器 FMA 结构上限 27.4–29.6，理论峰值 32）——
-> 这是不换硬件能力时卷积复用的现实天花板。生产路径 direct conv 大层 ~10.3，
-> 网格饥饿层经自适应分块 +20–56%。详见 [`docs/kernel.md`](docs/kernel.md)。
+> **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
+> **direct conv、OpenVINO 式（lane=通道 + broadcast）、Winograd 三条数据通路**
+> 曾被判定 ops/EU/cyc 上限均为 ~16（纯寄存器 FMA 结构上限 27.4–29.6，理论峰值 32）。
+> **R24 用 ISA 反汇编更正**：移植路径的 `sub_group_broadcast` 被折进 `mad`，指令配额上限
+> 实为 **~20.3**（见下方 R24 更新）。这仍是「不换硬件能力时的现实天花板」的一个更准确版本。
+> 生产路径 direct conv 大层 ~10.3，网格饥饿层经自适应分块 +20–56%。
+> 详见 [`docs/kernel.md`](docs/kernel.md)。
 >
 > **R22 更新**：把 OpenVINO `os_iyx_osv32` 的**真实数据通路**（lane=通道 +
 > `intel_sub_group_block_read` 权重 + OSV swizzle，见 `kernels/conv_ov.cl`）移植进来后，
@@ -148,12 +151,23 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > 详见 [`docs/kernel.md`](docs/kernel.md) Round 23 与
 > [`docs/round22-status.md`](docs/round22-status.md)。
 >
+> **R24 更正（重要）**：用离线 `ocloc` 反汇编 `conv_ov.cl` 得到决定性证据——
+> 主内循环 **288 packed mad / 453 指令 = 63.6% mad**，且 `sub_group_broadcast` **已被
+> IGC 折进 `mad` 操作数**（没有独立广播指令）。所以本移植 kernel 的指令配额上限 ≈ **20.3**，
+> **不是 R18/R20 的 ~16，也不是实测的 ~10–13**。实测 80×80 仅为配额的 68%、40×40 仅 42%，
+> 缺口是**延迟/流水/占用**而非指令数。据此把中间标准 `expected_ops` 改为
+> `32×0.636×prologue_amort×grid_factor`（上界 20.3），并让 **OV 与 native 两条通路在
+> 全部 shape（含 stride=2）上都是 autotune 候选**。第一个 ILP 变体（`-DUK` 双累加集）
+> 实测更慢并回退。逐 size 分析与下一步（split-K / 内部块 fast path / OSV64）见
+> [`docs/round24-analysis.md`](docs/round24-analysis.md)。
+>
 > **自动调优（P0）**：引入分层自动调优体系（[`docs/autotuning.md`](docs/autotuning.md)）：
 > `OpSignature` + `TuningCache`（按设备/op/shape）+ 候选枚举 + **中间标准 `expected_ops`**。
 > 不改任何 kernel 源码，仅靠自动选择配置，yolov8n conv3×3 分项 **10.98→9.71 ms（−11.6%）**、
 > 整网 busy **17.35→16.07 ms（−7.4%）**，输出**逐位不变**；中间标准自动定位出
-> 「离物理极限最远」的层（如 `320×320 s2 Cin3 Cout16` ratio 0.17）。
-> 调优表见 [`config/tuning.json`](config/tuning.json)。
+> 「离物理极限最远」的层（如 `320×320 s2 Cin3 Cout16` ratio 0.17）。调优表见
+> [`config/tuning.json`](config/tuning.json)。（R24 起中间标准按上面的 ISA 配额修正，
+> ratio 数值随之更新。）
 
 ## 状态
 

@@ -1820,6 +1820,54 @@ R23（3-D concat + 新 PlanModel）本身数值正确，`concat4` 是纯 copy、
 `concat4`（已优化到带宽极限）与 attention。下一步若继续，方向应是
 「完整移植 OV 阻塞 conv + 逐层 autotune」，属大工程。
 
+## Round 24 —— conv3×3 逐 size 瓶颈定位 + 「中间标准」修正 + 两通路接入调优
+
+> 完整分析见 [`docs/round24-analysis.md`](round24-analysis.md)。本轮不改 kernel 源码
+> （一个 ILP 变体试过并回退），核心产出是**用离线 ISA 推翻错误的「~16 上限」**并修正调优目标。
+
+### 24.1 决定性证据（离线 `ocloc` 反汇编 `conv_ov.cl`，无需 GPU）
+
+- 主内循环（2 输入通道）**288 条 packed `mad` / 453 条指令 = 63.6% mad**；
+- **`sub_group_broadcast` 被折进 `mad` 标量操作数**，指令流里没有独立广播指令；
+- 因此指令配额上限 = `32 × 0.636 ≈ 20.3`，**不是** R20/R23 按「1 broadcast : 1 mad」
+  推断的 16（那是 `conv3x3_sg` 的结构，不是本生产路径）；
+- 实测 80×80 = 13.77（配额的 68%）、40×40 = 8.46（42%）→ **缺口是延迟/流水/占用**，
+  不是指令数。这坐实了「默认软件流水不够好」，并更正了 R18.7/R20 的 `conv3x3 整核 10.3 /
+  OV 16.0` 标尺（后者是 OV 整体选核的聚合值，不是本移植 kernel 的天花板）。
+
+### 24.2 逐 size 瓶颈（修正后的中间标准下）
+
+| 类别 | 代表 | ratio=实测/期望 | 短板 |
+|---|---|---|---|
+| 大空间/大通道 | 80×80 s1 64→64 | 0.69 | 内存/send 延迟 |
+| 中空间（重点）| 40×40 s1 64→64 | 0.42 | grid/占用（block 甜点 8×1）|
+| 小空间 | 20×20 s1 64→64 | 0.42 | gridFactor < 1 |
+| 通道窄/Cin 短 | 112×112 s2 3→16 | **0.08** | lane 半空 + 循环太短 |
+
+40×40 block 扫描（新覆盖 `OBW×1`）：4×1=5.54、**8×1=8.44–8.69**、10×1=7.54、16×1=6.19、
+8×2=7.83 → 既非纯 grid 也非纯 ILP，8×1 是甜点。
+
+### 24.3 尝试（负结果，已回退）
+
+给 `conv_ov.cl` 加 `-DUK`（输入通道双累加集，拉长 FMA 依赖距离）：ISA 无 spill，但实测
+全面更慢（40×40 8.4→7.9、80×80 13.8→12.9），且变体有 codegen 正确性问题 → **整体回退**。
+判读：IGC 单集 codegen 已在 7 线程间提供足够 ILP，瓶颈更可能在 **send/全局读延迟** 与
+**每 WG 边界谓词/prologue/epilogue**。
+
+### 24.4 接入自动调优
+
+- `expected_ops` 修正为 `32 × 0.636 × prologue_amort × grid_factor`（上界 20.3），
+  不再锚定实测；`tuning_test` 锁住该行为；
+- `candidatesConv3x3` 让 **OV 与 native 在全部 shape（含 stride=2）上都是候选**，
+  由调优器按 size 选通路；
+- 数值：`kernel_check --skip-gemm` **ALL PASS**（OV / native / conv1x1 / gemv）。
+
+### 24.5 下一步
+
+split-K 提高 40×40 类 grid/占用（最大头）；内部块 fast path 去掉逐元素 gather/scatter；
+VECO=OSV64（每广播多算，注意 128-GRF 墙）；重跑逐层 autotune。
+
+
 ## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
   `outer=800, axdim=400, inner=320000` → **2.56 亿工作项 → 假死**（表现为开发板卡死）。
   已修（axis 归一化为非负），并在 `kernel_run` 加 **gws 安全阀**（>3e8 直接报错退出）。
