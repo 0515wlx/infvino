@@ -224,3 +224,58 @@ python3 scripts/model_check.py --model mobilenetv3-small --repo $PWD
 # 墙钟
 ./build/infvino_bench --config config/models.yaml --key yolov8n-pose --iters 100
 ```
+
+---
+
+# Round 23 补充：小算子收益、与 OV 的整网对照、阻塞式 conv（负结果）
+
+> 详见 `docs/kernel.md` Round 23；数值判据同上。
+
+## A. 与 OpenVINO 2025.2 的整网对照（同一 iGPU）
+
+| 模型 | OV GPU 合计 | OV infer | OV e2e | infvino busy (R23) | 差距 |
+|---|---|---|---|---|---|
+| yolov8n-pose | 9.33 ms | 11.2 ms | 13.9 ms | **17.2 ms** | ~1.5× |
+| yolo11n-pose | 9.61 ms | 11.8 ms | 14.5 ms | **20.1 ms** | ~1.7× |
+| mobilenetv3-small | 0.96 ms | 1.8 ms | 2.2 ms | **3.5 ms** | ~1.9× |
+
+OV 端到端测试脚本：`models/*.onnx` + `openvino.Core().compile_model(..., "GPU")`，
+预处理与 `infvino_bench` 一致（letterbox/RGB/normalize）。OV per-node 用
+`enable_profiling` 取 GPU real_time 聚合（`Convolution` 独占大头）。
+
+## B. infvino R23 的两项**已验证**收益
+
+| 提交 | 内容 | 效果 | 数值 |
+|---|---|---|---|
+| `b28a6a4` | `.cl` 源文本缓存 + per-node kernel 句柄缓存 | 去除每次推理上百次磁盘读/编译/建 kernel | 逐位不变 |
+| `bef119f` | `concat4` 改 3-D 网格（去逐元素 div/mod）| yolov8 busy **19.9→17.2**、yolo11 **23.0→20.1** ms | 精确 copy，三模型 PASS |
+
+- 并行 `softmax_axis_r` 试过：0.63→0.155 ms，但**破坏数值**（mean_rel 3.7e-2），已回退。
+
+## C. conv3×3 差距定位：**网格饥饿**
+
+- yolov8 里 `conv3x3ov@40x40s1_Cin64_Cout64` 单层 1.49 ms ×10 ≈ 15 ms ≈ 总时 85%，
+  且只有 ~8 ops。
+- osv32 block 扫描（OBW/OBH）：80×80 最好 13.6（8,2）、40×40 最好 8.4（5,2）、
+  20×20 最好 5.9（4,2）。**调参上限 ≤ +7% 且大层回退**。
+- 结论与 R18–R21 一致：`os_iyx_osv32` 是 **1 broadcast : 1 mad 的 ~16 ops 发射上限**，
+  与 block 大小无关。
+
+## D. OpenVINO 阻塞式 conv（`convolution_gpu_bfyx_f16`）移植：**未成功**
+
+- OV 实际选中的是阻塞式 kernel（lane=通道 16/块、每 lane 持 `OUTPUT_X_BLOCK_SIZE` 个连续
+  输出列、输入行 staged 复用、权重 block_read、网格 `(X_BLOCKS, feature_blocks)`）。
+- infvino 写了自包含简化版 `kernels/conv_blk.cl`：
+  - 首版（lane 各自标量读行）：**1.3 ops**（16 lane 冗余读、权重非合并）；
+  - 改权重 block_read + 输入 `sub_group_broadcast`：40×40 到 **6.6 ops**，仍**低于**
+    osv32 的 7.9，且输出 NaN（leftover/OOB 未收口）。
+- **判定**：当前工时内简化版没打赢已调优的 osv32，正确性未收口，**已回退**保留为负结果。
+  若继续：需完整实现 leftover/OOB/分组路径 + 逐层 autotune，属大工程。
+
+## E. 下一步建议（按性价比）
+
+1. **墙钟/launch 开销**：yolov8 busy 17.2 vs 墙钟 22.3 ms，~5 ms 是 launch/同步。
+   图融合（concat→conv 已试但正确性未收口）、减少 kernel 数、持久化 kernel 是主要杠杆。
+2. **conv3×3**：完整移植 OV 阻塞式 kernel + 逐层 autotune（大工程，天花板 ~16 ops）。
+3. **attention**：yolo11 的 `bmm`/`softmax`（~1.6 ms）仍是串行/低复用，值得专用化
+   （注意：本机 GPU 在反复提交时易触发 i915 GPU HANG，须遵守 `docs/benchmark_protocol.md`）。

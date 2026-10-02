@@ -123,7 +123,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
 | [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
-| [`docs/round22-status.md`](docs/round22-status.md) | **R22 现状分析**：1×1 kernel / OV conv3×3 / 融合 |
+| [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -138,6 +138,13 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > direct conv；1×1 的 N=1 层改走 split-K GEMV（+5–27×）。三模型 kernel busy
 > 1.10–1.81×、墙钟 1.08–1.57×（mobilenet 最大）。Apache-2.0 归属见
 > [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+>
+> **R23 更新**：`concat4` 改 3-D 网格（纯索引简化）+ 主机侧 kernel 缓存 →
+> yolov8n busy **19.9→17.2 ms**、yolo11n **23.0→20.1 ms**（数值精确，三模型 PASS）。
+> 与 OpenVINO 2025.2 对照，整网仍差 ~1.5–1.9×，差距集中在 conv3×3 网格饥饿
+> （`os_iyx_osv32` 已到 ~8–13 ops）；阻塞式 conv 移植未打赢 osv32（负结果）。
+> 详见 [`docs/kernel.md`](docs/kernel.md) Round 23 与
+> [`docs/round22-status.md`](docs/round22-status.md)。
 
 ## 状态
 
@@ -146,6 +153,8 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 - [x] 预处理 / NMS / detect+pose+classify 解码
 - [x] 三个目标模型端到端数值对齐 onnxruntime
 - [x] 算子级 + 整网 + 库后端三级数值检验
-- [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟）
+- [x] concat 3-D 网格 + 主机侧 kernel 缓存（R23）
+- [ ] conv3×3 阻塞式 kernel（OV 全功能移植 + 逐层 autotune）；当前 osv32 已到 ~8–13 ops
+- [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟；busy 17.2 vs 墙钟 22.3 ms）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）

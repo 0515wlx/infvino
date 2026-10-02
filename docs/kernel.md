@@ -1801,9 +1801,16 @@ OV 的优势更多来自其**全功能 JIT kernel + 逐层 autotune + 布局/融
 而非单一“阻塞”技巧。**该移植已回退，保留为负结果记录。**
 （若继续：需完整实现 leftover/OOB/分组路径并用 `kernel_check` 逐 shape 收口。）
 
-### 23.5 现状（R23 收尾）
+### 23.5 调试教训（bisect 方法）
 
-| 模型 | R22 busy | **R23 busy** | 墙钟(R23) | OV infer |
+R23 中途排查「数值 FAIL」时走了弯路：把 `kernels/ops.cl` **单独回退到 HEAD**，却仍用
+R23 的 `PlanModel`（它按 **3-D 网格**发起 `concat4`），于是 1-D 的旧 kernel 收到 3-D 的
+`gws` —— 人为制造了「kernel/host 不一致」的假 bug，并在这上面浪费了若干轮。**教训**：
+bisect 时若改动横跨「kernel 源码 + 其 host 端 launch 约定」，必须**成对回退/成对前进**，
+或用同一提交里的完整状态测试；不要把新 host 和旧 kernel 混跑。最终确认：完整一致的
+R23（3-D concat + 新 PlanModel）本身数值正确，`concat4` 是纯 copy、精确无误。
+
+### 23.6 现状（R23 收尾）| 模型 | R22 busy | **R23 busy** | 墙钟(R23) | OV infer |
 |---|---|---|---|---|
 | yolov8n-pose | ~19.9 ms | **~17.2 ms** | ~22 ms | 11.2 ms |
 | yolo11n-pose | ~23.0 ms | **~20.1 ms** | ~25 ms | 11.8 ms |

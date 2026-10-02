@@ -56,16 +56,17 @@
 > `iters` 线性变小。已修（`run()` 不再清空，改用 `clearProfile()` + warmup）。
 > 下表旧列为**按 ×iters 还原后的真实值**，与 `docs/kernel.md` Round 5 一致。
 
-| 模型 | conv+gemm GFLOPs | R6 kernel total (ms) | R6 ops/EU/cyc | **R22 kernel total (ms)** | **R22 ops/EU/cyc** | 加速 | % of 32 |
+| 模型 | conv+gemm GFLOPs | R6 kernel total (ms) | R6 ops/EU/cyc | **R23 kernel total (ms)** | **R23 ops/EU/cyc** | 加速 | % of 32 |
 |---|---|---|---|---|---|---|---|
-| yolov8n-pose | 9.178 | 26.38 | 3.34 | **17.37** | **5.09** | **1.52×** | 15.9% |
-| yolo11n-pose | 7.406 | 27.91 | 2.55 | **20.27** | **3.54** | **1.38×** | 11.1% |
-| mobilenetv3-small | 0.110 | 6.10 | 0.17 | **3.46** | **0.31** | **1.76×** | 1.0% |
+| yolov8n-pose | 9.178 | 26.38 | 3.34 | **17.2** | **5.13** | **1.53×** | 16.0% |
+| yolo11n-pose | 7.406 | 27.91 | 2.55 | **20.1** | **3.55** | **1.39×** | 11.1% |
+| mobilenetv3-small | 0.110 | 6.10 | 0.17 | **3.5** | **0.31** | **1.74×** | 1.0% |
 
-> R22 在 R18 基础上再提升（R18：yolov8 19.55 / yolo11 22.33 / mobilenet 6.33 ms）：
-> conv3×3 走 **OpenVINO os_iyx_osv32 移植**（大层 +20–80%，`kernels/conv_ov.cl`）、
-> 1×1 conv 融合 bias+act 且 N=1 走 **split-K GEMV**、GAP 改并行树归约。详见
-> `docs/kernel.md` Round 22。数值三级检验全部 PASS。
+> **R22**：conv3×3 走 OpenVINO `os_iyx_osv32` 移植（大层 +20–80%，`kernels/conv_ov.cl`）、
+> 1×1 conv 融合 bias+act 且 N=1 走 split-K GEMV、GAP 改并行树归约。
+> **R23**：`concat4` 改 3-D 网格（纯索引简化，`bef119f`）+ 主机侧 `.cl`/kernel 句柄缓存
+> （`b28a6a4`）——yolov8 19.9→**17.2**、yolo11 23.0→**20.1** ms，mobilenet 持平。
+> 数值三级检验全部 PASS。详见 `docs/kernel.md` Round 22 / 23。
 
 主要来自：把 K=3、groups=1 的 **stride-2** 层从朴素 `conv_general` 改走调优的
 `conv3x3_f16`，并把 s1 tile 改为 `TX40 TY8 TM1 CB32 CINC16`（Round 6/15）；
@@ -74,18 +75,31 @@ conv3x3 的 **WCOAL 合并权重 staging**（+5–12%，Round 18）与**自适�
 （小空间/低通道层 CB=32→16，+20–56%，Round 18）——conv3x3 分项 yolov8 15.0→12.5 ms。
 三模型数值检验仍全部 PASS。详见 `docs/kernel.md` Round 18。
 
+#### 与 OpenVINO 2025.2 的整网对照（同一 iGPU）
+
+OV per-node GPU 时间（`enable_profiling`）与端到端（含预处理）：
+
+| 模型 | OV GPU 合计 | OV infer | OV e2e | infvino busy (R23) | 差距 |
+|---|---|---|---|---|---|
+| yolov8n-pose | 9.33 ms | 11.2 ms | 13.9 ms | 17.2 ms | ~1.5× |
+| yolo11n-pose | 9.61 ms | 11.8 ms | 14.5 ms | 20.1 ms | ~1.7× |
+| mobilenetv3-small | 0.96 ms | 1.8 ms | 2.2 ms | 3.5 ms | ~1.9× |
+
+> OV 的整网差距主要在 **conv3×3**（yolov8 里 `40x40 Cin64` 单层 ~85% 时间）。
+> OV 实际选用的是**阻塞式** `convolution_gpu_bfyx_f16`（非 osv32）。infvino 的简化移植
+> 未能打赢已调优的 osv32（见 `docs/kernel.md` Round 23），因此 OV 仍作为对照基线。
+
 ### 2.2 整机墙钟（`infvino_bench`，mean，含 launch 开销）
 
 | 模型 | infer (ms) | pipeline (ms) | 说明 |
 |---|---|---|---|
-| yolov8n-pose | **22.3** | **24.1** | kernel busy ~17.4 ms，其余 ~4.9 ms 为 launch/同步 |
-| yolo11n-pose | **25.6** | **27.4** | kernel busy ~20.3 ms |
+| yolov8n-pose | **22.3** | **24.1** | kernel busy ~17.2 ms，其余 ~5.1 ms 为 launch/同步 |
+| yolo11n-pose | **25.6** | **27.4** | kernel busy ~20.1 ms |
 | mobilenetv3-small | 4.6 | 5.0 | kernel busy ~3.5 ms |
 
-> R22 墙钟（net only，含 launch 开销）：yolov8 24.1→22.3、yolo11 28.2→25.6、
-> mobilenet 7.3→4.6 ms（同会话 HEAD 基线对照）。
-> 非 profiling 模式下墙钟仍含可观 **kernel launch 开销**（yolov8：busy 17.4 vs 墙钟 22.3），
-> 这是下一步优化重点（算子融合、减少 kernel 数、批处理/持久化 kernel），见 `docs/kernel.md`。
+> R23 墙钟（net only，含 launch 开销）。非 profiling 模式下墙钟仍含可观 **kernel launch
+> 开销**（yolov8：busy 17.2 vs 墙钟 22.3），这是下一步优化重点（算子融合、减少 kernel 数、
+> 批处理/持久化 kernel），见 `docs/kernel.md`。
 
 ### 2.3 纯 GEMM 算子（`kernel_bench`，`f16`）
 
