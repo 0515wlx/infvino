@@ -51,6 +51,22 @@
 > 因此「读一次用一次」（AI≈1）的算子在这台机器上必然被 DRAM 卡死（19 GB/s）；
 > 计算要想跑满，数据必须留在 LLC（8 MB）内做复用。
 
+## 三条数据通路的 ops/EU/cyc 现实上限（R18–R21 结论）
+
+> **本机（Iris Xe 80EU / 128 GRF、7 线程 per EU / 无通用 L1）上，三条数据通路的
+> ops/EU/cyc 上限都是 ~16，只是各撞各的墙；direct conv 的 ~10.3 是当前最优。
+> ~16 不是「没优化好」，而是不换硬件能力时卷积复用的现实天花板。**
+
+| 通路 | 结构 | 上限 | 撞的墙 |
+|---|---|---|---|
+| **direct conv**（`conv3x3_f16`，生产）| lane=空间，通道在寄存器 + SLM staging | staging-free **~16.4**，整核 **~10.3** | global→SLM staging + 索引/边界/SLM 写指令 |
+| **OpenVINO 式**（`conv3x3_sg`）| lane=输出通道，输入块驻寄存器 + `sub_group_broadcast` | **~16.0** | 1 条 broadcast : 1 条 mad |
+| **Winograd F(2×2,3×3)** | 用变换把乘数减少 2.25× | **< 16** | 每 (tile, 通道) 需同时持有 16 个 m 值 → 128 GRF 放大 |
+
+- 参照：纯寄存器 FP16 FMA 的结构上限是 **27.4–29.6（86–92%）**；理论峰值 32。
+- 推导见：Round 14/18（direct 的 staging 与寄存器墙）、Round 19–20（L3 / OpenVINO 通路）、
+  Round 21（Winograd）。数据通路只有 **GRF + SLM** 两级可编程低延迟存储，是共同根因。
+
 ## Round 0 —— 历史基线（OpenVINO 2023.0.2，已移除）
 
 infvino 已不依赖 OpenVINO；下表为早期对照基线（整网 GPU，单流，net only）：
