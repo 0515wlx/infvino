@@ -528,3 +528,31 @@ FP32 峰值为 16 ops/EU/cyc（8 FMA/EU/cyc）；`0.73` = **4.6%**。Isa 反汇�
   `ulp_frac`（落在 1 ULP 内的比例）、`scale_rel`（误差/输出动态范围），避免分类
   logits 这类小量级输出被误读。
 
+### 12.5 同问题的另一个算子：depthwise（滑窗寄存器复用）
+
+`depthwise_f16` 也是「每个输出 K×K 次独立全局载入 + 一次 mad」——和 bmm 同一类
+（无复用/无流水，实测 ~0.3 ops/EU/cyc）。R29 增加 `depthwise_v`：
+一个 work-item 沿 x 算 `DW_TW` 个连续输出，输入条带 `(DW_TW-1)·DW_S + DW_K` 一
+次载入逐 tap 复用，K×K 权重一次进寄存器；累加顺序与标量版一致 → **逐位相同**。
+
+| 模型 | depthwise（标量）| **depthwise_v** | 加速 |
+|---|---:|---:|---:|
+| yolo11 | 0.776 ms | **0.562 ms** | 1.38× |
+| mobilenet | 0.440 ms | **0.391 ms** | 1.13× |
+
+调优器对 15 个签名选 `depthwise_v` 8 个（大层）、标量 7 个（小层）。
+
+### 12.6 R29 收尾（三模型端到端）
+
+`kernel_run --report --iters 5`（同会话 A/B）：
+
+| 模型 | baseline(off) | R28 | **R29** |
+|---|---:|---:|---:|
+| yolov8n-pose | 17.29 ms | 14.61 | **14.61** |
+| yolo11n-pose | 19.80 ms | 17.04 | **15.86** |
+| mobilenetv3-small | 3.08 ms | 2.83 | **2.81** |
+
+新增 op 级数值覆盖：`kernel_check.py` 增加 bmm（3 变体）、softmax（2 变体）、
+depthwise（3 变体）用例——**ALL PASS**（bmm/depthwise 变体逐位相同）。
+
+

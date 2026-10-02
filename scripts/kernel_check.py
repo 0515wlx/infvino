@@ -91,6 +91,50 @@ def gen_softmax(shape, workdir):
     return px, ref
 
 
+DEFAULT_DEPTHWISE = [
+    (64, 80, 80, 3, 1, 1, 1, "dw3x3 s1"),
+    (128, 40, 40, 3, 1, 1, 1, "dw3x3 s1"),
+    (16, 112, 112, 3, 2, 1, 0, "dw3x3 s2"),
+    (96, 14, 14, 5, 2, 2, 0, "dw5x5 s2"),
+]
+DW_VARIANTS = [
+    ("depthwise_f16", ""),
+    ("depthwise_v", "-DDW_TW=4"),
+    ("depthwise_v", "-DDW_TW=8"),
+]
+
+
+def _act(a, code):
+    if code == 1:
+        return a / (1.0 + np.exp(-a))
+    if code == 2:
+        return a * np.clip(a + 3.0, 0.0, 6.0) / 6.0
+    if code == 3:
+        return np.maximum(a, 0.0)
+    if code == 4:
+        return np.clip(a + 3.0, 0.0, 6.0) / 6.0
+    return a
+
+
+def gen_depthwise(shape, workdir):
+    C, H, W, K, S, P, act, _ = shape
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((C, H, W)).astype(np.float16)
+    w = (rng.standard_normal((C, K, K)).astype(np.float16) * 0.2).astype(np.float16)
+    b = rng.standard_normal(C).astype(np.float16)
+    tag = f"{C}x{H}x{W}x{K}x{S}x{P}x{act}"
+    px, pw, pb = (os.path.join(workdir, f"dw{tag}.{ext}") for ext in ("x", "w", "b"))
+    x.tofile(px); w.tofile(pw); b.tofile(pb)
+    Ho, Wo = (H + 2 * P - K) // S + 1, (W + 2 * P - K) // S + 1
+    xp = np.pad(x.astype(np.float32), ((0, 0), (P, P), (P, P)))
+    acc = np.zeros((C, Ho, Wo), np.float32)
+    for kh in range(K):
+        for kw in range(K):
+            acc += xp[:, kh:kh + Ho * S:S, kw:kw + Wo * S:S] * w[:, kh, kw].astype(np.float32)[:, None, None]
+    ref = _act(acc + b.astype(np.float32)[:, None, None], act).astype(np.float16)
+    return px, pw, pb, ref
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=os.getcwd())
@@ -150,6 +194,13 @@ def main() -> int:
         for kern, opts in SOFTMAX_VARIANTS:
             sm_jobs.append((shape, kern, opts, px, ref))
         print(f"[ref] softmax {shape[0]}x{shape[1]}x{shape[2]} {shape[3]}")
+
+    dw_jobs = []
+    for shape in DEFAULT_DEPTHWISE:
+        px, pw, pb, ref = gen_depthwise(shape, args.workdir)
+        for kern, opts in DW_VARIANTS:
+            dw_jobs.append((shape, kern, opts, px, pw, pb, ref))
+        print(f"[ref] depthwise {shape[0]}x{shape[1]}x{shape[2]} K{shape[3]} {shape[7]}")
 
     tiles_arg = f"--tiles {args.tiles}" if args.tiles else ""
     inner = [
@@ -222,6 +273,17 @@ def main() -> int:
             f"--outer {outer} --axdim {axdim} --inner {inn} "
             f"--input-x /work/{os.path.basename(px)} --dump /work/out_{tag}.bin "
             f"|| echo RUNFAIL softmax {tag}"
+        )
+    for shape, kern, opts, px, pw, pb, _ in dw_jobs:
+        C, H, W, K, S, P, act, _ = shape
+        tag = f"{kern}_{C}x{H}x{W}x{K}x{S}x{P}x{act}"
+        optarg = f'--opts "{opts}"' if opts else ""
+        inner.append(
+            f"timeout 30 /tmp/build/kernel_numtest --op depthwise --kernel {kern} {optarg} "
+            f"--cin {C} --h {H} --w {W} --dw-k {K} --stride {S} --pad {P} --act {act} "
+            f"--input-x /work/{os.path.basename(px)} --input-w /work/{os.path.basename(pw)} "
+            f"--input-bias /work/{os.path.basename(pb)} --dump /work/out_{tag}.bin "
+            f"|| echo RUNFAIL depthwise {tag}"
         )
     run(["docker", "run", "--rm",
          "--memory=3g", "--memory-swap=3g", "--pids-limit=256",
@@ -308,6 +370,18 @@ def main() -> int:
         ok, msg = _cmp(got, ref)
         ok_all &= ok
         print(f"  softmax {kern:16s} {outer}x{axdim}x{inn} {label:6s} {msg} -> {'PASS' if ok else 'FAIL'}")
+    for shape, kern, opts, _, _, _, ref in dw_jobs:
+        C, H, W, K, S, P, act, label = shape
+        tag = f"{kern}_{C}x{H}x{W}x{K}x{S}x{P}x{act}"
+        path = os.path.join(args.workdir, f"out_{tag}.bin")
+        if not os.path.exists(path):
+            ok_all = False
+            print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K} MISSING -> FAIL")
+            continue
+        got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
+        ok, msg = _cmp(got, ref)
+        ok_all &= ok
+        print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K}s{S} {label:10s} {msg} -> {'PASS' if ok else 'FAIL'}")
     print("\nRESULT:", "ALL PASS" if ok_all else "SOME FAILED")
     return 0 if ok_all else 1
 

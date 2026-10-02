@@ -114,3 +114,63 @@ __kernel void depthwise_f16(
   const half b = Bias ? Bias[c] : (half)0;
   Y[idx] = dw_activate((half)(acc + b));
 }
+
+// ---------------------------------------------------------------------------
+// R29: register-blocked depthwise (sliding window).  The scalar kernel above
+// issues K*K independent global loads + one mad each per output, so it is
+// latency-bound on the global loads (~0.3 ops/EU/cyc).  Here one work-item
+// computes DW_TW consecutive x outputs for one channel: the input strip
+// ((DW_TW-1)*DW_S + DW_K values) is loaded once per row and reused across taps
+// and outputs, and the K*K weights are loaded once into registers.  fp16
+// accumulation in the same (kh,kw) order => bit-identical to depthwise_f16.
+//   knobs: DW_K, DW_S, DW_P, DW_ACT, DW_TW
+#ifndef DW_TW
+#define DW_TW 4
+#endif
+#define DW_STRLEN ((DW_TW - 1) * DW_S + DW_K)
+
+__kernel void depthwise_v(
+  __global const half *restrict X,     // [C][H][W]
+  __global const half *restrict Wt,    // [C][K][K]
+  __global const half *restrict Bias,  // [C] or null
+  __global half *restrict Y,           // [C][Ho][Wo]
+  const int C, const int H, const int W, const int Ho, const int Wo) {
+  const int x0 = get_global_id(0) * DW_TW;
+  const int oy = get_global_id(1);
+  const int c  = get_global_id(2);
+  if (oy >= Ho || c >= C) return;
+
+  half w[DW_K * DW_K];
+#pragma unroll
+  for (int i = 0; i < DW_K * DW_K; ++i) w[i] = Wt[(size_t)c * DW_K * DW_K + i];
+  const __global half *xplane = X + (size_t)c * H * W;
+
+  half acc[DW_TW];
+#pragma unroll
+  for (int t = 0; t < DW_TW; ++t) acc[t] = (half)0;
+
+#pragma unroll
+  for (int kh = 0; kh < DW_K; ++kh) {
+    const int yy = oy * DW_S - DW_P + kh;
+    if (yy < 0 || yy >= H) continue;
+    const __global half *xrow = xplane + (size_t)yy * W;
+    half strip[DW_STRLEN];
+#pragma unroll
+    for (int j = 0; j < DW_STRLEN; ++j) {
+      const int xx = x0 * DW_S - DW_P + j;
+      strip[j] = (xx >= 0 && xx < W) ? xrow[xx] : (half)0;
+    }
+#pragma unroll
+    for (int t = 0; t < DW_TW; ++t)
+#pragma unroll
+      for (int kw = 0; kw < DW_K; ++kw)
+        acc[t] = mad(strip[t * DW_S + kw], w[kh * DW_K + kw], acc[t]);
+  }
+
+  const half b = Bias ? Bias[c] : (half)0;
+#pragma unroll
+  for (int t = 0; t < DW_TW; ++t) {
+    const int ox = x0 + t;
+    if (ox < Wo) Y[((size_t)c * Ho + oy) * Wo + ox] = dw_activate((half)(acc[t] + b));
+  }
+}

@@ -54,6 +54,7 @@ int main(int argc, char ** argv)
   int M = 0, N = 0, K = 0, iters = 1;
   int Cin = 0, Cout = 0, H = 0, W = 0, stride = -1, pad = -1;
   int B0 = 1, B1 = 1, outer = 0, axdim = 0, inner = 1;
+  int dwK = 3, act = 0;
   gk::Tiles tiles;
   gk::Conv3x3Cfg conv;
 
@@ -72,6 +73,8 @@ int main(int argc, char ** argv)
     else if (a == "--outer") outer = std::atoi(next().c_str());
     else if (a == "--axdim") axdim = std::atoi(next().c_str());
     else if (a == "--inner") inner = std::atoi(next().c_str());
+    else if (a == "--dw-k") dwK = std::atoi(next().c_str());
+    else if (a == "--act") act = std::atoi(next().c_str());
     else if (a == "--cin") Cin = std::atoi(next().c_str());
     else if (a == "--cout") Cout = std::atoi(next().c_str());
     else if (a == "--h") H = std::atoi(next().c_str());
@@ -386,6 +389,64 @@ int main(int argc, char ** argv)
                      dump.c_str(), outer, axdim, inner);
       }
       clReleaseMemObject(dX); clReleaseMemObject(dY); clReleaseKernel(k);
+    } else if (op == "depthwise") {
+      if (Cin <= 0 || H <= 0 || W <= 0) throw std::runtime_error("need --cin --h --w");
+      int S = stride >= 0 ? stride : 1, P = pad >= 0 ? pad : 1;
+      int Ho = (H + 2 * P - dwK) / S + 1, Wo = (W + 2 * P - dwK) / S + 1;
+      const std::string kern = knl.empty() ? "depthwise_f16" : knl;
+      char base[192];
+      std::snprintf(base, sizeof(base),
+                    "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d", dwK, S, P, act);
+      std::string o = base;
+      if (!opts.empty()) o += " " + opts;
+      o += " -cl-mad-enable -cl-fast-relaxed-math";
+      auto hX = readBin(in_x, static_cast<size_t>(Cin) * H * W);
+      auto hW = readBin(in_w, static_cast<size_t>(Cin) * dwK * dwK);
+      std::vector<uint16_t> hB;
+      if (!in_bias.empty()) hB = readBin(in_bias, static_cast<size_t>(Cin));
+      cl_kernel k = rt.buildKernel("conv_general", kern, o);
+      cl_mem dX = rt.alloc(hX.size() * 2, CL_MEM_READ_ONLY);
+      cl_mem dW = rt.alloc(hW.size() * 2, CL_MEM_READ_ONLY);
+      cl_mem dB = nullptr;
+      cl_mem dY = rt.alloc(static_cast<size_t>(Cin) * Ho * Wo * 2, CL_MEM_WRITE_ONLY);
+      rt.write(dX, hX.size() * 2, hX.data());
+      rt.write(dW, hW.size() * 2, hW.data());
+      if (!hB.empty()) {
+        dB = rt.alloc(hB.size() * 2, CL_MEM_READ_ONLY);
+        rt.write(dB, hB.size() * 2, hB.data());
+      }
+      clSetKernelArg(k, 0, sizeof(dX), &dX);
+      clSetKernelArg(k, 1, sizeof(dW), &dW);
+      clSetKernelArg(k, 2, sizeof(dB), &dB);
+      clSetKernelArg(k, 3, sizeof(dY), &dY);
+      clSetKernelArg(k, 4, sizeof(Cin), &Cin);
+      clSetKernelArg(k, 5, sizeof(H), &H);
+      clSetKernelArg(k, 6, sizeof(W), &W);
+      clSetKernelArg(k, 7, sizeof(Ho), &Ho);
+      clSetKernelArg(k, 8, sizeof(Wo), &Wo);
+      if (kern == "depthwise_v") {
+        const auto p = o.find("-DDW_TW=");
+        const int tw = p == std::string::npos
+                         ? 4
+                         : std::atoi(o.c_str() + p + std::strlen("-DDW_TW="));
+        const size_t g[3] = {static_cast<size_t>((Wo + tw - 1) / tw),
+                             static_cast<size_t>(Ho), static_cast<size_t>(Cin)};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+      } else {
+        const size_t g[1] = {static_cast<size_t>(Cin) * Ho * Wo};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+      }
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hY(static_cast<size_t>(Cin) * Ho * Wo);
+        rt.read(dY, hY.size() * 2, hY.data());
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (depthwise %dx%dx%d fp16)\n",
+                     dump.c_str(), Cin, Ho, Wo);
+      }
+      clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dY);
+      if (dB) clReleaseMemObject(dB);
+      clReleaseKernel(k);
     } else {
       throw std::runtime_error("unsupported op: " + op);
     }

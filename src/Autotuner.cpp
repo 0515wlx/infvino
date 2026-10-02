@@ -185,6 +185,23 @@ std::vector<Candidate> candidatesDepthwise(const OpSignature & sig)
   c.options = opts;
   c.config = cfg;
   out.push_back(std::move(c));
+  // R29: register-blocked sliding window (DW_TW outputs/WI, strip reused).
+  for (int tw : {2, 4, 8}) {
+    if (sig.W > 0 && tw > sig.W) continue;
+    char vo[192], vc[128];
+    std::snprintf(vo, sizeof(vo),
+                  "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d -DDW_TW=%d "
+                  "-cl-mad-enable -cl-fast-relaxed-math",
+                  sig.K, sig.stride, sig.pad, sig.act, tw);
+    std::snprintf(vc, sizeof(vc), "K=%d,S=%d,P=%d,ACT=%d,TW=%d", sig.K, sig.stride, sig.pad,
+                  sig.act, tw);
+    Candidate v;
+    v.kernel = "depthwise_v";
+    v.source = "conv_general";
+    v.options = vo;
+    v.config = vc;
+    out.push_back(std::move(v));
+  }
   return out;
 }
 

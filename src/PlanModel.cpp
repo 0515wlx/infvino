@@ -922,9 +922,13 @@ void PlanModel::run()
                       "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d "
                       "-cl-mad-enable -cl-fast-relaxed-math", K, S, P, act);
         std::string dwopts = dopts;
+        std::string dkern = "depthwise_f16";
         const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
-        if (const TuningEntry * e = tuning_.lookup(sig)) dwopts = e->options;
-        cl_kernel kd = getKernel("conv_general", "depthwise_f16", dwopts);
+        if (const TuningEntry * e = tuning_.lookup(sig)) {
+          if (!e->kernel.empty()) dkern = e->kernel;
+          dwopts = e->options;
+        }
+        cl_kernel kd = getKernel("conv_general", dkern, dwopts);
         int ho = Hout, wo = Wout;
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
         clSetKernelArg(kd, 1, sizeof(dw), &dw);
@@ -935,8 +939,16 @@ void PlanModel::run()
         clSetKernelArg(kd, 6, sizeof(W), &W);
         clSetKernelArg(kd, 7, sizeof(ho), &ho);
         clSetKernelArg(kd, 8, sizeof(wo), &wo);
-        const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
-        timed("depthwise", kd, 1, gdw, nullptr);
+        if (dkern == "depthwise_v") {
+          auto p = dwopts.find("-DDW_TW=");
+          const int tw = p == std::string::npos ? 4 : std::atoi(dwopts.c_str() + p + 8);
+          const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
+                               static_cast<size_t>(Hout), static_cast<size_t>(Cin)};
+          timed("depthwise", kd, 3, g, nullptr);
+        } else {
+          const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
+          timed("depthwise", kd, 1, gdw, nullptr);
+        }
       } else {
       clSetKernelArg(kConvG_, 0, sizeof(dx), &dx);
       clSetKernelArg(kConvG_, 1, sizeof(dw), &dw);
@@ -1720,7 +1732,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       const double flops = 2.0 * Cin * static_cast<double>(Hout) * Wout * K * K;
       const std::vector<Candidate> cands = candidatesDepthwise(sig);
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
-        cl_kernel kd = getKernel("conv_general", "depthwise_f16", c.options);
+        cl_kernel kd = getKernel("conv_general", c.kernel, c.options);
         int ho = Hout, wo = Wout;
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
         clSetKernelArg(kd, 1, sizeof(dw), &dw);
@@ -1731,6 +1743,15 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         clSetKernelArg(kd, 6, sizeof(W), &W);
         clSetKernelArg(kd, 7, sizeof(ho), &ho);
         clSetKernelArg(kd, 8, sizeof(wo), &wo);
+        if (c.kernel == "depthwise_v") {
+          auto p = c.options.find("-DDW_TW=");
+          const int tw = p == std::string::npos ? 4 : std::atoi(c.options.c_str() + p + 8);
+          const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
+                               static_cast<size_t>(Hout), static_cast<size_t>(Cin)};
+          return [this, kd, g]() {
+            return ClRuntime::enqueueND(rt_.queue(), kd, 3, g, nullptr);
+          };
+        }
         const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
         return [this, kd, gdw]() {
           return ClRuntime::enqueueND(rt_.queue(), kd, 1, gdw, nullptr);
