@@ -117,11 +117,13 @@ def main() -> int:
     ]
     for key, _ in jobs:
         inner.append(
-            f"/tmp/build/infvino_numtest --config /workspace/infvino/config/models.yaml --key {key} "
+            f"timeout 60 /tmp/build/infvino_numtest --config /workspace/infvino/config/models.yaml --key {key} "
             f"--image /work/engine_input.png --dump /work/eng_{key} "
             f"> /work/eng_log_{key}.txt 2>&1 || echo 'RUNFAIL {key}'")
+    inner.append("if dmesg 2>/dev/null | grep -q 'GPU HANG'; then "
+                 "echo '[engine_check] GPU HANG detected'; exit 3; fi")
     subprocess.run(["docker", "run", "--rm", "--memory=3g", "--memory-swap=3g",
-                    "--device=/dev/dri:/dev/dri", "--privileged",
+                    "--pids-limit=256", "--device=/dev/dri/renderD128",
                     "-v", f"{repo}:/workspace/infvino", "-w", "/workspace/infvino",
                     "-v", f"{os.path.abspath(args.workdir)}:/work",
                     args.image, "bash", "-lc", "\n".join(inner)], check=True)

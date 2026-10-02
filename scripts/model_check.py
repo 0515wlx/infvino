@@ -83,17 +83,21 @@ def main():
                     "--onnx", onnx_path, "--out-dir", plan_dir], check=True)
 
     # 3) run in container (cmake build + kernel_run)
+    # Safety (docs/benchmark_protocol.md): only the render node, no --privileged,
+    # memory + pid limits, and every GPU command wrapped in `timeout` so a wedged
+    # kernel cannot pin the host. `gpu_guard` checks dmesg for a GPU HANG and aborts.
     inner = [
         "set -e",
         "cmake -S /workspace/infvino -B /tmp/build -DCMAKE_BUILD_TYPE=Release >/tmp/cfg.log 2>&1",
         "cmake --build /tmp/build -j2 >/tmp/build.log 2>&1",
-        f"/tmp/build/kernel_run --plan /work/{args.model}/model.plan "
+        f"timeout 60 /tmp/build/kernel_run --plan /work/{args.model}/model.plan "
         f"--input /work/input.bin --output /work/out.bin --iters {args.iters} --report "
         "| tee /work/krun.log",
+        "if dmesg 2>/dev/null | grep -q 'GPU HANG'; then echo '[model_check] GPU HANG detected'; exit 3; fi",
     ]
     subprocess.run(["docker", "run", "--rm",
-                    "--memory=3g", "--memory-swap=3g",
-                    "--device=/dev/dri:/dev/dri", "--privileged",
+                    "--memory=3g", "--memory-swap=3g", "--pids-limit=256",
+                    "--device=/dev/dri/renderD128",
                     "-v", f"{args.repo}:/workspace/infvino", "-w", "/workspace/infvino",
                     "-v", f"{os.path.abspath(wd)}:/work", args.image, "bash", "-lc",
                     "\n".join(inner)], check=True, capture_output=False)

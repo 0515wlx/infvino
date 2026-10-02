@@ -95,10 +95,11 @@ def main() -> int:
         "set -e",
         "cmake -S /workspace/infvino -B /tmp/build -DCMAKE_BUILD_TYPE=Release >/tmp/cfg.log 2>&1",
         "cmake --build /tmp/build -j2 >/tmp/build.log 2>&1",
+        "gpu_hang=0",
     ]
     for M, N, K, pa, pb, _, _ in gemm_jobs:
         inner.append(
-            f"/tmp/build/kernel_numtest --op gemm --m {M} --n {N} --k {K} {tiles_arg} "
+            f"timeout 30 /tmp/build/kernel_numtest --op gemm --m {M} --n {N} --k {K} {tiles_arg} "
             f"--input-a /work/{os.path.basename(pa)} --input-b /work/{os.path.basename(pb)} "
             f"--dump /work/out_{M}x{N}x{K}.bin || echo RUNFAIL gemm {M}x{N}x{K}"
         )
@@ -107,7 +108,7 @@ def main() -> int:
         tag = f"{Cin}x{Cout}x{H}x{W}s{s}"
         cfg_arg = f"--conv {cfg}" if cfg else (f"--conv {args.conv}" if args.conv else "")
         inner.append(
-            f"/tmp/build/kernel_numtest --op conv3x3 --cin {Cin} --cout {Cout} --h {H} --w {W} "
+            f"timeout 30 /tmp/build/kernel_numtest --op conv3x3 --cin {Cin} --cout {Cout} --h {H} --w {W} "
             f"--stride {s} --pad {p} {cfg_arg} "
             f"--input-x /work/{os.path.basename(px)} --input-w /work/{os.path.basename(pw)} "
             f"--input-bias /work/{os.path.basename(pb)} --dump /work/out_conv_{tag}.bin "
@@ -117,7 +118,7 @@ def main() -> int:
         Cin, Cout, H, W, _ = shape
         tag = f"{Cin}x{Cout}x{H}x{W}"
         inner.append(
-            f"/tmp/build/kernel_numtest --op conv1x1 --cin {Cin} --cout {Cout} --h {H} --w {W} "
+            f"timeout 30 /tmp/build/kernel_numtest --op conv1x1 --cin {Cin} --cout {Cout} --h {H} --w {W} "
             f"--input-x /work/x1x1_{tag}.bin --input-w /work/w1x1_{tag}.bin "
             f"--dump /work/out_c1x1_{tag}.bin || echo RUNFAIL conv1x1 {tag}"
         )
@@ -125,7 +126,7 @@ def main() -> int:
         Cin, Cout, H, W, _ = shape
         tag = f"{Cin}x{Cout}x{H}x{W}"
         inner.append(
-            f"/tmp/build/kernel_numtest --op conv1x1g --cin {Cin} --cout {Cout} "
+            f"timeout 30 /tmp/build/kernel_numtest --op conv1x1g --cin {Cin} --cout {Cout} "
             f"--input-x /work/x1x1_{tag}.bin --input-w /work/w1x1_{tag}.bin "
             f"--dump /work/out_gemv_{tag}.bin || echo RUNFAIL conv1x1g {tag}"
         )
@@ -133,15 +134,17 @@ def main() -> int:
         Cin, Cout, H, W, s, p, label = shape[:7]
         tag = f"{Cin}x{Cout}x{H}x{W}s{s}"
         inner.append(
-            f"/tmp/build/kernel_numtest --op conv3x3 --ov --cin {Cin} --cout {Cout} --h {H} --w {W} "
+            f"timeout 30 /tmp/build/kernel_numtest --op conv3x3 --ov --cin {Cin} --cout {Cout} --h {H} --w {W} "
             f"--stride {s} --pad {p} "
             f"--input-x /work/{os.path.basename(px)} --input-w /work/{os.path.basename(pw)} "
             f"--input-bias /work/{os.path.basename(pb)} --dump /work/out_convov_{tag}.bin "
             f"|| echo RUNFAIL conv3x3ov {tag}"
         )
+    inner.append("if dmesg 2>/dev/null | grep -q 'GPU HANG'; then "
+                 "echo '[kernel_check] GPU HANG detected'; exit 3; fi")
     run(["docker", "run", "--rm",
-         "--memory=3g", "--memory-swap=3g",
-         "--device=/dev/dri:/dev/dri", "--privileged",
+         "--memory=3g", "--memory-swap=3g", "--pids-limit=256",
+         "--device=/dev/dri/renderD128",
          "-v", f"{args.repo}:/workspace/infvino", "-w", "/workspace/infvino",
          "-v", f"{os.path.abspath(args.workdir)}:/work",
          args.image, "bash", "-lc", "\n".join(inner)])
