@@ -131,6 +131,44 @@ Route A 已把 `concat→conv1x1` 折进 gemm 的 B-staging。推广：让访存
 
 ---
 
+## 5.1 实测结果（R-P0，已落地）
+
+同会话 A/B（base = R30c HEAD，new = 本改动）：
+
+| 模型 | busy base→new | wall base→new（net only） | 分配 base→new | 复用率 |
+|---|---|---|---|---|
+| yolov8n-pose | 13.53 → **13.07**（−3.4%）| 17.58 → **16.66**（**−5.2%**）| 67.7 → 26.1 MB | 62% |
+| yolo11n-pose | 14.59 → **13.87**（−4.9%）| 19.04 → **17.95**（**−5.8%**）| 76.8 → 28.1 MB | 63% |
+| mobilenetv3-small | 2.84 → **2.72**（−4.3%）| — | 4.3 → 0.7 MB | 83% |
+
+数值：三模型 `model_check` PASS，误差与 R30c 基线**逐位一致**
+（y8 `5.278e-4/8.874e-3`、y11 `8.945e-4/1.773e-2`、mb `1.306e-2/1.086e-2`）。
+
+### 新发现 1（重要）：内存池对**墙钟**的收益大于 **GPU busy**
+
+wall 降幅（5.2–5.8%）明显大于 busy 降幅（3.4–4.9%）。说明墙钟里那段
+「busy 之外」的开销**并非纯 per-dispatch launch 固定成本**，其中一部分随
+**常驻 `cl_mem` 对象数量**增长（驱动侧的驻留/绑定/页表开销）。
+→ 对 P2「减少 launch 开销」是个修正：**先把 buffer 数降下来**本身就是降 wall 的杠杆，
+不一定非要融合 kernel。
+
+### 新发现 2：首版数值 FAIL，根因是 reshape/flatten 视图的生存期
+
+第一版只按节点读写算 `[birth, death]`，`mean_rel=0.75` FAIL。**deciding 根因**：
+`run()` 里 `reshape/flatten` 把 `out.mem = in.mem`（零拷贝视图），视图与其源
+共享存储，但生存期分析没合并 → 源 buffer 在视图仍被读取时被复用。
+修法：并查集合并视图链，取区间并集。修正后逐位一致。
+→ **任何 alias/复用机制都必须把「视图」当一等公民处理**（这正是 R30 §7.7 
+多消费者 alias 失败的同源教训）。
+
+### 仍未吃满（62% vs 理论 87%）
+
+差距来自：(a) 视图并集延长了部分区间；(b) 静态「整块复用」无法把大 buffer 的
+空闲区切给小张量（需要 **byte-offset sub-allocation**，即 OV 的 padded pool）。
+后者是 P0 的下一步候选（收益递减，见下方结论）。
+
+---
+
 ## 6. 与后续阶段的关系
 
 - **P1 布局**：memory pool 是 blocked 布局传播的前提（reorder 的中间 buffer 也要复用）。
@@ -151,3 +189,13 @@ python3 scripts/model_check.py --model yolov8n-pose --repo $PWD --image infvino-
 # 整网 busy A/B
 ./build-ct/kernel_run --plan models/yolov8n-pose/model.plan --report --iters 5
 ```
+
+### 诊断开关（仅调试用）
+
+| 环境变量 | 作用 |
+|---|---|
+| `INFVINO_NO_POOL=1` | 关闭池化，退回「每 tensor 一块 buffer」（对照用）|
+| `INFVINO_POOL_LIMIT=k` | 只对**前 k 个**（声明序）张量池化，用于二分定位复用 bug |
+
+`PlanModel::allocateActivations()` 在分配后会跑一次 `verify()`：若发现有共享同一
+buffer 的两张量生存期重叠，会打印 `[pool][BUG]` —— 这是复用正确性的廉价守卫。
