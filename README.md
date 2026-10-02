@@ -34,9 +34,10 @@ include/infvino/
 └── InferenceEngine.hpp                        # 门面 + Session
 src/                                           # 对应实现 + tools/
 kernels/*.cl                                   # 自研 OpenCL kernel 源码
-scripts/                                       # 模型导出 / 计划生成 / 数值检验
+scripts/                                       # 模型导出 / 计划生成 / 数值检验 / 自动调优
 config/models.yaml                             # 模型注册表
-docs/                                          # 架构、基准、kernel 优化日志
+config/tuning.json                             # 自动调优缓存（按设备/op/shape）
+docs/                                          # 架构、基准、kernel 优化日志、自动调优
 ```
 
 ## 依赖
@@ -118,6 +119,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | 文档 | 内容 |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | 分层设计、API、执行计划、扩展点 |
+| [`docs/autotuning.md`](docs/autotuning.md) | **自动调优体系（含 JIT 设计）**：TuningCache / 候选枚举 / 中间标准 expected_ops |
 | [`docs/xe-lp-isa.md`](docs/xe-lp-isa.md) | **Xe-LP(Gen12) ISA 逆向**：cache 层级与 EU 寄存器全貌 |
 | [`docs/kernel.md`](docs/kernel.md) | 自研 kernel 优化日志与 ops/EU/cyc |
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
@@ -145,6 +147,13 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > （`os_iyx_osv32` 已到 ~8–13 ops）；阻塞式 conv 移植未打赢 osv32（负结果）。
 > 详见 [`docs/kernel.md`](docs/kernel.md) Round 23 与
 > [`docs/round22-status.md`](docs/round22-status.md)。
+>
+> **自动调优（P0）**：引入分层自动调优体系（[`docs/autotuning.md`](docs/autotuning.md)）：
+> `OpSignature` + `TuningCache`（按设备/op/shape）+ 候选枚举 + **中间标准 `expected_ops`**。
+> 不改任何 kernel 源码，仅靠自动选择配置，yolov8n conv3×3 分项 **10.98→9.71 ms（−11.6%）**、
+> 整网 busy **17.35→16.07 ms（−7.4%）**，输出**逐位不变**；中间标准自动定位出
+> 「离物理极限最远」的层（如 `320×320 s2 Cin3 Cout16` ratio 0.17）。
+> 调优表见 [`config/tuning.json`](config/tuning.json)。
 
 ## 状态
 
@@ -154,6 +163,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 - [x] 三个目标模型端到端数值对齐 onnxruntime
 - [x] 算子级 + 整网 + 库后端三级数值检验
 - [x] concat 3-D 网格 + 主机侧 kernel 缓存（R23）
+- [x] 分层自动调优体系（P0）：TuningCache + 候选枚举 + 中间标准 expected_ops + `kernel_autotune`
 - [ ] conv3×3 阻塞式 kernel（OV 全功能移植 + 逐层 autotune）；当前 osv32 已到 ~8–13 ops
 - [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟；busy 17.2 vs 墙钟 22.3 ms）
 - [ ] seg / obb 解码；多 Session 并行缓冲

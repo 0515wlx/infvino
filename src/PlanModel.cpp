@@ -6,12 +6,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
 #include "infvino/Half.hpp"
 #include "infvino/Tiles.hpp"
+#include "infvino/Autotuner.hpp"
 
 namespace gk
 {
@@ -53,6 +55,8 @@ PlanModel::PlanModel(
 {
   parse();
   buildKernels();
+  tuning_ = TuningCache::loadDefault();
+  tuning_.setDeviceId(TuningCache::deviceKey(rt_.info()));
 }
 
 PlanModel::~PlanModel()
@@ -254,6 +258,22 @@ cl_kernel PlanModel::getKernel(
   return k;
 }
 
+namespace
+{
+// kernel 函数名 → .cl 源文件名。
+std::string sourceOfKernel(const std::string & kernel)
+{
+  if (kernel == "conv3x3_ov") return "conv_ov";
+  if (kernel == "conv3x3_f16" || kernel == "conv3x3_rt" || kernel == "conv3x3_db") return "conv";
+  if (kernel == "conv3x3_sg") return "conv_sg";
+  if (kernel == "conv3x3_osv") return "conv_osv";
+  if (kernel == "gemm_f16") return "gemm";
+  if (kernel == "conv1x1_gemv_f16" || kernel == "conv1x1_f16") return "conv1x1";
+  if (kernel == "depthwise_f16" || kernel == "conv_general") return "conv_general";
+  return "ops";
+}
+}  // namespace
+
 void PlanModel::run()
 {
   const auto t0 = std::chrono::steady_clock::now();
@@ -320,7 +340,10 @@ void PlanModel::run()
         cfg.ACT = act;
         cfg.RES = dres ? 1 : 0;
         cfg.SG  = 16;
-        cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", cfg.options());
+        std::string gopts = cfg.options();
+        const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+        if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+        cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", gopts);
         clSetKernelArg(kg, 0, sizeof(dw), &dw);
         clSetKernelArg(kg, 1, sizeof(dx), &dx);
         clSetKernelArg(kg, 2, sizeof(db), &db);
@@ -347,7 +370,20 @@ void PlanModel::run()
         if (Cin < 32) t.SG = 0;
         t.EPI = 1;
         t.ACT = act;
-        cl_kernel kg = rt_.buildKernel("gemm", "gemm_f16", t.options());
+        std::string gopts = t.options();
+        const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+        if (const TuningEntry * e = tuning_.lookup(sig)) {
+          gopts = e->options;
+          auto optInt = [&](const char * k, int def) {
+            const auto p = gopts.find(k);
+            return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
+          };
+          t.BM = optInt("-DBM=", t.BM);
+          t.BN = optInt("-DBN=", t.BN);
+          t.TM = optInt("-DTM=", t.TM);
+          t.TN = optInt("-DTN=", t.TN);
+        }
+        cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
         clSetKernelArg(kg, 0, sizeof(dw), &dw);
         clSetKernelArg(kg, 1, sizeof(dx), &dx);
         clSetKernelArg(kg, 2, sizeof(dy), &dy);
@@ -383,7 +419,10 @@ void PlanModel::run()
         std::snprintf(dopts, sizeof(dopts),
                       "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d "
                       "-cl-mad-enable -cl-fast-relaxed-math", K, S, P, act);
-        cl_kernel kd = getKernel("conv_general", "depthwise_f16", dopts);
+        std::string dwopts = dopts;
+        const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
+        if (const TuningEntry * e = tuning_.lookup(sig)) dwopts = e->options;
+        cl_kernel kd = getKernel("conv_general", "depthwise_f16", dwopts);
         int ho = Hout, wo = Wout;
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
         clSetKernelArg(kd, 1, sizeof(dw), &dw);
@@ -431,13 +470,86 @@ void PlanModel::run()
       int Cout = static_cast<int>(od[od.size() >= 3 ? od.size() - 3 : 0]);
       cl_mem dx = in(0).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? in(3).mem : nullptr;
 
-      // Round 22: OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl) is the default
-      // 3x3 groups=1 path. Measured faster than the native direct conv on every
-      // model shape (e.g. 64->64@80 13.6 vs 10.3 ops/EU/cyc; s2 10.7 vs 7.1),
-      // because lane=channel + block-read weights removes the SLM staging cost.
-      // Set `ov=0` on the node to fall back to the native conv3x3_f16.
-      if (attrInt(n, "ov", 1))
+      // 自动调优：按签名查表。命中 → 用缓存里的 kernel/options；未命中 → 内置启发式。
+      // 数值与 kernel 语义不变，只改「选哪个 kernel/config」。
+      const OpSignature tsig =
+        OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
+      const TuningEntry * te = tuning_.lookup(tsig);
+
+      if (te && te->kernel == "conv3x3_f16")
+      {
+        // 调优命中的 native conv3x3_f16：config 串回放为 Conv3x3Cfg 选项（options 已存）。
+        cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, te->options);
+        cl_mem dw = in(1).mem;
+        // 从 options 回放 launch 几何（tuner 存的 options 就是 kernel 的编译宏）。
+        auto optInt = [&](const char * k, int def) {
+          const auto p = te->options.find(k);
+          return p == std::string::npos ? def : std::atoi(te->options.c_str() + p + std::strlen(k));
+        };
+        Conv3x3Cfg cfg;
+        cfg.TX = optInt("-DTX=", (Wout >= 40) ? 40 : (Wout >= 20 ? 20 : 16));
+        cfg.TY = optInt("-DTY=", 8);
+        cfg.TM = optInt("-DTM=", 1);
+        cfg.CB = optInt("-DCB=", 32);
+        cfg.STRIDE = stride; cfg.PAD = pad; cfg.ACT = act; cfg.SG = 16; cfg.WC = 1;
+        clSetKernelArg(kk, 0, sizeof(dx), &dx);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dy), &dy);
+        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 5, sizeof(H), &H);
+        clSetKernelArg(kk, 6, sizeof(W), &W);
+        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        const size_t lws[3] = {
+          static_cast<size_t>(cfg.TX / cfg.TM), static_cast<size_t>(cfg.TY), 1};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + cfg.TX - 1) / cfg.TX) * lws[0],
+          static_cast<size_t>((Hout + cfg.TY - 1) / cfg.TY) * lws[1],
+          static_cast<size_t>((Cout + cfg.CB - 1) / cfg.CB)};
+        timed("conv3x3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout) + "(tuned)",
+              kk, 3, gws, lws);
+      }
+      else if (te && te->kernel == "conv3x3_ov")
+      {
+        // 调优命中的 OV osv32：options 里已含 OBW/OBH/STRIDE/PAD/ACT/RES/SG。
+        // 从 options 解析 OBW/OBH 以重建 grid（避免再解析 config 串）。
+        int obw = 8, obh = 2;
+        {
+          auto p = te->options.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(te->options.c_str() + p + 6);
+          p = te->options.find("-DOBH=");
+          if (p != std::string::npos) obh = std::atoi(te->options.c_str() + p + 6);
+        }
+        cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, te->options);
+        cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
+        clSetKernelArg(kk, 0, sizeof(dx), &dx);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dres), &dres);
+        clSetKernelArg(kk, 4, sizeof(dy), &dy);
+        clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 6, sizeof(H), &H);
+        clSetKernelArg(kk, 7, sizeof(W), &W);
+        clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+        const size_t lws[3] = {1, 1, 16};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + obw - 1) / obw),
+          static_cast<size_t>((Hout + obh - 1) / obh),
+          static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+        timed("conv3x3ov@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout) + "(tuned)",
+              kk, 3, gws, lws);
+      }
+      else if (attrInt(n, "ov", 1))
       {
         int obw = (stride == 2) ? 5 : 8;
         int obh = (stride == 2) ? 4 : 2;
@@ -541,7 +653,21 @@ void PlanModel::run()
         t.DBUF = 0;
       }
       if (K < 32) t.SG = 0;
-      cl_kernel kg = getKernel("gemm", "gemm_f16", t.options());
+      std::string gopts = t.options();
+      // 自动调优：命中则用缓存的 tile（options 已含全部编译宏）。
+      const OpSignature gsig = OpSignature::gemm(M, N, K, 0);
+      if (const TuningEntry * ge = tuning_.lookup(gsig)) {
+        gopts = ge->options;
+        auto optInt = [&](const char * k, int def) {
+          const auto p = gopts.find(k);
+          return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
+        };
+        t.BM = optInt("-DBM=", t.BM);
+        t.BN = optInt("-DBN=", t.BN);
+        t.TM = optInt("-DTM=", t.TM);
+        t.TN = optInt("-DTN=", t.TN);
+      }
+      cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
       clSetKernelArg(kg, 0, sizeof(da), &da);
       clSetKernelArg(kg, 1, sizeof(db), &db);
       clSetKernelArg(kg, 2, sizeof(dc), &dc);
@@ -780,6 +906,348 @@ void PlanModel::readOutput(size_t i, void * fp16_host)
 {
   const Tensor & t = T_.at(outputs_.at(i));
   rt_.read(t.mem, static_cast<size_t>(t.numel()) * 2, fp16_host);
+}
+
+// ---------------------------------------------------------------------------
+// 离线自动调优
+// ---------------------------------------------------------------------------
+
+namespace
+{
+bool opInList(const std::vector<std::string> & ops, const std::string & op)
+{
+  if (ops.empty()) return true;
+  return std::find(ops.begin(), ops.end(), op) != ops.end();
+}
+}  // namespace
+
+std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string> & ops) const
+{
+  std::vector<std::string> out;
+  std::map<std::string, int> seen;
+  auto add = [&](const OpSignature & s) {
+    const std::string k = s.str();
+    if (!seen.count(k)) { seen[k] = 1; out.push_back(k); }
+  };
+  auto want = [&](const std::string & op) {
+    return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
+  };
+  for (const auto & n : nodes_)
+  {
+    if (n.op == "conv3x3" && want("conv3x3")) {
+      const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1), act = attrInt(n, "act", 0);
+      const auto & id = T_.at(n.ins[0]).dims;
+      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+      const int Cin = (int)id[base];
+      const auto & od = T_.at(n.outs[0]).dims;
+      const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
+      add(OpSignature::conv3x3(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), stride, pad, Cin, Cout, act));
+    } else if (n.op == "gemm" && want("gemm")) {
+      const auto & ad = T_.at(n.ins[0]).dims;
+      const int M = (int)ad[0], K = (int)ad[1];
+      const int N = (int)(T_.at(n.ins[1]).numel() / K);
+      add(OpSignature::gemm(M, N, K, 0));
+    } else if (n.op == "conv1x1" && want("conv1x1")) {
+      const int act = attrInt(n, "act", 0);
+      const auto & wd = T_.at(n.ins[0]).dims;
+      const int Cout = (int)wd[0], Cin = (int)wd[1];
+      const int N = Cin > 0 ? (int)(T_.at(n.ins[1]).numel() / Cin) : 0;
+      const bool res = n.ins.size() > 3 && n.ins[3] != "-";
+      add(OpSignature::conv1x1(Cout, N, Cin, act, res ? 1 : 0));
+    } else if (n.op == "conv_general" && want("depthwise")) {
+      const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
+                G = attrInt(n, "G", 1), act = attrInt(n, "act", 0);
+      const auto & id = T_.at(n.ins[0]).dims;
+      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+      const int Cin = (int)id[base];
+      const auto & od = T_.at(n.outs[0]).dims;
+      const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
+      if (G == Cin && (K == 3 || K == 5) && Cin == Cout)
+        add(OpSignature::depthwise(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), S, P, Cin, K, act));
+    }
+  }
+  return out;
+}
+
+std::map<std::string, TuningEntry> PlanModel::autotune(
+  const std::vector<std::string> & ops, const std::string & onlySubstr, int limit, int iters,
+  bool merge, bool verbose)
+{
+  std::map<std::string, TuningEntry> done;
+  int n_tuned = 0;
+  std::map<std::string, int> sig_seen;  // 同一签名只调一次（plan 里大量层共享签名）
+  // 返回 true 表示该签名还未调过（并登记）；false 表示跳过。
+  // 已在本进程调过、或缓存里已有 source=="tuned" 的条目 → 跳过（让分批调用自然推进）。
+  auto shouldTune = [&](const OpSignature & sig) {
+    const std::string k = sig.str();
+    if (sig_seen.count(k)) return false;
+    sig_seen[k] = 1;
+    if (const TuningEntry * e = tuning_.lookup(sig))
+      if (e->source == "tuned") return false;
+    return true;
+  };
+
+  for (const auto & n : nodes_)
+  {
+    if (limit > 0 && n_tuned >= limit) break;
+
+    // 每个可调优 op 一条分支；签名/候选/几何与 run() 保持一致。
+    if (n.op == "conv3x3" && opInList(ops, "conv3x3"))
+    {
+      const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1),
+                act = attrInt(n, "act", 0);
+      const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
+      const auto & id = ref(n.ins[0]).dims;
+      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+      const int Cin = static_cast<int>(id[base]), H = static_cast<int>(id[base + 1]),
+                W = static_cast<int>(id[base + 2]);
+      const auto & od = ref(n.outs[0]).dims;
+      const int Cout = static_cast<int>(od[od.size() >= 3 ? od.size() - 3 : 0]);
+      cl_mem dx = ref(n.ins[0]).mem, dy = ref(n.outs[0]).mem;
+      cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? ref(n.ins[3]).mem : nullptr;
+      const std::string tag = "conv3x3" + std::to_string(Wout) + "x" + std::to_string(Hout);
+      if (!onlySubstr.empty() && tag.find(onlySubstr) == std::string::npos) continue;
+
+      const OpSignature sig = OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
+      if (!shouldTune(sig)) continue;
+      const double flops = 2.0 * Cout * static_cast<double>(Hout) * Wout * Cin * 9.0;
+      const std::vector<Candidate> cands = candidatesConv3x3(sig);
+
+      auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        if (c.kernel == "conv3x3_ov") {
+          cl_kernel kk = getKernel("conv_ov", "conv3x3_ov", c.options);
+          cl_mem dw = ovWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
+          int obw = 8, obh = 2;
+          auto p = c.options.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(c.options.c_str() + p + 6);
+          p = c.options.find("-DOBH=");
+          if (p != std::string::npos) obh = std::atoi(c.options.c_str() + p + 6);
+          clSetKernelArg(kk, 0, sizeof(dx), &dx);
+          clSetKernelArg(kk, 1, sizeof(dw), &dw);
+          clSetKernelArg(kk, 2, sizeof(db), &db);
+          clSetKernelArg(kk, 3, sizeof(dres), &dres);
+          clSetKernelArg(kk, 4, sizeof(dy), &dy);
+          clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
+          clSetKernelArg(kk, 6, sizeof(H), &H);
+          clSetKernelArg(kk, 7, sizeof(W), &W);
+          clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
+          clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
+          clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+          const size_t lws[3] = {1, 1, 16};
+          const size_t gws[3] = {
+            static_cast<size_t>((Wout + obw - 1) / obw),
+            static_cast<size_t>((Hout + obh - 1) / obh),
+            static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+          return [this, kk, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
+          };
+        }
+        // native
+        cl_kernel kk = getKernel("conv", c.kernel, c.options);
+        cl_mem dw = ref(n.ins[1]).mem;
+        auto optInt = [&](const char * k, int def) {
+          const auto p = c.options.find(k);
+          return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
+        };
+        const int TX = optInt("-DTX=", 40), TY = optInt("-DTY=", 8), TM = optInt("-DTM=", 1),
+                  CB = optInt("-DCB=", 32);
+        clSetKernelArg(kk, 0, sizeof(dx), &dx);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dy), &dy);
+        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 5, sizeof(H), &H);
+        clSetKernelArg(kk, 6, sizeof(W), &W);
+        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        const size_t lws[3] = {
+          static_cast<size_t>(TX / TM), static_cast<size_t>(TY), 1};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + TX - 1) / TX) * lws[0],
+          static_cast<size_t>((Hout + TY - 1) / TY) * lws[1],
+          static_cast<size_t>((Cout + CB - 1) / CB)};
+        return [this, kk, gws, lws]() {
+          return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
+        };
+      };
+
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      if (!e.kernel.empty()) {
+        done[sig.str()] = e;
+        ++n_tuned;
+        if (merge) tuning_.put(sig, e);
+        if (verbose)
+          std::printf("  [tune] %-40s best=%-14s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f (%s)\n",
+                      sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio,
+                      e.config.c_str());
+      }
+      continue;
+    }
+
+    if (n.op == "gemm" && opInList(ops, "gemm"))
+    {
+      const int M = static_cast<int>(ref(n.ins[0]).dims[0]);
+      const int K = static_cast<int>(ref(n.ins[0]).dims[1]);
+      const int N = static_cast<int>(ref(n.ins[1]).numel() / K);
+      cl_mem da = ref(n.ins[0]).mem, db = ref(n.ins[1]).mem, dc = ref(n.outs[0]).mem;
+      const OpSignature sig = OpSignature::gemm(M, N, K, 0);
+      if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
+      if (!shouldTune(sig)) continue;
+      const double flops = 2.0 * M * N * static_cast<double>(K);
+      const std::vector<Candidate> cands = candidatesGemm(sig);
+      auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
+        auto optInt = [&](const char * k, int def) {
+          const auto p = c.options.find(k);
+          return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
+        };
+        const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
+                  TN = optInt("-DTN=", 4);
+        clSetKernelArg(kg, 0, sizeof(da), &da);
+        clSetKernelArg(kg, 1, sizeof(db), &db);
+        clSetKernelArg(kg, 2, sizeof(dc), &dc);
+        clSetKernelArg(kg, 3, sizeof(M), &M);
+        clSetKernelArg(kg, 4, sizeof(N), &N);
+        clSetKernelArg(kg, 5, sizeof(K), &K);
+        const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
+        const size_t gws[2] = {
+          static_cast<size_t>((N + BN - 1) / BN) * lws[0],
+          static_cast<size_t>((M + BM - 1) / BM) * lws[1]};
+        return [this, kg, gws, lws]() {
+          return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
+        };
+      };
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      if (!e.kernel.empty()) {
+        done[sig.str()] = e;
+        ++n_tuned;
+        if (merge) tuning_.put(sig, e);
+        if (verbose)
+          std::printf("  [tune] %-40s best=%-14s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f\n",
+                      sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio);
+      }
+      continue;
+    }
+
+    if (n.op == "conv1x1" && opInList(ops, "conv1x1"))
+    {
+      const int act = attrInt(n, "act", 0);
+      auto & w = ref(n.ins[0]);
+      const int Cout = static_cast<int>(w.dims[0]);
+      const int Cin  = static_cast<int>(w.dims[1]);
+      const int64_t xnumel = ref(n.ins[1]).numel();
+      const int N = (Cin > 0) ? static_cast<int>(xnumel / Cin) : 0;
+      cl_mem dw = w.mem, dx = ref(n.ins[1]).mem, dy = ref(n.outs[0]).mem;
+      cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? ref(n.ins[3]).mem : nullptr;
+      const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+      if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
+      if (!shouldTune(sig)) continue;
+      const double flops = 2.0 * Cout * static_cast<double>(N) * Cin;
+      const std::vector<Candidate> cands = candidatesConv1x1(sig);
+      auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        if (N == 1) {
+          cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", c.options);
+          clSetKernelArg(kg, 0, sizeof(dw), &dw);
+          clSetKernelArg(kg, 1, sizeof(dx), &dx);
+          clSetKernelArg(kg, 2, sizeof(db), &db);
+          clSetKernelArg(kg, 3, sizeof(dres), &dres);
+          clSetKernelArg(kg, 4, sizeof(dy), &dy);
+          clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+          clSetKernelArg(kg, 6, sizeof(Cout), &Cout);
+          const size_t lws[1] = {16};
+          const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+          return [this, kg, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kg, 1, gws, lws);
+          };
+        }
+        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
+        auto optInt = [&](const char * k, int def) {
+          const auto p = c.options.find(k);
+          return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
+        };
+        const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
+                  TN = optInt("-DTN=", 4);
+        clSetKernelArg(kg, 0, sizeof(dw), &dw);
+        clSetKernelArg(kg, 1, sizeof(dx), &dx);
+        clSetKernelArg(kg, 2, sizeof(dy), &dy);
+        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
+        clSetKernelArg(kg, 4, sizeof(N), &N);
+        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kg, 6, sizeof(db), &db);
+        clSetKernelArg(kg, 7, sizeof(dres), &dres);
+        const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
+        const size_t gws[2] = {
+          static_cast<size_t>((N + BN - 1) / BN) * lws[0],
+          static_cast<size_t>((Cout + BM - 1) / BM) * lws[1]};
+        return [this, kg, gws, lws]() {
+          return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
+        };
+      };
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      if (!e.kernel.empty()) {
+        done[sig.str()] = e;
+        ++n_tuned;
+        if (merge) tuning_.put(sig, e);
+        if (verbose)
+          std::printf("  [tune] %-40s best=%-16s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f\n",
+                      sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio);
+      }
+      continue;
+    }
+
+    if (n.op == "conv_general" && opInList(ops, "depthwise"))
+    {
+      const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
+                G = attrInt(n, "G", 1), act = attrInt(n, "act", 0);
+      const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
+      const auto & id = ref(n.ins[0]).dims;
+      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+      const int Cin = static_cast<int>(id[base]), H = static_cast<int>(id[base + 1]),
+                W = static_cast<int>(id[base + 2]);
+      const auto & od = ref(n.outs[0]).dims;
+      const int Cout = static_cast<int>(od[od.size() >= 3 ? od.size() - 3 : 0]);
+      if (!(G == Cin && (K == 3 || K == 5) && Cin == Cout)) continue;
+      cl_mem dx = ref(n.ins[0]).mem, dw = ref(n.ins[1]).mem, dy = ref(n.outs[0]).mem;
+      cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
+      const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
+      if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
+      if (!shouldTune(sig)) continue;
+      const double flops = 2.0 * Cin * static_cast<double>(Hout) * Wout * K * K;
+      const std::vector<Candidate> cands = candidatesDepthwise(sig);
+      auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        cl_kernel kd = getKernel("conv_general", "depthwise_f16", c.options);
+        int ho = Hout, wo = Wout;
+        clSetKernelArg(kd, 0, sizeof(dx), &dx);
+        clSetKernelArg(kd, 1, sizeof(dw), &dw);
+        clSetKernelArg(kd, 2, sizeof(db), &db);
+        clSetKernelArg(kd, 3, sizeof(dy), &dy);
+        clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kd, 5, sizeof(H), &H);
+        clSetKernelArg(kd, 6, sizeof(W), &W);
+        clSetKernelArg(kd, 7, sizeof(ho), &ho);
+        clSetKernelArg(kd, 8, sizeof(wo), &wo);
+        const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
+        return [this, kd, gdw]() {
+          return ClRuntime::enqueueND(rt_.queue(), kd, 1, gdw, nullptr);
+        };
+      };
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      if (!e.kernel.empty()) {
+        done[sig.str()] = e;
+        ++n_tuned;
+        if (merge) tuning_.put(sig, e);
+        if (verbose)
+          std::printf("  [tune] %-40s best=%-16s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f\n",
+                      sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio);
+      }
+      continue;
+    }
+  }
+
+  return done;
 }
 
 }  // namespace gk

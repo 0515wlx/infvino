@@ -41,6 +41,8 @@ add_library(infvino SHARED
   src/Nms.cpp
   src/Decoders.cpp
   src/ClRuntime.cpp
+  src/Tuning.cpp
+  src/Autotuner.cpp
   src/PlanModel.cpp
   src/ClBackend.cpp
   src/InferenceEngine.cpp
@@ -75,7 +77,16 @@ target_link_libraries(kernel_bench PRIVATE infvino)
 add_executable(kernel_numtest src/tools/kernel_numtest.cpp)
 target_link_libraries(kernel_numtest PRIVATE infvino)
 
-install(TARGETS infvino infvino_bench infvino_numtest kernel_run kernel_bench kernel_numtest
+add_executable(kernel_autotune src/tools/kernel_autotune.cpp)
+target_link_libraries(kernel_autotune PRIVATE infvino)
+
+add_executable(tuning_test src/tools/tuning_test.cpp)
+target_link_libraries(tuning_test PRIVATE infvino)
+
+enable_testing()
+add_test(NAME tuning_test COMMAND tuning_test)
+
+install(TARGETS infvino infvino_bench infvino_numtest kernel_run kernel_bench kernel_numtest kernel_autotune tuning_test
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin

@@ -15,6 +15,13 @@
 #ifndef CL_DEVICE_SUB_GROUP_SIZES_INTEL
 #define CL_DEVICE_SUB_GROUP_SIZES_INTEL 0x4108
 #endif
+// CL_DEVICE_PCI_BUS_INFO_KHR（cl_khr_pci_bus_info 扩展）；部分驱动不返回。
+#ifndef CL_DEVICE_PCI_BUS_INFO_KHR
+#define CL_DEVICE_PCI_BUS_INFO_KHR 0x410F
+#endif
+#ifndef CL_DEVICE_VENDOR_ID
+#define CL_DEVICE_VENDOR_ID 0x1000
+#endif
 
 namespace gk
 {
@@ -66,6 +73,15 @@ DeviceInfo queryDevice(cl_device_id d)
   size_t sg = 0;
   if (clGetDeviceInfo(d, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sg), &sg, nullptr) == CL_SUCCESS) {
     i.subgroup_size = sg;
+  }
+  cl_uint vid = 0;
+  if (clGetDeviceInfo(d, CL_DEVICE_VENDOR_ID, sizeof(vid), &vid, nullptr) == CL_SUCCESS)
+    i.pci_vendor_id = vid;
+  // cl_khr_pci_bus_info: {cl_uint domain, bus, device, function; cl_uint vendor_id, device_id}
+  struct PciBusInfo { cl_uint domain, bus, dev, func, vendor_id, device_id; } pci;
+  if (clGetDeviceInfo(d, CL_DEVICE_PCI_BUS_INFO_KHR, sizeof(pci), &pci, nullptr) == CL_SUCCESS) {
+    i.pci_device_id = pci.device_id;
+    if (!i.pci_vendor_id) i.pci_vendor_id = pci.vendor_id;
   }
   i.peak_fp16_gflops = static_cast<double>(i.eu) * i.clock_mhz * 1e6 * 32.0 / 1e9;
   return i;

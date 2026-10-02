@@ -34,6 +34,10 @@ struct DeviceInfo
   size_t          max_work_group{0};
   size_t          subgroup_size{0};
   bool            is_gpu{false};        // device is CL_DEVICE_TYPE_GPU
+  // PCI 标识（优先 CL_DEVICE_PCI_BUS_INFO_KHR 的 device id，退回 vendor id + name）。
+  // 用于自动调优缓存的设备键：不同型号/不同 EU 数的 GPU 必须分开缓存。
+  uint32_t        pci_device_id{0};     // 0 = 未知
+  uint32_t        pci_vendor_id{0};     // 0 = 未知
   double          peak_fp16_gflops{0};  // eu * clock(MHz) * 32 FLOP (16 packed FP16 FMA)
 
   std::string     describe() const;

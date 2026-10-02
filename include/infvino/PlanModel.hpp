@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "infvino/ClRuntime.hpp"
+#include "infvino/Tuning.hpp"
 
 namespace gk
 {
@@ -78,6 +79,31 @@ public:
 
   const ClRuntime &   runtime() const { return rt_; }
   const DeviceInfo &  device() const { return rt_.info(); }
+
+  /** @brief 调优缓存（只读；由构造时按 INFVINO_TUNING_CACHE / config/tuning.json 加载）。*/
+  const TuningCache & tuning() const { return tuning_; }
+
+  /**
+   * @brief 对计划里的节点做离线自动调优（枚举候选 + GPU 计时），返回结果并按需合并进
+   *        `tuning_`。仅在 profiling=true 的 ClRuntime 上有意义。
+   *
+   * @param ops       只调优这些 op（空 = 全部支持调优的 op）。
+   * @param onlySubstr 只调优 profile tag 含此子串的节点（用于分批，空 = 不筛）。
+   * @param limit     最多调优多少个节点（0 = 不限；用于安全分批）。
+   * @param iters     每个候选的计时迭代数。
+   * @param merge     是否把结果写进 tuning_。
+   * @param verbose   打印每个节点的候选扫描明细。
+   * @return 本次调优的条目（key = OpSignature::str()）。
+   */
+  std::map<std::string, TuningEntry> autotune(
+    const std::vector<std::string> & ops = {}, const std::string & onlySubstr = "",
+    int limit = 0, int iters = 30, bool merge = true, bool verbose = false);
+
+  /** @brief 列出计划里可调优的唯一签名（不触碰 GPU，用于分批/审计）。 */
+  std::vector<std::string> tuningTargets(const std::vector<std::string> & ops = {}) const;
+
+  /** @brief 把 current tuning_ 写回文件。 */
+  bool saveTuning(const std::string & path) const { return tuning_.save(path); }
 
   /** @brief 最近一次 run() 的墙钟耗时（ms）。 */
   double lastRunMs() const { return last_run_ms_; }
@@ -144,6 +170,9 @@ private:
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
   double                                        last_run_ms_{0.0};
+
+  // 自动调优缓存（docs/autotuning.md）。查不到 → 回退到 dispatch 里的内置启发式。
+  TuningCache tuning_;
 };
 
 }  // namespace gk
