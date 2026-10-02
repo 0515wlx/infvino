@@ -1,0 +1,94 @@
+# Round 25：完整移植 OpenVINO 阻塞式 conv（`convolution_gpu_bfyx_f16`）+ 逐 size 对照
+
+> 目标模型：`yolov8n-pose`（其余同理）。硬件：Intel Iris Xe（80 EU / 1.3 GHz, TGL）。
+> 数值判据：`kernel_bench --verify` 与 `model_check` 同口径（vs FP32 参考）。
+> 上游源码：`~/openvino/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/convolution_gpu_bfyx_f16.cl`
+> （selector `ConvolutionKernel_b_fs_yx_fsv16`）。本机 OV 在 TGL 上选的就是它。
+
+---
+
+## 1. 移植了什么
+
+`kernels/conv_blk.cl`（自包含，Apache-2.0，见 `THIRD_PARTY_NOTICES.md`）：
+
+- **lane = 输出通道**：一个 work-group = 1 个 sub-group（16 lane）= 16 个输出通道，
+  每个 work-group 处理**一行**（`y`）× `OBW` 个输出列；`gws = (ceil(X/OBW)*Y, ceil(C/16)*16, B)`。
+- 每个 lane 用向量 `dst` 累加 `OBW`（2/4/8）个连续输出列 → `mad` 覆盖 OBW 个位置，
+  把每个输入通道的 `sub_group_shuffle` 摊薄到 `OBW/2` 个 packed FMA 上。
+- **输入 b_fs_yx_fsv16**（`[Cin/16][H][W][16]`）：lane `l` 用 `intel_sub_group_block_read_us8`
+  读入通道 `(icb*16+l)` 的整行，再用 `sub_group_shuffle` 广播通道 `id` 给所有 lane。
+- **权重 os_is_yx_isv16_osv16**（`[Cout/16][Cin/16][3][3][isv16][osv16]`），
+  `block_read_us8` 让每个 lane 拿到自己输出通道的 16 个输入通道权重。
+- **输出 bfyx**（OV 的 `OUTPUT_FORMAT_BFYX` 后重排路径），所以对 infvino 是 drop-in。
+- 主机侧：`PlanModel::blkWeight`（os_is_yx_isv16_osv16 重排）、`PlanModel::blkInput`
+  （bfyx→fsv16 重排，缓存 scratch）、`reorder_bfyx_to_fsv16` kernel。
+
+## 2. 数值
+
+- `kernel_bench --op conv3x3blk --verify`：40×40 s1 `mean_rel=3.1e-3`、s2 `1.5e-3`（过）。
+- **整网强制 blk**（把 yolov8n 全部 45 个 conv3×3 节点加 `blk=1`，`INFVINO_TUNING=off`）
+  vs onnxruntime：
+  - default（内置启发式 OV/native）：`mean_rel=5.69e-4 max_rel=2.03e-2` PASS
+  - **blk**：`mean_rel=5.42e-4 max_rel=1.21e-2` **PASS（还略更准）**
+- 数值差异来源是 fp16 求和顺序，不是逻辑错误。
+
+## 3. 逐 size 对照（blk OBW8 vs 调优后的 osv32/native）
+
+| shape | blk OBW8 | osv32/native 最佳 | Δ |
+|---|---:|---:|---:|
+| 20×20 s1 64→64 | 3.66 | 3.17 | **+15%** |
+| 20×20 s1 128→128 | 6.92 | 6.19 | **+12%** |
+| 20×20 s1 256→64 | 5.23 | 3.62 | **+44%** |
+| 40×40 s1 64→64 | 8.53 | 8.46 | +1% |
+| 40×40 s1 128→128 | 12.23 | 10.52 | **+16%** |
+| 80×80 s1 64→64 | 11.61 | 13.77 (ov 8×2) | −16% |
+| 80×80 s1 64→64 | 11.61 | 11.10 (ov 8×1) | +5% |
+| 40×40 s2 64→128 | 4.54 | 8.01 | −43% |
+| 160×160 s2 16→32 | 4.66 | 6.64 | −30% |
+| 320×320 s2 3→16 | 0.92 | 1.73 | −47% |
+
+**分工**：blk 赢在 **s1 小空间/大通道**（20×20 全系、40×40 C128），
+输在 **stride-2**（`INPUT_LINE_SIZE=17`，行 load 与边界开销更大）和 **80×80 大层**
+（osv32 的 8×2 packed 通路更省指令）。所以应作为**第三条 autotune 候选按 size 选**，
+而不是替换。
+
+**整网强制全 blk**（不是按 size 选，是最坏/压测下界）：yolov8n busy
+**17.35 → 17.19 ms（−0.9%）**——即使在不该用 blk 的层上也因 20×20 系收益略胜；
+按 size 选会更好。注意这里 default 是 `INFVINO_TUNING=off` 的启发式，非缓存调优后的 15.2 ms。
+
+## 4. 回答用户的问题：能到理论极限吗？
+
+**不能。** 反汇编（离线 `ocloc`）与实测：
+
+- `conv_blk`（OBW8）主循环 **mad 占比 ≈ 0.476**（288 packed mad / 605 指令量级），
+  指令配额 ≈ **15.2**；实测 40×40 C128 达 **12.23 = 配额的 80%**。
+- osv32 指令配额 ≈ 20.3（R24），实测 80×80 = 13.77（68%）。
+- **两条数据通路都没到各自配额**：40×40 类受 560 驻留 sub-group 的**波量化**限制，
+  80×80 受延迟/占用限制。换到 OV 的阻塞通路把「网格」这一项补上了（WG 数 ×2–4），
+  所以在小空间层追回了 12–44%；但它自己的指令配额更低（shuffle 开销），大层反而不如 8×2。
+
+**结论**：这台机器（7 线程 EU、无 L1、128 GRF）上，direct conv 的两条 OV 数据通路
+`os_iyx_osv32` 与 `bfyx_f16` 的现实天花板都停在 **~12–14 ops**（各自配额的 68–80%），
+差距是**延迟/占用**而非指令数。要达到 ~20 需要换硬件（矩阵单元/更大 GRF）或换问题
+（batch，但本任务要低延迟，不做）。
+
+## 5. 接入自动调优
+
+- `Autotuner::candidatesConv3x3` 新增 `conv3x3_blk` 候选（OBW = 2/4/8，含 stride）。
+- `PlanModel` dispatch / `autotune()` 支持 `conv3x3_blk`（含输入重排 + 权重重排）。
+- 默认路径**不变**（仍 OV）；只有调优缓存选中 `conv3x3_blk` 才走它 → 零回归风险。
+- **未重跑全量 autotune**（GPU 安全）：需要时按 `scripts/autotune.py` 分批重扫 conv3x3，
+  新的中间标准 + blk 候选会自动按 size 选。
+
+## 6. 复现
+
+```bash
+# 单 shape 对照（一条短命令，遵守 benchmark_protocol.md）
+./build/kernel_bench --op conv3x3blk --conv-shape 64,64,40,40 \
+  --conv 8,2,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,0,0,0 --iters 5 --verify
+./build/kernel_bench --op conv3x3ov  --conv-shape 64,64,40,40 \
+  --conv 8,1,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,0,0,0,0,0 --iters 5
+
+# 强制 blk 整网（审计）：把 plan 的 conv3x3 节点加 blk=1，INFVINO_TUNING=off 跑 kernel_run
+# 接入后逐层选：kernel_autotune --plan ... --op conv3x3 --limit N --iters M
+```

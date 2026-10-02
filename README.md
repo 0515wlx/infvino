@@ -127,6 +127,7 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
 | [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
+| [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) | **R25 OV 阻塞式 conv 完整移植**：逐 size 对照 / 第三条 autotune 通路 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -161,6 +162,16 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > 实测更慢并回退。逐 size 分析与下一步（split-K / 内部块 fast path / OSV64）见
 > [`docs/round24-analysis.md`](docs/round24-analysis.md)。
 >
+> **R25 更新**：**完整移植了 OpenVINO 的阻塞式 conv**（`convolution_gpu_bfyx_f16`，
+> lane=输出通道 + `b_fs_yx_fsv16` 输入 + `os_is_yx_isv16_osv16` 权重 + 向量 `mad`），
+> 作为 `kernels/conv_blk.cl` + 第三条 autotune 候选（OBW=2/4/8，含输入/权重重排）。
+> 逐 size 对照：blk 赢在 **s1 小空间/大通道**（20×20 系 +12–44%、40×40 C128 +16%），
+> 输在 **stride-2**（−30–47%）与 **80×80 大层**（−16%），因此按 size 选而非替换。
+> 整网强制全 blk 也 **−0.9%**（17.35→17.19 ms），强制 blk 与 default 均 vs onnxruntime PASS。
+> **回答「能否到理论极限」：不能**——blk 指令配额 ≈15（实测达 80%）、osv32 ≈20（达 68%），
+> 两条 OV 通路的现实天花板都在 **~12–14 ops**，差距是延迟/占用而非指令数。
+> 详见 [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md)。
+>
 > **自动调优（P0）**：引入分层自动调优体系（[`docs/autotuning.md`](docs/autotuning.md)）：
 > `OpSignature` + `TuningCache`（按设备/op/shape）+ 候选枚举 + **中间标准 `expected_ops`**。
 > 不改任何 kernel 源码，仅靠自动选择配置，yolov8n conv3×3 分项 **10.98→9.71 ms（−11.6%）**、
@@ -178,7 +189,8 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 - [x] 算子级 + 整网 + 库后端三级数值检验
 - [x] concat 3-D 网格 + 主机侧 kernel 缓存（R23）
 - [x] 分层自动调优体系（P0）：TuningCache + 候选枚举 + 中间标准 expected_ops + `kernel_autotune`
-- [ ] conv3×3 阻塞式 kernel（OV 全功能移植 + 逐层 autotune）；当前 osv32 已到 ~8–13 ops
+- [x] conv3×3 阻塞式 kernel（R25 完整移植 OV `convolution_gpu_bfyx_f16`）+ 接入 autotune 候选；两条 OV 通路现实上限 ~12–14 ops
+- [ ] conv3×3 逐层 autotune 重扫（blk 候选 + R24 中间标准）；当前 osv32 已到 ~8–13 ops
 - [ ] 算子融合、内存复用、降低 launch 开销（整网墙钟；busy 17.2 vs 墙钟 22.3 ms）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）
