@@ -338,9 +338,6 @@ cl_mem PlanModel::bcastDims(const std::string & spec)
 OpSignature PlanModel::smallSig(const Node & n) const
 {
   const int64_t nout = T_.at(n.outs[0]).numel();
-  auto dimOf = [&](int i) -> int64_t {
-    return i < static_cast<int>(T_.at(n.ins[i]).dims.size()) ? T_.at(n.ins[i]).dims[i] : 1;
-  };
   if (n.op == "ew_binary")
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0),
@@ -392,9 +389,16 @@ OpSignature PlanModel::smallSig(const Node & n) const
     return OpSignature::custom("permute_0213", {attrInt(n, "D1", 1), attrInt(n, "D2", 1),
                                                 attrInt(n, "I", 1), attrInt(n, "mode", 0)});
   if (n.op == "bmm")
-    return OpSignature::custom("bmm", {static_cast<int>(dimOf(0)), static_cast<int>(dimOf(1)),
-                                       static_cast<int>(dimOf(2)), static_cast<int>(dimOf(3)),
-                                       static_cast<int>(T_.at(n.ins[1]).dims[3])});
+  {
+    // dims: A=[B0,B1,M,K], B=[B0,B1,K,N]（这里的首两维可能是 1，需按张量自身形状取）。
+    const auto & ad = T_.at(n.ins[0]).dims;
+    const auto & bd = T_.at(n.ins[1]).dims;
+    auto at = [](const std::vector<int64_t> & d, size_t i) -> int {
+      return i < d.size() ? static_cast<int>(d[i]) : 1;
+    };
+    return OpSignature::custom("bmm", {at(ad, 0), at(ad, 1), at(ad, 2),
+                                       at(ad, ad.size() - 1), at(bd, bd.size() - 1)});
+  }
   if (n.op == "gap")
     return OpSignature::gap(attrInt(n, "C", 0), attrInt(n, "HW", 1));
   return OpSignature::custom(n.op, {});
@@ -422,7 +426,7 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     return static_cast<size_t>((count + v - 1) / v);
   };
 
-  if (n.op == "ew_binary")
+  if (n.op == "ew_binary" && !n.attr.count("bdims"))
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
     cl_mem da = inMem(0), db = inMem(1);
@@ -436,7 +440,7 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     gws[0] = isVec ? vecN(nn) : static_cast<size_t>(nn);
     return;
   }
-  if (n.op == "ew_binary_bcast")
+  if (n.op == "ew_binary_bcast" || (n.op == "ew_binary" && n.attr.count("bdims")))
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
     cl_mem da = inMem(0), db = inMem(1);
@@ -730,7 +734,12 @@ void PlanModel::run()
       throw std::runtime_error(
         "PlanModel: gws too large for " + tag + ": " + std::to_string(total) +
         " items (check plan attrs)");
-    cl_event ev = ClRuntime::enqueueND(rt_.queue(), k, dim, gws, lws);
+    cl_event ev = nullptr;
+    try {
+      ev = ClRuntime::enqueueND(rt_.queue(), k, dim, gws, lws);
+    } catch (const std::exception & e) {
+      throw std::runtime_error("node " + tag + ": " + e.what());
+    }
     if (profiling_)
     {
       clWaitForEvents(1, &ev);
