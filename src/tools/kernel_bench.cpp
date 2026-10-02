@@ -307,6 +307,116 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   return 0;
 }
 
+// Round 25: blocked conv — OV `convolution_gpu_bfyx_f16` port (kernels/conv_blk.cl).
+// Input is in b_fs_yx_fsv16 ([Cin/16][H][W][16]), weights in os_is_yx_isv16_osv16
+// ([Cout/16][Cin/16][3][3][16 isv][16 osv]), output plain bfyx.  OBW = c.TX.
+int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s, int iters, bool verify)
+{
+  const int Hout = (s.H + 2 * c.PAD - 3) / c.STRIDE + 1;
+  const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
+  const int Cin = s.Cin, Cout = s.Cout, OBW = c.TX;
+  char oo[192];
+  std::snprintf(oo, sizeof(oo),
+                "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 -cl-mad-enable -cl-fast-relaxed-math",
+                OBW, c.STRIDE, c.PAD, c.ACT);
+  cl_kernel k;
+  try { k = rt.buildKernel("conv_blk", "conv3x3_blk", oo); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+
+  const int icb = (Cin + 15) / 16, ocb = (Cout + 15) / 16;
+  std::vector<uint16_t> hX((size_t)Cin * s.H * s.W), hB((size_t)Cout),
+      hWt((size_t)Cout * Cin * 9), hY((size_t)Cout * Hout * Wout);
+  std::mt19937 rngX(11), rngW(22);
+  std::uniform_real_distribution<float> dum(-0.5f, 0.5f), dud(-0.2f, 0.2f);
+  for (auto & v : hX) v = gk::f32_to_f16(dum(rngX));
+  for (auto & v : hWt) v = gk::f32_to_f16(dud(rngW));
+  for (auto & v : hB) v = gk::f32_to_f16(dud(rngW));
+
+  // input bfyx -> b_fs_yx_fsv16
+  std::vector<uint16_t> hXb((size_t)icb * s.H * s.W * 16, 0);
+  for (int ch = 0; ch < Cin; ++ch)
+    for (int y = 0; y < s.H; ++y)
+      for (int x = 0; x < s.W; ++x)
+        hXb[(((size_t)(ch / 16) * s.H + y) * s.W + x) * 16 + (ch % 16)] =
+          hX[((size_t)ch * s.H + y) * s.W + x];
+  // weights bfyx -> os_is_yx_isv16_osv16
+  std::vector<uint16_t> hWb((size_t)ocb * icb * 9 * 16 * 16, 0);
+  for (int o = 0; o < Cout; ++o)
+    for (int i = 0; i < Cin; ++i)
+      for (int kh = 0; kh < 3; ++kh)
+        for (int kw = 0; kw < 3; ++kw)
+          hWb[((((size_t)(o / 16) * icb + (i / 16)) * 9 + kh * 3 + kw) * 16 + (i % 16)) * 16 + (o % 16)] =
+              hWt[((size_t)o * Cin + i) * 9 + kh * 3 + kw];
+
+  cl_mem dX = rt.alloc((size_t)icb * s.H * s.W * 16 * 2, CL_MEM_READ_ONLY);
+  cl_mem dW = rt.alloc(hWb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
+  cl_mem dY = rt.alloc((size_t)Cout * Hout * Wout * 2, CL_MEM_WRITE_ONLY);
+  rt.write(dX, hXb.size() * 2, hXb.data());
+  rt.write(dW, hWb.size() * 2, hWb.data());
+  rt.write(dB, (size_t)Cout * 2, hB.data());
+  clSetKernelArg(k, 0, sizeof(dX), &dX);
+  clSetKernelArg(k, 1, sizeof(dW), &dW);
+  clSetKernelArg(k, 2, sizeof(dB), &dB);
+  clSetKernelArg(k, 3, sizeof(dY), &dY);
+  int CinA = Cin, HA = s.H, WA = s.W, CoutA = Cout, ho = Hout, wo = Wout;
+  clSetKernelArg(k, 4, sizeof(CinA), &CinA);
+  clSetKernelArg(k, 5, sizeof(HA), &HA);
+  clSetKernelArg(k, 6, sizeof(WA), &WA);
+  clSetKernelArg(k, 7, sizeof(CoutA), &CoutA);
+  clSetKernelArg(k, 8, sizeof(ho), &ho);
+  clSetKernelArg(k, 9, sizeof(wo), &wo);
+
+  const size_t lws[3] = {1, 16, 1};
+  const size_t gws[3] = {
+    static_cast<size_t>(((Wout + OBW - 1) / OBW) * Hout),
+    static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+  const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  conv3x3blk %-15s Cin=%-4d Cout=%-4d %dx%d s%d OBW%d  %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), Cin, Cout, s.H, s.W, c.STRIDE, OBW, med,
+    flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+
+  if (verify) {
+    rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
+    auto ref_act = [&](float f) -> double {
+      if (c.ACT == 1) return f / (1.0 + std::exp(-(double)f));
+      if (c.ACT == 2) return (double)(f * std::min(std::max(f + 3.0f, 0.0f), 6.0f) / 6.0f);
+      return (double)f;
+    };
+    double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    for (int oc = 0; oc < Cout; ++oc)
+      for (int oy = 0; oy < Hout; ++oy)
+        for (int ox = 0; ox < Wout; ++ox) {
+          float acc = gk::f16_to_f32(hB[oc]);
+          for (int ci = 0; ci < Cin; ++ci)
+            for (int kh = 0; kh < 3; ++kh)
+              for (int kw = 0; kw < 3; ++kw) {
+                int yy = oy * c.STRIDE - c.PAD + kh, xx = ox * c.STRIDE - c.PAD + kw;
+                if (yy >= 0 && yy < s.H && xx >= 0 && xx < s.W)
+                  acc += gk::f16_to_f32(hX[((size_t)ci * s.H + yy) * s.W + xx]) *
+                         gk::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
+              }
+          const double r = ref_act(acc);
+          const size_t oidx = ((size_t)oc * Hout + oy) * Wout + ox;
+          const double got = gk::f16_to_f32(hY[oidx]);
+          const double d = std::fabs(got - r);
+          sumabs += d; sumref += std::fabs(r);
+          maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs(r));
+        }
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e",
+      sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dB); clReleaseMemObject(dY);
+  clReleaseKernel(k);
+  return 0;
+}
+
 // Specialized 1x1 conv (pointwise) kernel: fused bias + activation.
 int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
 {
@@ -814,15 +924,19 @@ int main(int argc, char ** argv)
     std::printf("[conv1x1g] gemv %s\n", c1x1.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{576, 1024, 1, 1, "fc"}, {1024, 1000, 1, 1, "cls"}};
     for (const auto & s : conv_shapes) rc |= benchConv1x1Gemv(rt, c1x1, s, iters, verify);
-  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov") {
+  } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov" || op == "conv3x3blk") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;
     if (op == "conv3x3sg") conv.SGK = 1;
     if (op == "conv3x3db") conv.DB = 1;
     if (op == "conv3x3ov") conv.OV = 1;
+    if (op == "conv3x3blk") conv.BLK = 1;
     std::printf("[%s] %s\n", op.c_str(), conv.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "p3-3x3"}, {64, 64, 40, 40, "p4-3x3"}};
-    for (const auto & s : conv_shapes) rc |= benchConv(rt, conv, s, iters, verify);
+    for (const auto & s : conv_shapes) {
+      if (conv.BLK) rc |= benchConvBlk(rt, conv, s, iters, verify);
+      else rc |= benchConv(rt, conv, s, iters, verify);
+    }
   } else if (op == "bandwidth") {
     std::printf("[bandwidth] buffer=%zu MB\n", mb);
     rc = benchBandwidth(rt, mb, iters);

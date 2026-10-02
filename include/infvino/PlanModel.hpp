@@ -140,6 +140,10 @@ private:
   Tensor & ref(const std::string & name);
   int     attrInt(const Node & n, const char * key, int def) const;
   cl_mem  ovWeight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief R25: repack weights to OpenVINO os_is_yx_isv16_osv16 for conv3x3_blk. */
+  cl_mem  blkWeight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief R25: reorder a conv input bfyx -> b_fs_yx_fsv16 (cached scratch). */
+  cl_mem  blkInput(const std::string & name, Tensor & x, int Cin, int H, int W);
   /** @brief Build (once) and cache a kernel keyed by source|name|options. */
   cl_kernel getKernel(const std::string & src, const std::string & name, const std::string & opts);
 
@@ -155,6 +159,10 @@ private:
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;
   std::vector<cl_mem>                     owned_ov_;
+  // R25: cached blocked-conv (conv3x3_blk) weights + reordered inputs.
+  std::unordered_map<std::string, cl_mem> blk_w_;
+  std::unordered_map<std::string, cl_mem> blk_in_;
+  std::vector<cl_mem>                     owned_blk_;
   std::vector<Node>                       nodes_;
   std::vector<std::string>                outputs_;   // 输出张量名（按声明顺序）
   std::string                             input_name_;

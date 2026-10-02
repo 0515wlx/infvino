@@ -66,6 +66,8 @@ PlanModel::~PlanModel()
     if (m) clReleaseMemObject(m);
   for (cl_mem m : owned_ov_)
     if (m) clReleaseMemObject(m);
+  for (cl_mem m : owned_blk_)
+    if (m) clReleaseMemObject(m);
 }
 
 cl_mem PlanModel::ovWeight(const std::string & name, Tensor & w, int Cout, int Cin)
@@ -89,6 +91,48 @@ cl_mem PlanModel::ovWeight(const std::string & name, Tensor & w, int Cout, int C
   rt_.write(m, sw.size() * 2, sw.data());
   ov_w_[name] = m;
   owned_ov_.push_back(m);
+  return m;
+}
+
+cl_mem PlanModel::blkWeight(const std::string & name, Tensor & w, int Cout, int Cin)
+{
+  auto it = blk_w_.find(name);
+  if (it != blk_w_.end()) return it->second;
+  const int icb = (Cin + 15) / 16, ocb = (Cout + 15) / 16;
+  std::vector<uint16_t> host(static_cast<size_t>(w.numel()));
+  rt_.read(w.mem, host.size() * 2, host.data());
+  // os_is_yx_isv16_osv16 = [OC/16][IC/16][3][3][isv16][osv16]
+  std::vector<uint16_t> sw(static_cast<size_t>(ocb) * icb * 9 * 16 * 16, 0);
+  for (int o = 0; o < Cout; ++o)
+    for (int i = 0; i < Cin; ++i)
+      for (int kh = 0; kh < 3; ++kh)
+        for (int kw = 0; kw < 3; ++kw)
+          sw[((((static_cast<size_t>(o / 16) * icb + (i / 16)) * 9) + kh * 3 + kw) * 16 + (i % 16)) * 16 + (o % 16)] =
+              host[(static_cast<size_t>(o) * Cin + i) * 9 + kh * 3 + kw];
+  cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
+  rt_.write(m, sw.size() * 2, sw.data());
+  blk_w_[name] = m;
+  owned_blk_.push_back(m);
+  return m;
+}
+
+cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H, int W)
+{
+  auto it = blk_in_.find(name);
+  if (it != blk_in_.end()) return it->second;
+  const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
+  cl_mem m = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+  blk_in_[name] = m;
+  owned_blk_.push_back(m);
+  cl_kernel k = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+  clSetKernelArg(k, 0, sizeof(x.mem), &x.mem);
+  clSetKernelArg(k, 1, sizeof(m), &m);
+  clSetKernelArg(k, 2, sizeof(Cin), &Cin);
+  clSetKernelArg(k, 3, sizeof(H), &H);
+  clSetKernelArg(k, 4, sizeof(W), &W);
+  const size_t gws[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                         static_cast<size_t>(Cin)};
+  ClRuntime::enqueueND(rt_.queue(), k, 3, gws, nullptr);
   return m;
 }
 
@@ -513,6 +557,44 @@ void PlanModel::run()
         timed("conv3x3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
                 std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout) + "(tuned)",
+              kk, 3, gws, lws);
+      }
+      else if ((te && te->kernel == "conv3x3_blk") || (attrInt(n, "blk", 0) != 0 && !te))
+      {
+        // R25: OpenVINO blocked conv port (kernels/conv_blk.cl). Reorders the
+        // input bfyx -> b_fs_yx_fsv16 (cached scratch) then runs the blocked
+        // kernel, writing plain bfyx output.
+        int obw = 8;
+        char oo[192];
+        if (te) {
+          auto p = te->options.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(te->options.c_str() + p + 6);
+          std::snprintf(oo, sizeof(oo), "%s", te->options.c_str());
+        } else {
+          std::snprintf(oo, sizeof(oo),
+                        "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
+                        "-cl-mad-enable -cl-fast-relaxed-math", obw, stride, pad, act);
+        }
+        cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", oo);
+        cl_mem dw = blkWeight(n.ins[1], in(1), Cout, Cin);
+        cl_mem dxb = blkInput(n.ins[0], in(0), Cin, H, W);
+        clSetKernelArg(kk, 0, sizeof(dxb), &dxb);
+        clSetKernelArg(kk, 1, sizeof(dw), &dw);
+        clSetKernelArg(kk, 2, sizeof(db), &db);
+        clSetKernelArg(kk, 3, sizeof(dy), &dy);
+        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
+        clSetKernelArg(kk, 5, sizeof(H), &H);
+        clSetKernelArg(kk, 6, sizeof(W), &W);
+        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
+        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
+        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        const size_t lws[3] = {1, 16, 1};
+        const size_t gws[3] = {
+          static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
+          static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
+        timed("conv3x3blk@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout) + (te ? "(tuned)" : ""),
               kk, 3, gws, lws);
       }
       else if (te && te->kernel == "conv3x3_ov")
@@ -1039,6 +1121,31 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             static_cast<size_t>((Wout + obw - 1) / obw),
             static_cast<size_t>((Hout + obh - 1) / obh),
             static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+          return [this, kk, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
+          };
+        }
+        if (c.kernel == "conv3x3_blk") {
+          int obw = 8;
+          auto p = c.options.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(c.options.c_str() + p + 6);
+          cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", c.options);
+          cl_mem dw = blkWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
+          cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
+          clSetKernelArg(kk, 0, sizeof(dxb), &dxb);
+          clSetKernelArg(kk, 1, sizeof(dw), &dw);
+          clSetKernelArg(kk, 2, sizeof(db), &db);
+          clSetKernelArg(kk, 3, sizeof(dy), &dy);
+          clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
+          clSetKernelArg(kk, 5, sizeof(H), &H);
+          clSetKernelArg(kk, 6, sizeof(W), &W);
+          clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
+          clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
+          clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+          const size_t lws[3] = {1, 16, 1};
+          const size_t gws[3] = {
+            static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
+            static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
           return [this, kk, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
           };

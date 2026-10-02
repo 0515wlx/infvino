@@ -24,6 +24,17 @@ library is linked or required at build or run time — only source code was adap
     `os_iyx_osv32` weight layout described by OpenVINO's
     `GET_FILTER_OS_IYX_OSV_INDEX` (see
     `src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/fetch_weights.cl`).
+  - `kernels/conv_blk.cl` — a self-contained adaptation of the data path of the
+    upstream `src/plugins/intel_gpu/src/kernel_selector/cl_kernels/convolution_gpu_bfyx_f16.cl`
+    (kernel `convolution_gpu_bfyx_f16`, selector `ConvolutionKernel_b_fs_yx_fsv16`):
+    sub-group lanes = 16 output channels, blocked `b_fs_yx_fsv16` input,
+    `os_is_yx_isv16_osv16` weights via `intel_sub_group_block_read_us8`, per-input
+    vector `mad` over `OUTPUT_X_BLOCK_SIZE` columns, plain `bfyx` output. Upstream
+    `#include` helper headers and JIT macro layer replaced by local definitions;
+    also contains an original `reorder_bfyx_to_fsv16` helper.
+  - The host-side blocked weight repack (`PlanModel::blkWeight`) and input reorder
+    (`PlanModel::blkInput`) reproduce OpenVINO's `os_is_yx_isv16_osv16` /
+    `b_fs_yx_fsv16` layouts.
 - **Copyright notice retained**: `Copyright (C) 2018-2026 Intel Corporation`.
 - **Modifications**: reduced to a single self-contained `.cl` file; added an
   infvino-specific fused activation/residual epilogue and a `RES` toggle; the

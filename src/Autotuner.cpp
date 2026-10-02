@@ -53,6 +53,26 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
     c.config = ovConfig(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0);
     out.push_back(std::move(c));
   }
+  // R25: OpenVINO blocked conv port (kernels/conv_blk.cl).  Lane=output channel,
+  // OBW consecutive output columns per lane, blocked input + vector mads; grid is
+  // 16 channels x 1 row per WG (2-4x more WGs than osv32).  Wins on small-spatial
+  // / large-channel s1 layers; the tuner picks per size.
+  for (int obw : {2, 4, 8}) {
+    if (sig.W > 0 && obw > sig.W) continue;
+    Candidate c;
+    c.kernel = "conv3x3_blk";
+    c.source = "conv_blk";
+    {
+      std::ostringstream o;
+      o << "-DOBW=" << obw << " -DSTRIDE=" << sig.stride << " -DPAD=" << sig.pad
+        << " -DACT=" << sig.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+      c.options = o.str();
+      std::ostringstream cc;
+      cc << "OBW=" << obw << ",STRIDE=" << sig.stride << ",PAD=" << sig.pad << ",ACT=" << sig.act;
+      c.config = cc.str();
+    }
+    out.push_back(std::move(c));
+  }
   // native conv3x3_f16（R18 自适应 tile 谱系）作为第二条通路候选——所有 shape 都枚举
   //（含 stride=2），让调优器按 size 在「lane=通道 OV」与「lane=空间 SLM native」之间选。
   // R22 起 OV 通常赢，但小通道 shape 上 native 偶尔更优（如 40×40 Cin32 Cout64、

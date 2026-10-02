@@ -144,6 +144,8 @@ struct Conv3x3Cfg
   int WGL = 0;
   // Round 22: OpenVINO os_iyx_osv32 port (kernels/conv_ov.cl). TX=OBW, TY=OBH.
   int OV = 0;
+  // Round 25: OpenVINO blocked conv port (kernels/conv_blk.cl), OBW = TX.
+  int BLK = 0;
 
   std::string options() const
   {
