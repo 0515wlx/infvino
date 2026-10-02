@@ -1873,12 +1873,23 @@ R23（3-D concat + 新 PlanModel）本身数值正确，`concat4` 是纯 copy、
 → 400 WG 的问题不是「grid 少」，而是**波量化**（并发 ≈ 80×7=560 sub-group；800 WG 仍是
 1.43 波，利用率 ~0.71）。split-K 拿确定的 −24% 换 +3%，**S=2/4 都不划算，已放弃**。
 
-### 24.6 下一步
+### 24.6 内部块 fast path（**负结果，已回退**）
 
-1. **压每 WG 的固定/延迟开销**（~27%，第一杠杆）：内部块 fast path，去掉输入
-   `byte gathering read` + 边界谓词与输出 `byte scattering write`。
-2. VECO/OSV64（每 lane 4 通道）只改善指令配额、**不增加 grid**，作为次选。
-3. 重跑逐层 autotune（native 覆盖 stride=2；新中间标准自动指出最远层）。
+对齐 block read（内部块用 `intel_sub_group_block_read_us`）→ **数值错误**（`mean_rel≈1.1`）：
+`PAD=1` 时 `base_x=oc*stride-1` 为奇数，未对齐的 block read 返回错位数据。
+去谓词 per-lane 载入 → 数值 PASS 但**更慢**：40×40 8×1 8.77→7.30、8×2 7.83→7.08、
+80×80 8×2 13.77→11.84。热循环里运行时的 `interior` 分支比省下的谓词更贵。
+**已回退**（kernel 逐字节回到 R23 状态）。
+
+### 24.7 收口与下一步
+
+R24 三个方向（split-K、双累加集、内部块 fast path）全部实测否决，加上 grid/Cin 扫描，
+指向同一结论：**`os_iyx_osv32` 移植在本机已接近其数据通路的实际平台**（8×1 渐近 ≈ 11、
+8×2 在 80×80 达 13.77；40×40 类受 `≤400 WG < 560` 的波量化限制，拆工作代价大于收益）。
+继续微调 kernel 的期望收益很低，要再进一步只剩：
+(1) 完整移植 **OV 阻塞式 conv**（唯一可能越过该结构上限的通路，工程量大）；
+(2) 更大 **batch** 把 40×40 类的波填满。详见
+[`docs/round24-analysis.md`](round24-analysis.md) §3/§5。
 
 
 ## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

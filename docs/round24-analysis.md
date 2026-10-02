@@ -155,6 +155,39 @@ ocloc disasm -file /tmp/ov_tgllp.bin -device tgllp -dump /tmp/ov
 **每 WG 的边界谓词/prologue/epilogue**）。所以下一轮要压的不是「累加器 ILP」，而是
 **内存访问指令**与**每 WG 固定开销**。
 
+### 3.2 内部块 fast path（去边界谓词 + 对齐 block read）——**负结果，已回退**
+
+按上面判读，又试了两种内部块优化（`conv_ov.cl`，都改完即回退）：
+
+1. **对齐 block read**：内部块（`base_x≥0 && base_x+IBW≤W && base_y≥0 && base_y+IN_REQ_H≤H`，
+   80×80 约 76%）改用 `intel_sub_group_block_read_us` 一次读一整行。
+   → **数值错误**（`mean_rel≈1.1`）：`block_read_us` 要求对齐地址，而 `PAD=1` 时
+   `base_x=oc*stride-1` 是**奇数**，未对齐的 block read 返回错位数据。
+2. **无谓词 per-lane 载入**：内部块只去掉边界谓词、保留逐 lane 载入。
+   → 数值 PASS，但**更慢**：
+
+| shape | 原版 | 无谓词 fast path |
+|---|---:|---:|
+| 40×40 s1 64→64 8×1 | 8.77 | 7.30 |
+| 40×40 s1 64→64 8×2 | 7.83 | 7.08 |
+| 80×80 s1 64→64 8×2 | 13.77 | 11.84 |
+
+**判读**：热循环里的运行时 `interior` 分支（IGC 未做 loop-unswitch）比它省下的谓词更贵，
+且两条路径都进 kernel 抬高了 I-cache/寄存器压力。原来的逐元素谓词被 IGC 编译成廉价的
+`predicated load`，本就不值得替换。**已回退**（kernel 逐字节回到 R23 状态）。
+
+### 3.3 当前收口（R24 证据链）
+
+三个方向全部被实测否决（split-K、双累加集、内部块 fast path），加上 grid/Cin 扫描，
+指向同一结论：**`os_iyx_osv32` 移植在本机已接近其数据通路的实际平台**——
+- 8×1 的渐近 ops ≈ 11（Cin→∞），8×2 在 80×80 达 13.77；
+- 40×40 类受制于 `spatial × Cout/32 ≤ 400 WG < 560` 的波量化，而拆工作（split-K）
+  的代价（工作/WG −24%）远大于 grid 收益（+3%）；
+- 剩余缺口（20.3 配额 → 实测 13.8/8.5）是 7 线程 EU 上的延迟/占用，**不是可再压的指令数**。
+
+要再进一步，只剩**换数据通路/切分**（OV 阻塞式 conv 的完整移植，R23 的简化版未成）或
+**换问题切分**（更大 batch 让 40×40 类网格变满）。这两条都超出「微调 kernel」范畴。
+
 ---
 
 ## 4. 自动调优接入（本轮落地的正向改动）
@@ -199,16 +232,22 @@ ocloc disasm -file /tmp/ov_tgllp.bin -device tgllp -dump /tmp/ov
 
 ## 5. 下一步（按预期收益排序）
 
-1. **压每 WG 的固定/延迟开销（真正的短板，~27%）**：ISA 显示输入是逐元素
-   `byte gathering read 16b` + `if/else` 谓词、输出是 `byte scattering write 16b`。
-   对内部块（80×80 约 72%）走 `intel_sub_group_block_read`/合并写，削掉谓词与散列访存，
-   同时让 prologue/epilogue 更短。**这是当前证据指向的第一杠杆。**
-2. **波/网格量化**：40×40 类无论怎么调 block 都受限于 `spatial×Cout/32`（≤400 WG < 560），
-   靠调 grid 无法补齐；只能靠减少每波里的停顿（同上）或换问题切分（split-K 已否决）。
-3. **VECO/OSV64：每 lane 4 个输出通道**，让 1 条广播喂 2 个 `half2` mad（提高每广播算术量）。
-   注意：VECO 会在保持工作/WG 的同时把 `Cout/(SG·VECO)` 的通道组数减半，
-   **grid 不增**（见 §2.1 的推导），因此它只改善指令配额，不改善占用；风险：128 GRF。
-4. **重跑逐层 autotune**（新候选覆盖 stride=2 native；新中间标准可自动指出最远的层）。
+> §3、§4.5 的四个实测全部为负 → 当前 `os_iyx_osv32` 移植在本机已接近其数据通路平台。
+> 继续「微调 kernel」的期望收益很低；下面按投入产出重排。
+
+1. **换数据通路：完整移植 OV 阻塞式 conv（`convolution_gpu_bfyx_f16`）**——R23 的简化版
+   未成（6.6 vs 7.9 且 NaN）。它是唯一可能越过「lane=通道 + 广播」结构上限的通路
+   （`lane=通道 + 多输出列/块`，网格与复用模式不同）。工程量大，需 leftover/OOB/分组
+   完整实现 + 逐 shape 数值收口。**若还要继续压 conv，这是唯一实质方向。**
+2. **换问题切分：更大 batch**——40×40 类受 `spatial×Cout/32 ≤ 400 WG < 560` 的波量化限制；
+   batch>1 时网格成倍增长、波被填满（grid 扫描：1600 WG 时 ops 11.0 vs 400 时 8.8）。
+   推理后端当前单流单 batch，bin-wise 方案代价大。
+3. **重跑逐层 autotune**（低风险、小收益）：新候选覆盖 stride=2 native；新中间标准
+   可自动指出最远的层。
+4. **窄通道 stem 特化**（`Cout≤16`，如 `320×320 s2 3→16` 0.61 ms、ratio 0.11）：
+   OSV=32 时一半 lane 闲置，可让半个 sub-group 处理另一空间块。收益 ~1–2% e2e，中等复杂度。
+5. **VECO/OSV64**（每 lane 4 通道）：只改善指令配额、**不增加 grid**（§2.1 推导），
+   在当前 40×40 占用受限下预期有限；风险和收益都不占优，暂缓。
 
 ---
 
