@@ -56,6 +56,14 @@
 #ifndef VEC
 #define VEC 4
 #endif
+// R30c (Route A): fuse a contiguous 4-way channel concat into B's staging.
+//   B's logical rows are K=Cin; row gr belongs to source seg (0..3) per ca/cb/cc/cd,
+//   and within that source it is row (gr - seg_offset).  Each source is a separate
+//   buffer, so B is addressed via BROW(gr) instead of &B[gr*N].  This removes the
+//   concat's materialisation (write + re-read) while keeping gemm_f16's tile/pipeline.
+#ifndef CAT4
+#define CAT4 0
+#endif
 #ifndef ASYNC
 #define ASYNC 0
 #endif
@@ -174,7 +182,22 @@ __kernel void gemm_f16(__global const half *restrict A,
                        , __global const half *restrict Bias
                        , __global const half *restrict Res
 #endif
+#if CAT4
+                       , __global const half *restrict B1
+                       , __global const half *restrict B2
+                       , __global const half *restrict B3
+                       , const int ca, const int cb, const int cc
+#endif
                        ) {
+#if CAT4
+  // R30c: logical B row `gr` -> source buffer + row-in-source.  Sources are
+  // contiguous channel slices; ca/cb/cc are the channel counts of b0/b1/b2 (b3 = rest).
+// (macro, not a function/lambda — OpenCL C 1.2 has neither lambdas nor function ptrs)
+#define brow(gr) ((gr) < ca ? (B + (size_t)(gr) * N) : \
+                  ((gr) < ca + cb ? (B1 + (size_t)((gr) - ca) * N) : \
+                   ((gr) < ca + cb + cc ? (B2 + (size_t)((gr) - ca - cb) * N) : \
+                    (B3 + (size_t)((gr) - ca - cb - cc) * N))))
+#endif
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * LX + lx;
@@ -245,19 +268,35 @@ __kernel void gemm_f16(__global const half *restrict A,
     }                                                                               \
   } while (0)
 
+// R30c: return the base pointer of logical B row `gr` in the (possibly fused)
+// concatenated channel space.  CAT4=1 selects one of 4 contiguous sources.
+#if CAT4
+#define BROW(gr) (brow((gr)))
+#else
+#define BROW(gr) (&B[(gr) * N])
+#endif
+
 // ---- vectorized synchronous staging of the B tile into buffer `pb` ----
+// R30c: `BROW(gr)[...]` is used instead of `B[gr*N + ...]` so CAT4 can redirect a
+// logical row to one of 4 source buffers.  With CAT4=0 BROW(gr) == &B[gr*N], so the
+// generated code is identical to before.
 #define STAGE_B(pb, K0)                                                             \
   do {                                                                              \
     __local half (*Bs)[BR] = (__local half (*)[BR])Bs_ + (pb) * BK;                \
     const int k0_ = (K0);                                                           \
     if ((N % VEC) == 0) {                                                           \
-      if ((blockCol + BN <= N) && (k0_ + BK <= K)) {                                \
+      if ((k0_ + BK <= K)) {                                                        \
         _Pragma("unroll") for (int i = 0; i < (BK * BC_PR + NTHR - 1) / NTHR; ++i) { \
           int idx = tid + i * NTHR;                                                 \
           if (idx < BK * BC_PR) {                                                   \
             int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                           \
-            *(__local half4 *)&Bs[r][c] =                                           \
-              *(__global const half4 *)&B[(k0_ + r) * N + blockCol + c];            \
+            if (blockCol + c + VEC <= N)                                            \
+              *(__local half4 *)&Bs[r][c] =                                         \
+                *(__global const half4 *)&BROW(k0_ + r)[blockCol + c];              \
+            else {                                                                  \
+              _Pragma("unroll") for (int v = 0; v < VEC; ++v)                       \
+                Bs[r][c + v] = (blockCol + c + v < N) ? BROW(k0_ + r)[blockCol + c + v] : (half)0; \
+            }                                                                       \
           }                                                                         \
         }                                                                           \
       } else {                                                                      \
@@ -267,10 +306,10 @@ __kernel void gemm_f16(__global const half *restrict A,
             int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                           \
             int gr = k0_ + r, gc = blockCol + c;                                    \
             if (gr < K && gc + VEC <= N) {                                          \
-              *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&B[gr * N + gc]; \
+              *(__local half4 *)&Bs[r][c] = *(__global const half4 *)&BROW(gr)[gc]; \
             } else {                                                                \
               _Pragma("unroll") for (int v = 0; v < VEC; ++v)                       \
-                Bs[r][c + v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0; \
+                Bs[r][c + v] = (gr < K && gc + v < N) ? BROW(gr)[gc + v] : (half)0; \
             }                                                                       \
           }                                                                         \
         }                                                                           \
@@ -281,7 +320,7 @@ __kernel void gemm_f16(__global const half *restrict A,
         if (idx < BK * BN) {                                                        \
           int r = idx / BN, c = idx % BN;                                           \
           int gr = k0_ + r, gc = blockCol + c;                                      \
-          Bs[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : (half)0;                 \
+          Bs[r][c] = (gr < K && gc < N) ? BROW(gr)[gc] : (half)0;                   \
         }                                                                           \
       }                                                                             \
     }                                                                               \
@@ -368,10 +407,10 @@ __kernel void gemm_f16(__global const half *restrict A,
         int r = idx / BC_PR, c = (idx % BC_PR) * VEC;                             \
         int gr = k0_ + r, gc = blockCol + c;                                      \
         if (gr < K && gc + VEC <= N) {                                            \
-          pb[i] = *(__global const half4 *)&B[gr * N + gc];                       \
+          pb[i] = *(__global const half4 *)&BROW(gr)[gc];                       \
         } else {                                                                  \
           _Pragma("unroll") for (int v = 0; v < VEC; ++v)                         \
-            pb[i][v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0;     \
+            pb[i][v] = (gr < K && gc + v < N) ? BROW(gr)[gc + v] : (half)0;     \
         }                                                                         \
       }                                                                           \
     } else {                                                                      \
@@ -380,7 +419,7 @@ __kernel void gemm_f16(__global const half *restrict A,
         int r = idx / (BN / VEC), c = (idx % (BN / VEC)) * VEC;                   \
         int gr = k0_ + r, gc = blockCol + c;                                      \
         _Pragma("unroll") for (int v = 0; v < VEC; ++v)                           \
-          pb[i][v] = (gr < K && gc + v < N) ? B[gr * N + gc + v] : (half)0;       \
+          pb[i][v] = (gr < K && gc + v < N) ? BROW(gr)[gc + v] : (half)0;       \
       }                                                                           \
     }                                                                             \
   } while (0)
@@ -498,7 +537,7 @@ __kernel void gemm_f16(__global const half *restrict A,
       }
       _Pragma("unroll") for (int j = 0; j < TN; ++j) {
         const int gc = blockCol + lx * TN + j;
-        b[j] = (k < K && gc < N) ? B[k * N + gc] : (half)0;
+        b[j] = (k < K && gc < N) ? BROW(k)[gc] : (half)0;
       }
       _Pragma("unroll") for (int i = 0; i < TM; ++i)
         _Pragma("unroll") for (int j = 0; j < TN; ++j)

@@ -92,6 +92,9 @@ std::string OpSignature::str() const
       << "_K" << K << "_G" << groups;
   } else if (op == "conv1x1") {
     o << "|Cout" << Cout << "_N" << N << "_Cin" << Cin;
+  } else if (op == "conv1x1_cat4") {
+    o << "|Cout" << Cout << "_N" << N << "_Cin" << Cin << "_cat";
+    for (size_t i = 0; i < params.size(); ++i) { if (i) o << ","; o << params[i]; }
   } else if (op == "gap") {
     o << "|C" << Cin << "_HW" << N;
   } else {
@@ -134,6 +137,15 @@ OpSignature OpSignature::conv1x1(int Cout, int N, int Cin, int act, int res)
   OpSignature s;
   s.op = "conv1x1"; s.Cout = Cout; s.N = N; s.Cin = Cin; s.act = act;
   if (res) s.groups = 2;  // res 复用 groups 低 bit 仅用于签名区分
+  return s;
+}
+OpSignature OpSignature::conv1x1Cat4(int Cout, int N, int Cin, int ca, int cb, int cc, int cd,
+                                     int act, int res)
+{
+  OpSignature s;
+  s.op = "conv1x1_cat4"; s.Cout = Cout; s.N = N; s.Cin = Cin; s.act = act;
+  s.params = {ca, cb, cc, cd};
+  if (res) s.groups = 2;
   return s;
 }
 OpSignature OpSignature::depthwise(int Wout, int Hout, int stride, int pad, int Cin, int K, int act)
@@ -406,6 +418,11 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
     if (s.K < 64) e *= 0.7;      // 小 K：k-tile 流水 prologue/epilogue 亏（R9）
     if (s.M <= 64) e *= 0.8;     // BM=64 复用降低（R9）
     return std::max(0.5, e);
+  }
+
+  if (s.op == "conv1x1_cat4") {
+    // R30c: 融合 concat；计算仍是 M=Cout,N=HW,K=Cin 的 GEMM（另省 concat 物化）。
+    return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev);
   }
 
   if (s.op == "conv1x1") {

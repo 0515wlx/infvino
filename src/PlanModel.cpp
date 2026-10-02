@@ -275,7 +275,72 @@ void PlanModel::parse()
   for (const auto & o : outputs_)
     if (!T_.count(o)) throw std::runtime_error("PlanModel: output tensor not declared: " + o);
 
+  // R30c：把「4 路 concat -> 1x1 conv」融合（Route A）：conv1x1 走 gemm_f16 的
+  // CAT4 B-staging（B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量），
+  // 省掉 concat 的物化（写+再读），同时保留 gemm_f16 的 tile/流水。
+  fuseConcatConv1x1();
+
   // 预取权重到设备后无需再保留主机侧数据；rt_.write 为阻塞写。
+}
+
+void PlanModel::fuseConcatConv1x1()
+{
+  std::map<std::string, size_t> producer;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producer[o] = i;
+
+  std::map<std::string, int> useCount;
+  for (const auto & n : nodes_)
+    for (const auto & in : n.ins)
+      if (in != "-") ++useCount[in];
+
+  std::vector<char> remove(nodes_.size(), 0);
+  for (auto & n : nodes_)
+  {
+    if (n.op != "conv1x1") continue;
+    if (n.ins.size() < 2 || n.ins[1] == "-") continue;
+    const std::string & xname = n.ins[1];
+    auto pit = producer.find(xname);
+    if (pit == producer.end()) continue;
+    const Node & cat = nodes_[pit->second];
+    if (cat.op != "concat4") continue;
+    if (useCount[xname] != 1) continue;
+    if (attrInt(cat, "outer", 1) != 1) continue;
+    int ca = attrInt(cat, "ca", 0), cb = attrInt(cat, "cb", 0),
+        cc = attrInt(cat, "cc", 0), cd = attrInt(cat, "cd", 0);
+    // 允许尾部的 cd==0 / cc==0（concat 只用了 2–3 路）：对应的源写成 "-"。
+    if (ca <= 0) continue;
+    if (cb <= 0 && cc == 0 && cd == 0) { /* single-source concat: skip (点到点 copy) */ }
+    // 4 个槽位：缺失（cnt==0 或 "-"）的源用一个非空张量占位（内核不会索引它）。
+    bool ok = true;
+    std::string s0 = cat.ins[0], s1 = cat.ins[1], s2 = cat.ins[2], s3 = cat.ins[3];
+    auto real = [&](const std::string & s) { return s != "-" && T_.count(s); };
+    if (!real(s0)) { ok = false; }
+    if (cb > 0 && !real(s1)) ok = false;
+    if (cc > 0 && !real(s2)) ok = false;
+    if (cd > 0 && !real(s3)) ok = false;
+    if (!ok) continue;
+    if (!real(s1)) s1 = s0;
+    if (!real(s2)) s2 = s0;
+    if (!real(s3)) s3 = s0;
+    n.attr["cat_ca"] = std::to_string(ca);
+    n.attr["cat_cb"] = std::to_string(cb);
+    n.attr["cat_cc"] = std::to_string(cc);
+    n.attr["cat_cd"] = std::to_string(cd);
+    n.ins[1] = s0;
+    n.ins.insert(n.ins.begin() + 2, s1);
+    n.ins.insert(n.ins.begin() + 3, s2);
+    n.ins.insert(n.ins.begin() + 4, s3);
+    n.op = "conv1x1_cat4";
+    remove[pit->second] = 1;
+  }
+
+  std::vector<Node> kept;
+  kept.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    if (!remove[i]) kept.push_back(std::move(nodes_[i]));
+  nodes_ = std::move(kept);
 }
 
 void PlanModel::buildKernels()
@@ -908,7 +973,66 @@ void PlanModel::run()
       return getKernel("ops", kernOut, optsOut);
     };
 
-    if (n.op == "conv1x1")
+    if (n.op == "conv1x1_cat4")
+    {
+      // R30c Route A: fused concat4->conv1x1 via gemm_f16 CAT4 B-staging.
+      // A = weight [Cout][Cin]; C = out [Cout][HW]; logical B [Cin][HW] is the
+      // concat of 4 contiguous sources (b0..b3) with channel counts ca/cb/cc/cd.
+      const int act = attrInt(n, "act", 0);
+      auto & w = in(0);
+      const int Cout = static_cast<int>(w.dims[0]);
+      const int Cin  = static_cast<int>(w.dims[1]);
+      const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
+                cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
+      const int64_t anum = in(1).numel();
+      const int HW = (ca > 0) ? static_cast<int>(anum / ca) : 0;
+      cl_mem dA = w.mem, dC = out.mem;
+      cl_mem dB0 = in(1).mem, dB1 = in(2).mem, dB2 = in(3).mem, dB3 = in(4).mem;
+      cl_mem db = (n.ins.size() > 5 && n.ins[5] != "-") ? in(5).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 6 && n.ins[6] != "-") ? in(6).mem : nullptr;
+      // tile: same heuristic as the plain conv1x1 N>1 path.
+      Tiles t;
+      const long grid = static_cast<long>((Cout + t.BM - 1) / t.BM) *
+                        static_cast<long>((HW + t.BN - 1) / t.BN);
+      if (Cout <= 64) t.BM = 64;
+      else if (Cin >= 192 && grid >= 64) { t.BK = 32; t.DBUF = 0; }
+      else { t.BK = 8; t.DBUF = 0; }
+      if (Cin < 32) t.SG = 0;
+      t.EPI = 1; t.ACT = act; t.ASYNC = 0; t.PF = 0; t.GN = 0;
+      std::string gopts = t.options() + " -DCAT4=1";
+      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act,
+                                                       dres ? 1 : 0);
+      if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+      cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
+      auto optInt = [&](const char * key, int def) {
+        const auto p = gopts.find(key);
+        return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(key));
+      };
+      t.BM = optInt("-DBM=", t.BM); t.BN = optInt("-DBN=", t.BN);
+      t.TM = optInt("-DTM=", t.TM); t.TN = optInt("-DTN=", t.TN);
+      clSetKernelArg(kg, 0, sizeof(dA), &dA);
+      clSetKernelArg(kg, 1, sizeof(dB0), &dB0);
+      clSetKernelArg(kg, 2, sizeof(dC), &dC);
+      clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
+      clSetKernelArg(kg, 4, sizeof(HW), &HW);
+      clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+      clSetKernelArg(kg, 6, sizeof(db), &db);
+      clSetKernelArg(kg, 7, sizeof(dres), &dres);
+      clSetKernelArg(kg, 8, sizeof(dB1), &dB1);
+      clSetKernelArg(kg, 9, sizeof(dB2), &dB2);
+      clSetKernelArg(kg, 10, sizeof(dB3), &dB3);
+      clSetKernelArg(kg, 11, sizeof(ca), &ca);
+      clSetKernelArg(kg, 12, sizeof(cb), &cb);
+      clSetKernelArg(kg, 13, sizeof(cc), &cc);
+      const size_t lws[2] = {t.localX(), t.localY()};
+      const size_t gws[2] = {
+        static_cast<size_t>((HW + t.BN - 1) / t.BN) * lws[0],
+        static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1]};
+      timed("conv1x1cat4@" + std::to_string(Cout) + "x" + std::to_string(HW) + "x" +
+              std::to_string(Cin),
+            kg, 2, gws, lws);
+    }
+    else if (n.op == "conv1x1")
     {
       // Round 22: dedicated 1x1 conv / fc path.
       //   * N==1 (HW==1): split-K GEMV (one sub-group per output channel) — the
@@ -1524,6 +1648,15 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
       const int M = (int)ad[0], K = (int)ad[1];
       const int N = (int)(T_.at(n.ins[1]).numel() / K);
       add(OpSignature::gemm(M, N, K, 0));
+    } else if (n.op == "conv1x1_cat4" && want("conv1x1_cat4")) {
+      const int act = attrInt(n, "act", 0);
+      const auto & wd = T_.at(n.ins[0]).dims;
+      const int Cout = (int)wd[0], Cin = (int)wd[1];
+      const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
+                cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
+      const int HW = ca > 0 ? (int)(T_.at(n.ins[1]).numel() / ca) : 0;
+      const bool res = n.ins.size() > 6 && n.ins[6] != "-";
+      add(OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act, res ? 1 : 0));
     } else if (n.op == "conv1x1" && want("conv1x1")) {
       const int act = attrInt(n, "act", 0);
       const auto & wd = T_.at(n.ins[0]).dims;
@@ -1737,6 +1870,74 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         if (merge) tuning_.put(sig, e);
         if (verbose)
           std::printf("  [tune] %-40s best=%-14s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f\n",
+                      sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio);
+      }
+      continue;
+    }
+
+    if (n.op == "conv1x1_cat4" && opInList(ops, "conv1x1_cat4"))
+    {
+      const int act = attrInt(n, "act", 0);
+      auto & w = ref(n.ins[0]);
+      const int Cout = static_cast<int>(w.dims[0]);
+      const int Cin  = static_cast<int>(w.dims[1]);
+      const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
+                cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
+      const int64_t anum = ref(n.ins[1]).numel();
+      const int HW = (ca > 0) ? static_cast<int>(anum / ca) : 0;
+      cl_mem dA = w.mem, dC = ref(n.outs[0]).mem;
+      cl_mem dB0 = ref(n.ins[1]).mem, dB1 = ref(n.ins[2]).mem,
+             dB2 = ref(n.ins[3]).mem, dB3 = ref(n.ins[4]).mem;
+      cl_mem db = (n.ins.size() > 5 && n.ins[5] != "-") ? ref(n.ins[5]).mem : nullptr;
+      cl_mem dres = (n.ins.size() > 6 && n.ins[6] != "-") ? ref(n.ins[6]).mem : nullptr;
+      const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, act,
+                                                       dres ? 1 : 0);
+      if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
+      if (!shouldTune(sig)) continue;
+      const double flops = 2.0 * Cout * static_cast<double>(HW) * Cin;
+      // reuse the gemm candidate spectrum; each candidate is compiled with -DCAT4=1.
+      std::vector<Candidate> cands = candidatesGemm(OpSignature::gemm(Cout, HW, Cin, act));
+      for (auto & c : cands) {
+        c.options += " -DCAT4=1";
+        c.options += " -DEPI=1 -DACT=" + std::to_string(act);
+      }
+      auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
+        auto optInt = [&](const char * k, int def) {
+          const auto p = c.options.find(k);
+          return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
+        };
+        const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
+                  TN = optInt("-DTN=", 4);
+        clSetKernelArg(kg, 0, sizeof(dA), &dA);
+        clSetKernelArg(kg, 1, sizeof(dB0), &dB0);
+        clSetKernelArg(kg, 2, sizeof(dC), &dC);
+        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
+        clSetKernelArg(kg, 4, sizeof(HW), &HW);
+        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
+        clSetKernelArg(kg, 6, sizeof(db), &db);
+        clSetKernelArg(kg, 7, sizeof(dres), &dres);
+        clSetKernelArg(kg, 8, sizeof(dB1), &dB1);
+        clSetKernelArg(kg, 9, sizeof(dB2), &dB2);
+        clSetKernelArg(kg, 10, sizeof(dB3), &dB3);
+        clSetKernelArg(kg, 11, sizeof(ca), &ca);
+        clSetKernelArg(kg, 12, sizeof(cb), &cb);
+        clSetKernelArg(kg, 13, sizeof(cc), &cc);
+        const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
+        const size_t gws[2] = {
+          static_cast<size_t>((HW + BN - 1) / BN) * lws[0],
+          static_cast<size_t>((Cout + BM - 1) / BM) * lws[1]};
+        return [this, kg, gws, lws]() {
+          return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
+        };
+      };
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      if (!e.kernel.empty()) {
+        done[sig.str()] = e;
+        ++n_tuned;
+        if (merge) tuning_.put(sig, e);
+        if (verbose)
+          std::printf("  [tune] %-40s best=%-16s %6.3f ms  ops=%5.2f exp=%5.2f ratio=%.2f\n",
                       sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.expected, e.ratio);
       }
       continue;

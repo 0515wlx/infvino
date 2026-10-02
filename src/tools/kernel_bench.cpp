@@ -772,6 +772,40 @@ int benchMemBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
   return 0;
 }
 
+// R30c: read-vs-write asymmetry at a given footprint (DRAM when large).
+int benchReadWrite(gk::ClRuntime & rt, size_t mb, int fi)
+{
+  const size_t n = mb * 1024 * 1024 / 4;  // float elements
+  cl_kernel kw = rt.buildKernel("stream_rw", "wr_only", "-cl-mad-enable");
+  cl_kernel kr = rt.buildKernel("stream_rw", "rd_only", "-cl-mad-enable");
+  cl_kernel ks = rt.buildKernel("stream_rw", "rd_sum", "-cl-mad-enable");
+  cl_mem in = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+  cl_mem out = rt.alloc(n * 4, CL_MEM_WRITE_ONLY);
+  { std::vector<float> z(n, 1.0f); rt.write(in, n * 4, z.data()); }
+  const uint nn = static_cast<uint>(n), C = 8;
+  const size_t lws = 256, gws = ((n + lws - 1) / lws) * lws;
+  const float c = 1.0f;
+  clSetKernelArg(kw, 0, sizeof(out), &out); clSetKernelArg(kw, 1, sizeof(nn), &nn);
+  clSetKernelArg(kw, 2, sizeof(c), &c);
+  clSetKernelArg(kr, 0, sizeof(in), &in); clSetKernelArg(kr, 1, sizeof(out), &out);
+  clSetKernelArg(kr, 2, sizeof(nn), &nn);
+  const uint nout = static_cast<uint>(n / C);
+  const size_t gs = ((nout + lws - 1) / lws) * lws;
+  clSetKernelArg(ks, 0, sizeof(in), &in); clSetKernelArg(ks, 1, sizeof(out), &out);
+  clSetKernelArg(ks, 2, sizeof(nout), &nout); clSetKernelArg(ks, 3, sizeof(C), &C);
+  const double tw = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kw, 1, &gws, &lws); }, 2, fi);
+  const double tr = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kr, 1, &gws, &lws); }, 2, fi);
+  const double ts = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), ks, 1, &gs, &lws); }, 2, fi);
+  const double wb = (double)n * 4 / 1e9;
+  std::printf("  rw %zu MB  write-only %.3f ms %6.1f GB/s | read-only %.3f ms %6.1f GB/s | "
+              "rd_sum(C=%u) %.3f ms (read %6.1f + write %4.1f GB/s)\n",
+              mb, tw, wb / (tw * 1e-3), tr, wb / (tr * 1e-3), C, ts,
+              wb / (ts * 1e-3), (wb / C) / (ts * 1e-3));
+  clReleaseMemObject(in); clReleaseMemObject(out);
+  clReleaseKernel(kw); clReleaseKernel(kr); clReleaseKernel(ks);
+  return 0;
+}
+
 // Read-only bandwidth vs footprint with an internal pass loop, so even small
 // footprints keep the launch long enough to be bandwidth-bound (L1/LLC tiers).
 int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
@@ -992,6 +1026,9 @@ int main(int argc, char ** argv)
     std::printf("[membw] streaming read bandwidth vs footprint\n");
     if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};
     rc = benchMemBw(rt, sizes_kb, 2);
+  } else if (op == "rwbw") {
+    std::printf("[rwbw] write vs read vs rd_sum asymmetry (footprint = --mb)\n");
+    rc = benchReadWrite(rt, mb, 2);
   } else if (op == "scanbw") {
     std::printf("[scanbw] read-only bandwidth vs footprint (internal passes)\n");
     if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 512, 1024, 2048};

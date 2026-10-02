@@ -288,7 +288,52 @@ attention 两个 shape（`[1,2,400,32,400]` 用 TM8×TN4、`[1,2,64,400,400]` �
 
 ---
 
-### 7.3 负结果：attention 转置的 SLM 分块（已回退）
+### 7.3 负结果：concat→conv1x1 融合（Route B，已回退）
+
+**动机**：每个 `concat4` 的唯一消费者都是 `conv1x1`（y8 13 条 / y11 17 条），
+`concat4` 占整网 ~10% busy 且已贴 DRAM 墙。写一个专用 `conv1x1_cat4_f16`
+（lane=空间，直接吃 4 个 concat 源张量、按 `ca/cb/cc/cd` 定位源内偏移，省掉 concat
+的写+读）。
+
+**实测（locally tuned，独立扫描 TM/TN/SG/UNROLL）**：
+
+| 层 | fused `conv1x1_cat4` | 现路径 `conv1x1(gemm_f16)` + `concat4` |
+|---|---:|---:|
+| Cout64 N6400 Cin128 | **0.815 ms** | 0.130 + ~0.09 |
+| Cout128 N1600 Cin256 | **0.789 ms** | 0.122 + ~0.06 |
+| Cout256 N400 Cin512 | **1.135 ms** | 0.184 + ~0.06 |
+
+→ **融合版慢 3–5×**。根因：现路径的 `conv1x1` 走的是 **SLM 分块的 `gemm_f16`**
+（BM=64 等，复用 + 流水），而这个前向的简单 scalar-GEMM（TM×TN、lane=空间、
+每 ci 两次宽载）达不到那个复用/流水；省下的 concat 物化（~0.1 ms/层）远不够赔。
+**结论：Route B 负结果，已回退。** 真正的收益路径是 Route A（见 §7.5，已落地）。
+
+### 7.5 正结果：concat→conv1x1 融合（Route A，已落地）
+
+Route B 的教训是「别自己重写 GEMM」。Route A 保留调好的 **`gemm_f16`**，只把 B 的
+**取址**改掉：给 `gemm.cl` 加 `-DCAT4=1`，B 的逻辑行 `K=Cin` 按 `ca/cb/cc/cd` 重定向到
+4 个源张量（每行内仍连续 → 向量化 staging 不变），核心是 `BROW(gr)` 宏。默认路径
+（CAT4=0）展开后与原来逐字节相同。
+
+- 解析期改写：`fuseConcatConv1x1()` 把 `concat4 -> conv1x1` 折成 `conv1x1_cat4`
+  （y8 11 / y11 13 条），concat 节点删除；`outer==1`、concat 输出仅此一个消费者时才做。
+  3 路 concat（cd=0）也支持（缺失源填占位指针、cnt=0）。
+- 调优：`OpSignature::conv1x1Cat4` + 复用 gemm 候选谱系（带 `-DCAT4=1 -DEPI=1 -DACT=`），
+  17 条签名入缓存。
+
+**实测（同会话 A/B，`kernel_run --report --iters 5`，warming 后）**：
+
+| 模型 | baseline busy | **Route A busy** | 变化 |
+|---|---:|---:|---:|
+| yolov8n-pose | 14.49 ms | **13.62 ms** | **−6.0%** |
+| yolo11n-pose | 15.84 ms | **14.70 ms** | **−7.2%** |
+| mobilenetv3-small |（无 concat→1x1）| 2.84 ms | — |
+
+`model_check` 三模型 **PASS**，误差与基线**逐位一致**（y8 `5.278e-4/8.874e-3`、
+y11 `8.945e-4/1.773e-2`、mb `1.306e-2/1.086e-2`）——证明融合不改变任何数值。
+`concat4` 从 1.55 ms 降到 ~0.34 ms（只剩 6 条非 1x1 的 concat）。
+
+### 7.4 负结果：attention 转置的 SLM 分块（已回退）
 
 `permute` mode 1（attention `[1,2,400,400]` 的最后两轴转置）实测 0.44× 内存模型上限，
 是个跨步写问题（2 B store 跨 D2 → 每个 store 触一个 L3 sector）。试了 SLM 分块
@@ -298,12 +343,53 @@ attention 两个 shape（`[1,2,400,32,400]` 用 TM8×TN4、`[1,2,64,400,400]` �
 
 ---
 
+## 7.6 「多读少写」的实测结论与算法设计
+
+用户假设：低算术强度算子应尽量 L3 命中，用「多读、少写」换性能。本机实测（`kernel_bench
+--op rwbw`，见 §2 与下表）**推翻了这个假设的一半**：
+
+| 足迹 | write-only | read-only | rd_sum(C=8，读 8 写 1) |
+|---:|---:|---:|---:|
+| 1 MB | 81.5 GB/s | 60.8 | read 27.4 + write 3.4（0.038 ms）|
+| 4 MB | 72.0 | 29.2 | read 37.6 + write 4.7（0.112 ms）|
+| 8 MB | 52.9 | 28.5 | read 29.6 + write 3.7（0.284 ms）|
+| 16 MB | 23.4 | 31.6 | read 24.4 + write 3.1 |
+| 64 MB | **21.7** | **22.9** | read 18.6 + write 2.3 |
+
+关键读数：
+
+1. **DRAM 上 write ≈ read（21.7 vs 22.9 GB/s）**——没有「写更贵」。所以「多读少写」
+   本身不会快，除非**多出来的读能命中 L3**（L3 里 write 72 vs read 29，反而写更快）。
+2. **`rd_sum` 永远比 pure read 或 pure write 慢**：它是 read+write 两股流量之和，
+   和 `copy` 同性质（读+写都要过同一套 DRAM/L3 端口）。→ **真正的成本是总字节
+   `R+W`，而不是 W。**
+3. 因此「减少写」只有在**同时减少读或把读留在 L3**时才有意义——即**消除中间物的
+   物化**（producer→consumer 之间不再写一次、再读一次）。这正是 Route A 的做法。
+
+**据此的算法设计原则（已用于 Route A，也是后续方向）**：
+
+- **消除物化链**：`Split(copy_c) → Concat → Conv1x1` 这类「复制+拼接+再读」链，
+  让最终消费者直接读**最初的父张量**。Route A 把 concat 整个删掉，只保留一次读取。
+- **单次读写、就地复用**：能 alias 就 alias（`copy_c`/`slice`/`reshape` 若其消费者
+  支持 base-offset），否则走「消费者直接取源」。
+- **不要新增读**：`rd_sum` 式「读更多、写更少」在本机是负优化（端口共享），除非新增的
+  读确定命中 L3（≤ ~3.75 MB 的层）。
+
+**剩余可做的事（按落地后的账本）**：
+1. `copy_c`（Split）单独消除：消费者若支持 base-offset，可直接读父张量；预计再省
+   1.7 MB 读 + 1.7 MB 写（y8）。
+2. `concat4` 中 **非 conv1x1 消费者**的 6 条（tail 的 reshape/ew_binary/ew_unary）：
+   这些 concat 的 outer=64/51/17，沿最后轴拼接，可试 3-D 网格 + SLM 分块，或让消费者
+   直接读源。
+3. `resize_nn` / `permute` 的跨步访问（§4.1 的 2× 空间）：都属「一次读一次写」，
+   只能说减少跨步、不能靠「多读少写」。
+
 ## 8. 下一步（按预期收益）
 
 1. ~~pose-decode 广播（标量分支 + 3-D 网格 stride 核）~~（**已落地**，整网 −1.8%）。
 2. `maxpool` 向量化 tap（去边界谓词 + 一次读 K² 个连续 half）。
 3. `softmax` 的 2 趟（在线 max+sum）或减少写回读。
-4. `concat` 融合进下游 conv（结构改动，收益最大但风险高，属独立一轮）。
+4. ~~`concat` 融合进下游 conv~~（**Route A 已落地**，y8 −6.0% / y11 −7.2%）。
 5. `depthwise` 去边界谓词的 interior fast path（R28 FIT 思路）。
 
 ---

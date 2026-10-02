@@ -142,6 +142,8 @@ private:
   };
 
   void    parse();
+  /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
+  void    fuseConcatConv1x1();
   void    buildKernels();
   void    releaseKernels();
   void    dispatch(const Node & n);
