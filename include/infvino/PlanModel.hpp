@@ -97,7 +97,8 @@ public:
    */
   std::map<std::string, TuningEntry> autotune(
     const std::vector<std::string> & ops = {}, const std::string & onlySubstr = "",
-    int limit = 0, int iters = 30, bool merge = true, bool verbose = false);
+    int limit = 0, int iters = 30, bool merge = true, bool verbose = false,
+    bool retune = false);
 
   /** @brief 列出计划里可调优的唯一签名（不触碰 GPU，用于分批/审计）。 */
   std::vector<std::string> tuningTargets(const std::vector<std::string> & ops = {}) const;

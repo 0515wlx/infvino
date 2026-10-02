@@ -43,7 +43,7 @@ int main(int argc, char ** argv)
   std::string plan_path, cache_path, kernel_dir, only, bake_out;
   std::vector<std::string> ops;
   int  limit = 0, iters = 30;
-  bool report = false, expected = false, bake = false, list = false;
+  bool report = false, expected = false, bake = false, list = false, retune = false;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -59,6 +59,7 @@ int main(int argc, char ** argv)
     else if (a == "--report") report = true;
     else if (a == "--expected") expected = true;
     else if (a == "--list") list = true;
+    else if (a == "--retune") retune = true;
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -70,6 +71,7 @@ int main(int argc, char ** argv)
         "  --limit N          本次最多调优 N 个签名（0=不限；安全分批推荐 3–5）\n"
         "  --iters N          每个候选的计时迭代数（默认 30）\n"
         "  --list             只列出唯一签名，不跑 GPU 计时\n"
+        "  --retune           忽略缓存里已有的 tuned 条目，强制重新扫描（候选/标准更新后用）\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
         "  --bake <out.plan>  额外复制一份 plan（审计；运行时以 cache 为准）\n"
@@ -102,7 +104,8 @@ int main(int argc, char ** argv)
       return 0;
     }
 
-    auto done = model.autotune(ops, only, limit, iters, /*merge=*/true, /*verbose=*/report);
+    auto done = model.autotune(ops, only, limit, iters, /*merge=*/true, /*verbose=*/report,
+                               /*retune=*/retune);
 
     if (expected)
     {

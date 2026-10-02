@@ -1053,19 +1053,21 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
 
 std::map<std::string, TuningEntry> PlanModel::autotune(
   const std::vector<std::string> & ops, const std::string & onlySubstr, int limit, int iters,
-  bool merge, bool verbose)
+  bool merge, bool verbose, bool retune)
 {
   std::map<std::string, TuningEntry> done;
   int n_tuned = 0;
   std::map<std::string, int> sig_seen;  // 同一签名只调一次（plan 里大量层共享签名）
   // 返回 true 表示该签名还未调过（并登记）；false 表示跳过。
   // 已在本进程调过、或缓存里已有 source=="tuned" 的条目 → 跳过（让分批调用自然推进）。
+  // retune=true 时忽略已有 tuned 条目（用于候选集/中间标准更新后重扫）。
   auto shouldTune = [&](const OpSignature & sig) {
     const std::string k = sig.str();
     if (sig_seen.count(k)) return false;
     sig_seen[k] = 1;
-    if (const TuningEntry * e = tuning_.lookup(sig))
-      if (e->source == "tuned") return false;
+    if (!retune)
+      if (const TuningEntry * e = tuning_.lookup(sig))
+        if (e->source == "tuned") return false;
     return true;
   };
 
