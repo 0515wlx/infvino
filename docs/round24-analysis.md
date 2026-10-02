@@ -94,7 +94,9 @@ ocloc disasm -file /tmp/ov_tgllp.bin -device tgllp -dump /tmp/ov
 
 1. **大空间/大通道（80×80 s1，ratio 0.53–0.69）**：最接近指令配额；缺口是**内存/send 延迟**
    （每 2 个输入通道 13 条 `send` + 4 条 `sync.nop`）。可压榨空间 ~30%。
-2. **中空间（40×40 s1/s2，ratio 0.34–0.49）**：占总时 ~85% 的关键类。block 扫描（本轮实测）：
+2. **中空间（40×40 s1/s2，ratio 0.34–0.49）**：`conv3x3` 合计占 yolov8n kernel busy ~64%，
+   其中单签名最大的是 `40×40 s1 64→64`（×10，1.39 ms，~9%）与 `80×80 s1 64→64`
+   （×4，1.33 ms，~9%）。block 扫描（本轮实测）：
 
    | OBW,OBH | 累加器 | grid | ops |
    |---|---:|---:|---:|
@@ -174,16 +176,38 @@ ocloc disasm -file /tmp/ov_tgllp.bin -device tgllp -dump /tmp/ov
 
 ---
 
+## 4.5 split-K 预实验（两个廉价 proxy 直接否决）
+
+「提高 grid/占用」的第一直觉是 split-K（按输入通道路由到更多 WG）。在动手写两 kernel 的
+归约之前，先用两个**只改 shape、不改 kernel** 的 proxy 验证前提：
+
+| proxy | 变化 | 实测 ops | 说明 |
+|---|---|---:|---|
+| Cin 扫描 @40×40 8×1 C64 | Cin 64→32（= split-K S=2 的每 WG 工作量）| 8.74 → **6.62（−24%）** | 每 WG 固定开销 ≈ 27% |
+| | Cin 16（= S=4）| 4.44 | |
+| grid 扫描 @Cin64 8×1 | grid 400 | 8.77 | |
+| | grid 800 | ~9.0（+3%） | |
+| | grid 1600 | **11.0（+25%）** | 只有到 ~1600 WG 才有明显收益 |
+
+判读：**split-K 是拿确定的 −24%（工作/WG 减半）换 +3% 的 grid 收益**，S=4 更是灾难
+（Cin=16 → 4.44）。grid 曲线也说明 40×40 的问题是**波量化**：max 并发 ≈ 80 EU × 7 线程
+= 560 sub-group，400 WG = 0.71 波、800 = 1.43 波（利用率仍 ~0.71）、1600 = 2.86 波（~0.95）——
+即 400→800 几乎无收益、1600 才满，而不是「WG 越多越好」。
+→ **split-K 不论 S=2/4 在本机都不划算，已放弃实现。**
+
+---
+
 ## 5. 下一步（按预期收益排序）
 
-1. **split-K（输入通道分组）提高 40×40 类的 grid/占用**——这是第 2.1 节里唯一还没试过、
-   且直接命中「网格/占用」这个大头的结构手段（40×40 s1 64→64 占 yolov8 总时 ~85%）。
-   代价是部分和归约（L3 常驻，非 DRAM）。
-2. **去掉每元素边界谓词的输入 gather 与 scatter 输出**（内部块的 fast path）。ISA 里
-   输入块是逐元素 `byte gathering read 16b` + `if/else` 谓词，输出是 `byte scattering
-   write 16b`；内部块（80×80 约 72%）可走 `intel_sub_group_block_read`/合并写。
+1. **压每 WG 的固定/延迟开销（真正的短板，~27%）**：ISA 显示输入是逐元素
+   `byte gathering read 16b` + `if/else` 谓词、输出是 `byte scattering write 16b`。
+   对内部块（80×80 约 72%）走 `intel_sub_group_block_read`/合并写，削掉谓词与散列访存，
+   同时让 prologue/epilogue 更短。**这是当前证据指向的第一杠杆。**
+2. **波/网格量化**：40×40 类无论怎么调 block 都受限于 `spatial×Cout/32`（≤400 WG < 560），
+   靠调 grid 无法补齐；只能靠减少每波里的停顿（同上）或换问题切分（split-K 已否决）。
 3. **VECO/OSV64：每 lane 4 个输出通道**，让 1 条广播喂 2 个 `half2` mad（提高每广播算术量）。
-   风险：128 GRF（R21 的寄存器墙）；仅在 OBW*OBH 小时试。
+   注意：VECO 会在保持工作/WG 的同时把 `Cout/(SG·VECO)` 的通道组数减半，
+   **grid 不增**（见 §2.1 的推导），因此它只改善指令配额，不改善占用；风险：128 GRF。
 4. **重跑逐层 autotune**（新候选覆盖 stride=2 native；新中间标准可自动指出最远的层）。
 
 ---

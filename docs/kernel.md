@@ -1761,6 +1761,8 @@ OSV 2025.2（同一块 iGPU，per-node GPU 时间）整网：yolov8-pose 9.33 ms
 9.61 ms / mobilenet 0.96 ms；端到端（含预处理）11.24 / 11.82 / 1.78 ms。
 infvino R22 之后 kernel busy：~19.9 / ~23.0 / ~3.5 ms。**差距主要在 conv3x3**：
 yolov8 里 `conv3x3ov@40x40s1_Cin64_Cout64` 单层 1.49 ms ×10 = ~15 ms，占总时间 ~85%。
+（**R24 更正**：实测这 10 个层**合计** 1.39 ms（`kernel_run --report`），占 yolov8n kernel busy
+~9%；conv3×3 **合计**占 ~64%。R23 这里把「10 层合计」误写成单层再 ×10，放大了 10×。）
 
 ### 23.2 已落地的两项**真实、过数值**的收益
 
@@ -1773,7 +1775,7 @@ yolov8 里 `conv3x3ov@40x40s1_Cin64_Cout64` 单层 1.49 ms ×10 = ~15 ms，占�
 
 ### 23.3 conv3x3 差距定位：**网格饥饿**，不是单核算术
 
-对 40x40 Cin64 Cout64（占总时 ~85%）做 block 扫描（osv32 的 OBW/OBH）：
+对 40x40 Cin64 Cout64（占总时 ~85%）（**R24 更正：该 10 层合计 ~9%，conv3×3 合计 ~64%**）做 block 扫描（osv32 的 OBW/OBH）：
 
 | cfg | 8,2 | 5,2 | 6,2 | 4,4 |
 |---|---|---|---|---|
@@ -1816,7 +1818,7 @@ R23（3-D concat + 新 PlanModel）本身数值正确，`concat4` 是纯 copy、
 | yolo11n-pose | ~23.0 ms | **~20.1 ms** | ~25 ms | 11.8 ms |
 | mobilenetv3-small | ~3.5 ms | ~3.5 ms | ~4.6 ms | 1.8 ms |
 
-剩余差距集中在 conv3x3（占 yolov8 ~85%，已到 osv32 的 ~8–13 ops），以及 yolo 的
+剩余差距集中在 conv3x3（占 yolov8 ~64%（R24 更正，见上），已到 osv32 的 ~8–13 ops），以及 yolo 的
 `concat4`（已优化到带宽极限）与 attention。下一步若继续，方向应是
 「完整移植 OV 阻塞 conv + 逐层 autotune」，属大工程。
 
@@ -1862,10 +1864,21 @@ R23（3-D concat + 新 PlanModel）本身数值正确，`concat4` 是纯 copy、
   由调优器按 size 选通路；
 - 数值：`kernel_check --skip-gemm` **ALL PASS**（OV / native / conv1x1 / gemv）。
 
-### 24.5 下一步
+### 24.5 split-K 预实验（**否决**）
 
-split-K 提高 40×40 类 grid/占用（最大头）；内部块 fast path 去掉逐元素 gather/scatter；
-VECO=OSV64（每广播多算，注意 128-GRF 墙）；重跑逐层 autotune。
+在写两 kernel 归约前，用两个只改 shape 的 proxy 验证「更多 grid」的前提：
+**(a) Cin 扫描**（≈拆 K）：Cin 64→32（S=2）ops 8.74→**6.62（−24%）**；Cin 16（S=4）→4.44。
+每 WG 固定/延迟开销 ≈ 27%。
+**(b) grid 扫描**（固定 Cin64、8×1）：grid 400=8.77、800≈9.0（+3%）、1600=**11.0（+25%）**。
+→ 400 WG 的问题不是「grid 少」，而是**波量化**（并发 ≈ 80×7=560 sub-group；800 WG 仍是
+1.43 波，利用率 ~0.71）。split-K 拿确定的 −24% 换 +3%，**S=2/4 都不划算，已放弃**。
+
+### 24.6 下一步
+
+1. **压每 WG 的固定/延迟开销**（~27%，第一杠杆）：内部块 fast path，去掉输入
+   `byte gathering read` + 边界谓词与输出 `byte scattering write`。
+2. VECO/OSV64（每 lane 4 通道）只改善指令配额、**不增加 grid**，作为次选。
+3. 重跑逐层 autotune（native 覆盖 stride=2；新中间标准自动指出最远层）。
 
 
 ## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
