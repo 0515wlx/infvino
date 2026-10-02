@@ -50,6 +50,18 @@
 #ifndef SG
 #define SG 16
 #endif
+// Round 28 (P2): compile-time shape specialization (see conv_ov.cl). Removing the
+// leftover predicates when the shape is tile/channel aligned lets IGC drop the
+// branch entirely (numerically identical).
+#ifndef FIT_WH
+#define FIT_WH 0          // Wout % OBW == 0 && Hout % 1 == 0
+#endif
+#ifndef FIT_COUT
+#define FIT_COUT 0        // Cout % 16 == 0
+#endif
+#ifndef FIT_CIN
+#define FIT_CIN 0         // Cin % 16 == 0
+#endif
 
 #define FEATURE_SLICE_SIZE 16
 // INPUT_LINE_SIZE = stride*(OBW-1) + (3-1)*dil + 1 = stride*(OBW-1) + 3
@@ -125,7 +137,11 @@ __kernel void conv3x3_blk(
 
   for (int icb = 0; icb < ic_blocks; ++icb) {
     const int gc = icb * 16 + lid;                 // this lane's input channel
+#if FIT_CIN
+    const bool in_left = false;
+#else
     const bool in_left = (gc >= Cin);              // input-channel leftover
+#endif
     const int fs_off = input_offset + icb * input_fs_pitch;
 #pragma unroll
     for (int kh = 0; kh < 3; ++kh) {
@@ -187,12 +203,20 @@ __kernel void conv3x3_blk(
   }
 
   const int oc = f_block * 16 + lid;
+#if FIT_COUT
+  const bool out_left = false;
+#else
   const bool out_left = (oc >= Cout);
+#endif
   half b = (bias != 0 && !out_left) ? bias[oc] : (half)0;
 #pragma unroll
   for (int i = 0; i < OBW; ++i) {
     const int ox = x + i;
+#if FIT_WH
+    if (!out_left)
+#else
     if (!out_left && ox < Wout && y < Hout)
+#endif
       output[((size_t)oc * Hout + y) * Wout + ox] = blk_activate(dst[i] + b);
   }
 }

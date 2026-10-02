@@ -57,6 +57,24 @@ PlanModel::PlanModel(
   buildKernels();
   tuning_ = TuningCache::loadDefault();
   tuning_.setDeviceId(TuningCache::deviceKey(rt_.info()));
+
+  // P3: 在线调优（opt-in）。默认关闭——开发板上跑长 GPU 任务有风险，部署端若要
+  // 自适应再显式打开 `INFVINO_TUNING=online`（需要 profiling=true 才能计时）。
+  // 只调优「缓存未命中」的签名，且用 INFVINO_ONLINE_BUDGET 限制数量。
+  {
+    const char * online = std::getenv("INFVINO_TUNING");
+    if (online && std::string(online) == "online" && profiling_) {
+      const char * be = std::getenv("INFVINO_ONLINE_BUDGET");
+      const char * ie = std::getenv("INFVINO_ONLINE_ITERS");
+      const int budget = be ? std::atoi(be) : 4;
+      const int iters  = ie ? std::atoi(ie) : 5;
+      const char * oe = std::getenv("INFVINO_ONLINE_OPS");
+      std::vector<std::string> oops =
+        oe ? splitCsv(oe) : std::vector<std::string>{"conv3x3", "conv1x1", "depthwise"};
+      const int n = onlineTuneMissing(budget, iters, oops);
+      if (n > 0) std::fprintf(stderr, "[online-tune] tuned %d signature(s)\n", n);
+    }
+  }
 }
 
 PlanModel::~PlanModel()
@@ -302,6 +320,386 @@ cl_kernel PlanModel::getKernel(
   return k;
 }
 
+cl_mem PlanModel::bcastDims(const std::string & spec)
+{
+  auto it = small_buf_.find(spec);
+  if (it != small_buf_.end()) return it->second;
+  std::vector<int> all;
+  std::stringstream ss(spec);
+  std::string tk;
+  while (std::getline(ss, tk, ',')) all.push_back(std::atoi(tk.c_str()));
+  cl_mem m = rt_.alloc(all.size() * 4, CL_MEM_READ_ONLY);
+  rt_.write(m, all.size() * 4, all.data());
+  small_buf_[spec] = m;
+  owned_.push_back(m);   // 生命周期与模型一致（比每次 run 分配/释放更省）
+  return m;
+}
+
+OpSignature PlanModel::smallSig(const Node & n) const
+{
+  const int64_t nout = T_.at(n.outs[0]).numel();
+  auto dimOf = [&](int i) -> int64_t {
+    return i < static_cast<int>(T_.at(n.ins[i]).dims.size()) ? T_.at(n.ins[i]).dims[i] : 1;
+  };
+  if (n.op == "ew_binary")
+  {
+    const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0),
+              bs = attrInt(n, "b_scalar", 0);
+    if (n.attr.count("bdims"))
+    {
+      int C = 0;
+      const Tensor & ta = T_.at(n.ins[0]);
+      const Tensor & tb = T_.at(n.ins[1]);
+      const Tensor * ts = nullptr;
+      if (ta.numel() != nout && tb.numel() == nout) ts = &ta;
+      else if (tb.numel() != nout && ta.numel() == nout) ts = &tb;
+      if (ts && ts->numel() > 0)
+      {
+        int nonunit = 0, dimpos = -1;
+        for (size_t i = 0; i < ts->dims.size(); ++i)
+          if (ts->dims[i] != 1) { ++nonunit; dimpos = static_cast<int>(i); }
+        const Tensor & tl = (ts == &ta) ? tb : ta;
+        const auto &   ld = tl.dims;
+        const int      chidx = ld.size() >= 3 ? static_cast<int>(ld.size()) - 3 : 0;
+        if (nonunit == 1 && dimpos == chidx && ld[chidx] == ts->numel())
+          C = static_cast<int>(ts->numel());
+      }
+      return OpSignature::custom("ew_binary_bcast", {nn, op, bs, C});
+    }
+    return OpSignature::custom("ew_binary", {nn, op, bs});
+  }
+  if (n.op == "ew_unary")
+    return OpSignature::custom("ew_unary", {static_cast<int>(nout), attrInt(n, "op", 0)});
+  if (n.op == "copy_c")
+    return OpSignature::custom("copy_c", {attrInt(n, "HW", 1), attrInt(n, "cnt", 0)});
+  if (n.op == "slice_axis")
+    return OpSignature::custom("slice_axis", {attrInt(n, "outer", 1), attrInt(n, "axdim", 0),
+                                              attrInt(n, "inner", 1), attrInt(n, "start", 0),
+                                              attrInt(n, "len", 0)});
+  if (n.op == "concat4")
+    return OpSignature::custom("concat4", {attrInt(n, "outer", 1), attrInt(n, "inner", 1),
+                                           attrInt(n, "ca", 0), attrInt(n, "cb", 0),
+                                           attrInt(n, "cc", 0), attrInt(n, "cd", 0)});
+  if (n.op == "maxpool")
+    return OpSignature::custom("maxpool", {attrInt(n, "C", 0), attrInt(n, "H", 0),
+                                           attrInt(n, "W", 0), attrInt(n, "Hout", 0),
+                                           attrInt(n, "Wout", 0), attrInt(n, "K", 5),
+                                           attrInt(n, "S", 1), attrInt(n, "P", 2)});
+  if (n.op == "resize_nn")
+    return OpSignature::custom("resize_nn", {attrInt(n, "C", 0), attrInt(n, "H", 0),
+                                             attrInt(n, "W", 0), attrInt(n, "S", 2)});
+  if (n.op == "permute_0213")
+    return OpSignature::custom("permute_0213", {attrInt(n, "D1", 1), attrInt(n, "D2", 1),
+                                                attrInt(n, "I", 1), attrInt(n, "mode", 0)});
+  if (n.op == "bmm")
+    return OpSignature::custom("bmm", {static_cast<int>(dimOf(0)), static_cast<int>(dimOf(1)),
+                                       static_cast<int>(dimOf(2)), static_cast<int>(dimOf(3)),
+                                       static_cast<int>(T_.at(n.ins[1]).dims[3])});
+  if (n.op == "gap")
+    return OpSignature::gap(attrInt(n, "C", 0), attrInt(n, "HW", 1));
+  return OpSignature::custom(n.op, {});
+}
+
+void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & kernel,
+                            const std::string & opts, cl_uint & dim, size_t * gws,
+                            size_t * lws, bool & useLws)
+{
+  dim = 1;
+  useLws = false;
+  auto inMem = [&](size_t i) -> cl_mem {
+    return (i < n.ins.size() && n.ins[i] != "-" && T_.count(n.ins[i])) ? ref(n.ins[i]).mem
+                                                                      : nullptr;
+  };
+  const int64_t nout = ref(n.outs[0]).numel();
+  cl_mem dy = ref(n.outs[0]).mem;
+  auto optInt = [&](const char * key, int def) {
+    const auto p = opts.find(key);
+    return p == std::string::npos ? def : std::atoi(opts.c_str() + p + std::strlen(key));
+  };
+  const bool isVec = kernel.find("_v") != std::string::npos;
+  auto vecN = [&](int64_t count) -> size_t {
+    const int v = std::max(1, optInt("-DEW_VEC=", 4));
+    return static_cast<size_t>((count + v - 1) / v);
+  };
+
+  if (n.op == "ew_binary")
+  {
+    const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
+    cl_mem da = inMem(0), db = inMem(1);
+    clSetKernelArg(k, 0, sizeof(da), &da);
+    clSetKernelArg(k, 1, sizeof(db), &db);
+    clSetKernelArg(k, 2, sizeof(dy), &dy);
+    clSetKernelArg(k, 3, sizeof(nn), &nn);
+    clSetKernelArg(k, 4, sizeof(op), &op);
+    const int bs = attrInt(n, "b_scalar", 0);
+    clSetKernelArg(k, 5, sizeof(bs), &bs);
+    gws[0] = isVec ? vecN(nn) : static_cast<size_t>(nn);
+    return;
+  }
+  if (n.op == "ew_binary_bcast")
+  {
+    const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
+    cl_mem da = inMem(0), db = inMem(1);
+    if (kernel == "ew_binary_ch")
+    {
+      const Tensor & ta = ref(n.ins[0]);
+      const Tensor & tb = ref(n.ins[1]);
+      const Tensor * ts = nullptr;
+      int a_ch = 0;
+      if (ta.numel() != nout && tb.numel() == nout) { ts = &ta; a_ch = 1; }
+      else if (tb.numel() != nout && ta.numel() == nout) { ts = &tb; a_ch = 0; }
+      const int C  = (ts && ts->numel() > 0) ? static_cast<int>(ts->numel()) : 1;
+      const int HW = C > 0 ? static_cast<int>(nout / C) : static_cast<int>(nout);
+      clSetKernelArg(k, 0, sizeof(da), &da);
+      clSetKernelArg(k, 1, sizeof(db), &db);
+      clSetKernelArg(k, 2, sizeof(dy), &dy);
+      clSetKernelArg(k, 3, sizeof(HW), &HW);
+      clSetKernelArg(k, 4, sizeof(C), &C);
+      clSetKernelArg(k, 5, sizeof(op), &op);
+      clSetKernelArg(k, 6, sizeof(a_ch), &a_ch);
+      dim = 2;
+      gws[0] = static_cast<size_t>(HW);
+      gws[1] = static_cast<size_t>(C);
+      return;
+    }
+    auto bit = n.attr.find("bdims");
+    const std::string spec = (bit != n.attr.end()) ? bit->second : std::string();
+    int rank = 0;
+    if (!spec.empty())
+      rank = static_cast<int>((std::count(spec.begin(), spec.end(), ',') + 1) / 3);
+    cl_mem dm = bcastDims(spec);
+    clSetKernelArg(k, 0, sizeof(da), &da);
+    clSetKernelArg(k, 1, sizeof(db), &db);
+    clSetKernelArg(k, 2, sizeof(dy), &dy);
+    clSetKernelArg(k, 3, sizeof(nn), &nn);
+    clSetKernelArg(k, 4, sizeof(op), &op);
+    clSetKernelArg(k, 5, sizeof(rank), &rank);
+    clSetKernelArg(k, 6, sizeof(dm), &dm);
+    gws[0] = static_cast<size_t>(nn);
+    return;
+  }
+  if (n.op == "ew_unary")
+  {
+    const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(nn), &nn);
+    clSetKernelArg(k, 3, sizeof(op), &op);
+    gws[0] = isVec ? vecN(nn) : static_cast<size_t>(nn);
+    return;
+  }
+  if (n.op == "copy_c")
+  {
+    int HW = attrInt(n, "HW", 1), c0 = attrInt(n, "c0", 0), cnt = attrInt(n, "cnt", 0),
+        dst = attrInt(n, "dst_off", 0);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(HW), &HW);
+    clSetKernelArg(k, 3, sizeof(c0), &c0);
+    clSetKernelArg(k, 4, sizeof(cnt), &cnt);
+    clSetKernelArg(k, 5, sizeof(dst), &dst);
+    if (kernel == "copy_c2")
+    {
+      dim = 2;
+      gws[0] = static_cast<size_t>(HW);
+      gws[1] = static_cast<size_t>(cnt);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(cnt) * static_cast<size_t>(HW);
+    }
+    return;
+  }
+  if (n.op == "slice_axis")
+  {
+    int outer = attrInt(n, "outer", 1), axdim = attrInt(n, "axdim", 0),
+        inner = attrInt(n, "inner", 1), start = attrInt(n, "start", 0),
+        len = attrInt(n, "len", 0);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(outer), &outer);
+    clSetKernelArg(k, 3, sizeof(axdim), &axdim);
+    clSetKernelArg(k, 4, sizeof(inner), &inner);
+    clSetKernelArg(k, 5, sizeof(start), &start);
+    clSetKernelArg(k, 6, sizeof(len), &len);
+    if (kernel == "slice_axis3")
+    {
+      dim = 3;
+      gws[0] = static_cast<size_t>(inner);
+      gws[1] = static_cast<size_t>(len);
+      gws[2] = static_cast<size_t>(outer);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(outer) * static_cast<size_t>(len) *
+               static_cast<size_t>(inner);
+    }
+    return;
+  }
+  if (n.op == "concat4")
+  {
+    int ca = attrInt(n, "ca", 0), cb = attrInt(n, "cb", 0), cc = attrInt(n, "cc", 0),
+        cd = attrInt(n, "cd", 0);
+    int outer = attrInt(n, "outer", 1), inner = attrInt(n, "inner", 1);
+    cl_mem ia = ca ? inMem(0) : nullptr, ib = cb ? inMem(1) : nullptr,
+           ic = cc ? inMem(2) : nullptr, id = cd ? inMem(3) : nullptr;
+    clSetKernelArg(k, 0, sizeof(ia), &ia);
+    clSetKernelArg(k, 1, sizeof(ca), &ca);
+    clSetKernelArg(k, 2, sizeof(ib), &ib);
+    clSetKernelArg(k, 3, sizeof(cb), &cb);
+    clSetKernelArg(k, 4, sizeof(ic), &ic);
+    clSetKernelArg(k, 5, sizeof(cc), &cc);
+    clSetKernelArg(k, 6, sizeof(id), &id);
+    clSetKernelArg(k, 7, sizeof(cd), &cd);
+    clSetKernelArg(k, 8, sizeof(dy), &dy);
+    clSetKernelArg(k, 9, sizeof(outer), &outer);
+    clSetKernelArg(k, 10, sizeof(inner), &inner);
+    const int csum = ca + cb + cc + cd;
+    dim = 3;
+    gws[0] = isVec ? vecN(inner) : static_cast<size_t>(inner);
+    gws[1] = static_cast<size_t>(csum);
+    gws[2] = static_cast<size_t>(outer);
+    return;
+  }
+  if (n.op == "maxpool")
+  {
+    int C = attrInt(n, "C", 0), H = attrInt(n, "H", 0), W = attrInt(n, "W", 0),
+        ho = attrInt(n, "Hout", 0), wo = attrInt(n, "Wout", 0), K = attrInt(n, "K", 5),
+        S = attrInt(n, "S", 1), P = attrInt(n, "P", 2);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(C), &C);
+    clSetKernelArg(k, 3, sizeof(H), &H);
+    clSetKernelArg(k, 4, sizeof(W), &W);
+    clSetKernelArg(k, 5, sizeof(ho), &ho);
+    clSetKernelArg(k, 6, sizeof(wo), &wo);
+    clSetKernelArg(k, 7, sizeof(K), &K);
+    clSetKernelArg(k, 8, sizeof(S), &S);
+    clSetKernelArg(k, 9, sizeof(P), &P);
+    if (kernel == "maxpool3")
+    {
+      dim = 3;
+      gws[0] = static_cast<size_t>(wo);
+      gws[1] = static_cast<size_t>(ho);
+      gws[2] = static_cast<size_t>(C);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(C) * static_cast<size_t>(ho) * static_cast<size_t>(wo);
+    }
+    return;
+  }
+  if (n.op == "resize_nn")
+  {
+    int C = attrInt(n, "C", 0), H = attrInt(n, "H", 0), W = attrInt(n, "W", 0),
+        S = attrInt(n, "S", 2);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(C), &C);
+    clSetKernelArg(k, 3, sizeof(H), &H);
+    clSetKernelArg(k, 4, sizeof(W), &W);
+    clSetKernelArg(k, 5, sizeof(S), &S);
+    if (kernel == "resize_nn3")
+    {
+      dim = 3;
+      gws[0] = static_cast<size_t>(W) * static_cast<size_t>(S);
+      gws[1] = static_cast<size_t>(H) * static_cast<size_t>(S);
+      gws[2] = static_cast<size_t>(C);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(C) * static_cast<size_t>(H) * static_cast<size_t>(S) *
+               static_cast<size_t>(W) * static_cast<size_t>(S);
+    }
+    return;
+  }
+  if (n.op == "permute_0213")
+  {
+    int D1 = attrInt(n, "D1", 1), D2 = attrInt(n, "D2", 1), I = attrInt(n, "I", 1),
+        mode = attrInt(n, "mode", 0);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(D1), &D1);
+    clSetKernelArg(k, 3, sizeof(D2), &D2);
+    clSetKernelArg(k, 4, sizeof(I), &I);
+    clSetKernelArg(k, 5, sizeof(mode), &mode);
+    if (kernel == "permute_0213_3d")
+    {
+      dim = 3;
+      if (mode == 0)
+      {
+        gws[0] = static_cast<size_t>(I);
+        gws[1] = static_cast<size_t>(D2);
+      }
+      else
+      {
+        gws[0] = static_cast<size_t>(D2);
+        gws[1] = static_cast<size_t>(I);
+      }
+      gws[2] = static_cast<size_t>(D1);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(D1) * static_cast<size_t>(D2) * static_cast<size_t>(I);
+    }
+    return;
+  }
+  if (n.op == "bmm")
+  {
+    const Tensor & A = ref(n.ins[0]);
+    const Tensor & B2 = ref(n.ins[1]);
+    const int B0 = static_cast<int>(A.dims[0]);
+    const int B1 = static_cast<int>(A.dims[1]);
+    const int M  = static_cast<int>(A.dims[2]);
+    const int K  = static_cast<int>(A.dims[3]);
+    const int N  = static_cast<int>(B2.dims[3]);
+    cl_mem da = A.mem, db = B2.mem;
+    clSetKernelArg(k, 0, sizeof(da), &da);
+    clSetKernelArg(k, 1, sizeof(db), &db);
+    clSetKernelArg(k, 2, sizeof(dy), &dy);
+    clSetKernelArg(k, 3, sizeof(B0), &B0);
+    clSetKernelArg(k, 4, sizeof(B1), &B1);
+    clSetKernelArg(k, 5, sizeof(M), &M);
+    clSetKernelArg(k, 6, sizeof(K), &K);
+    clSetKernelArg(k, 7, sizeof(N), &N);
+    if (kernel == "bmm2")
+    {
+      dim = 3;
+      gws[0] = static_cast<size_t>(N);
+      gws[1] = static_cast<size_t>(M);
+      gws[2] = static_cast<size_t>(B0) * static_cast<size_t>(B1);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(B0) * static_cast<size_t>(B1) * static_cast<size_t>(M) *
+               static_cast<size_t>(N);
+    }
+    return;
+  }
+  if (n.op == "gap")
+  {
+    int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
+    cl_mem dx = inMem(0);
+    const int wgs = std::max(1, optInt("-DGAP_WGS=", 128));
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(C), &C);
+    clSetKernelArg(k, 3, sizeof(HW), &HW);
+    useLws = true;
+    dim = 1;
+    lws[0] = static_cast<size_t>(wgs);
+    gws[0] = static_cast<size_t>(C) * static_cast<size_t>(wgs);
+    return;
+  }
+  throw std::runtime_error("PlanModel: smallLaunch unsupported op: " + n.op);
+}
+
 namespace
 {
 // kernel 函数名 → .cl 源文件名。
@@ -360,8 +758,20 @@ void PlanModel::run()
       if (it != T_.end()) return it->second.numel();
       return T_.at(n.ins[0]).numel();
     };
-    const int64_t nout = out_numel();
     const size_t  g1   = static_cast<size_t>(out_numel());
+
+    // Round 28: 小算子调优查表 —— 命中缓存用其 kernel/options，否则内置默认。
+    // 只影响「用哪个变体」，数值由 kernel 语义决定。
+    auto smallKernelFor = [&](const OpSignature & sig, const char * dk, std::string & kernOut,
+                              std::string & optsOut) -> cl_kernel {
+      kernOut = dk;
+      optsOut.clear();
+      if (const TuningEntry * e = tuning_.lookup(sig)) {
+        kernOut = e->kernel;
+        optsOut = e->options;
+      }
+      return getKernel("ops", kernOut, optsOut);
+    };
 
     if (n.op == "conv1x1")
     {
@@ -765,142 +1175,82 @@ void PlanModel::run()
     }
     else if (n.op == "ew_binary")
     {
-      int nn = static_cast<int>(nout), op = attrInt(n, "op", 0), bs = attrInt(n, "b_scalar", 0);
-      cl_mem da = in(0).mem, db = in(1).mem, dy = out.mem;
-      auto   bit = n.attr.find("bdims");
-      if (bit != n.attr.end())
-      {
-        std::vector<int> all;
-        {
-          std::stringstream ss(bit->second);
-          std::string       tk;
-          while (std::getline(ss, tk, ',')) all.push_back(std::atoi(tk.c_str()));
-        }
-        const int rank = static_cast<int>(all.size() / 3);
-        cl_mem    dm   = rt_.alloc(all.size() * 4, CL_MEM_READ_ONLY);
-        rt_.write(dm, all.size() * 4, all.data());
-        clSetKernelArg(kBinB_, 0, sizeof(da), &da);
-        clSetKernelArg(kBinB_, 1, sizeof(db), &db);
-        clSetKernelArg(kBinB_, 2, sizeof(dy), &dy);
-        clSetKernelArg(kBinB_, 3, sizeof(nn), &nn);
-        clSetKernelArg(kBinB_, 4, sizeof(op), &op);
-        clSetKernelArg(kBinB_, 5, sizeof(rank), &rank);
-        clSetKernelArg(kBinB_, 6, sizeof(dm), &dm);
-        timed("ew_binary", kBinB_, 1, &g1, nullptr);
-        clReleaseMemObject(dm);
-      }
-      else
-      {
-        clSetKernelArg(kBin_, 0, sizeof(da), &da);
-        clSetKernelArg(kBin_, 1, sizeof(db), &db);
-        clSetKernelArg(kBin_, 2, sizeof(dy), &dy);
-        clSetKernelArg(kBin_, 3, sizeof(nn), &nn);
-        clSetKernelArg(kBin_, 4, sizeof(op), &op);
-        clSetKernelArg(kBin_, 5, sizeof(bs), &bs);
-        timed("ew_binary", kBin_, 1, &g1, nullptr);
-      }
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, sig.op == "ew_binary_bcast" ? "ew_binary_bcast"
+                                                                     : "ew_binary",
+                                     kern, opts);
+      cl_uint dim;
+      size_t  gws[3], lws[3];
+      bool    useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("ew_binary", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "ew_unary")
     {
-      int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kUn_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kUn_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kUn_, 2, sizeof(nn), &nn);
-      clSetKernelArg(kUn_, 3, sizeof(op), &op);
-      timed("ew_unary", kUn_, 1, &g1, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "ew_unary", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("ew_unary", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "copy_c")
     {
-      int HW = attrInt(n, "HW", 1), c0 = attrInt(n, "c0", 0), cnt = attrInt(n, "cnt", 0),
-          dst = attrInt(n, "dst_off", 0);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kCopy_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kCopy_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kCopy_, 2, sizeof(HW), &HW);
-      clSetKernelArg(kCopy_, 3, sizeof(c0), &c0);
-      clSetKernelArg(kCopy_, 4, sizeof(cnt), &cnt);
-      clSetKernelArg(kCopy_, 5, sizeof(dst), &dst);
-      const size_t g = static_cast<size_t>(cnt) * HW;
-      timed("copy_c", kCopy_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "copy_c", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("copy_c", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "slice_axis")
     {
-      int outer = attrInt(n, "outer", 1), axdim = attrInt(n, "axdim", 0), inner = attrInt(n, "inner", 1),
-          start = attrInt(n, "start", 0), len = attrInt(n, "len", 0);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kSlice_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kSlice_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kSlice_, 2, sizeof(outer), &outer);
-      clSetKernelArg(kSlice_, 3, sizeof(axdim), &axdim);
-      clSetKernelArg(kSlice_, 4, sizeof(inner), &inner);
-      clSetKernelArg(kSlice_, 5, sizeof(start), &start);
-      clSetKernelArg(kSlice_, 6, sizeof(len), &len);
-      const size_t g = static_cast<size_t>(outer) * len * inner;
-      timed("slice_axis", kSlice_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "slice_axis", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("slice_axis", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "concat4")
     {
-      int ca = attrInt(n, "ca", 0), cb = attrInt(n, "cb", 0), cc = attrInt(n, "cc", 0),
-          cd = attrInt(n, "cd", 0);
-      int outer = attrInt(n, "outer", 1), inner = attrInt(n, "inner", 1);
-      auto inOr = [&](size_t i) -> cl_mem {
-        return (i < n.ins.size() && n.ins[i] != "-" && T_.count(n.ins[i])) ? ref(n.ins[i]).mem
-                                                                          : nullptr;
-      };
-      cl_mem ia = ca ? inOr(0) : nullptr;
-      cl_mem ib = cb ? inOr(1) : nullptr;
-      cl_mem ic = cc ? inOr(2) : nullptr;
-      cl_mem id = cd ? inOr(3) : nullptr;
-      cl_mem dy = out.mem;
-      clSetKernelArg(kConcat_, 0, sizeof(ia), &ia);
-      clSetKernelArg(kConcat_, 1, sizeof(ca), &ca);
-      clSetKernelArg(kConcat_, 2, sizeof(ib), &ib);
-      clSetKernelArg(kConcat_, 3, sizeof(cb), &cb);
-      clSetKernelArg(kConcat_, 4, sizeof(ic), &ic);
-      clSetKernelArg(kConcat_, 5, sizeof(cc), &cc);
-      clSetKernelArg(kConcat_, 6, sizeof(id), &id);
-      clSetKernelArg(kConcat_, 7, sizeof(cd), &cd);
-      clSetKernelArg(kConcat_, 8, sizeof(dy), &dy);
-      clSetKernelArg(kConcat_, 9, sizeof(outer), &outer);
-      clSetKernelArg(kConcat_, 10, sizeof(inner), &inner);
-      const int csum = ca + cb + cc + cd;
-      const size_t g[3] = {
-        static_cast<size_t>(inner), static_cast<size_t>(csum),
-        static_cast<size_t>(outer)};
-      timed("concat4", kConcat_, 3, g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "concat4", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("concat4", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "maxpool")
     {
-      int C = attrInt(n, "C", 0), H = attrInt(n, "H", 0), W = attrInt(n, "W", 0),
-          ho = attrInt(n, "Hout", 0), wo = attrInt(n, "Wout", 0), K = attrInt(n, "K", 5),
-          S = attrInt(n, "S", 1), P = attrInt(n, "P", 2);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kPool_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kPool_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kPool_, 2, sizeof(C), &C);
-      clSetKernelArg(kPool_, 3, sizeof(H), &H);
-      clSetKernelArg(kPool_, 4, sizeof(W), &W);
-      clSetKernelArg(kPool_, 5, sizeof(ho), &ho);
-      clSetKernelArg(kPool_, 6, sizeof(wo), &wo);
-      clSetKernelArg(kPool_, 7, sizeof(K), &K);
-      clSetKernelArg(kPool_, 8, sizeof(S), &S);
-      clSetKernelArg(kPool_, 9, sizeof(P), &P);
-      const size_t g = static_cast<size_t>(C) * ho * wo;
-      timed("maxpool", kPool_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "maxpool", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("maxpool", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "resize_nn")
     {
-      int C = attrInt(n, "C", 0), H = attrInt(n, "H", 0), W = attrInt(n, "W", 0), S = attrInt(n, "S", 2);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kResize_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kResize_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kResize_, 2, sizeof(C), &C);
-      clSetKernelArg(kResize_, 3, sizeof(H), &H);
-      clSetKernelArg(kResize_, 4, sizeof(W), &W);
-      clSetKernelArg(kResize_, 5, sizeof(S), &S);
-      const size_t g = static_cast<size_t>(C) * H * S * W * S;
-      timed("resize_nn", kResize_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "resize_nn", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("resize_nn", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "softmax_axis")
     {
@@ -916,52 +1266,41 @@ void PlanModel::run()
     }
     else if (n.op == "permute_0213")
     {
-      int D1 = attrInt(n, "D1", 1), D2 = attrInt(n, "D2", 1), I = attrInt(n, "I", 1),
-          mode = attrInt(n, "mode", 0);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kPerm_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kPerm_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kPerm_, 2, sizeof(D1), &D1);
-      clSetKernelArg(kPerm_, 3, sizeof(D2), &D2);
-      clSetKernelArg(kPerm_, 4, sizeof(I), &I);
-      clSetKernelArg(kPerm_, 5, sizeof(mode), &mode);
-      const size_t g = static_cast<size_t>(D1) * D2 * I;
-      timed("permute", kPerm_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "permute_0213", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("permute", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "bmm")
     {
-      auto & A  = in(0);
-      auto & B2 = in(1);
-      const int B0 = static_cast<int>(A.dims[0]);
-      const int B1 = static_cast<int>(A.dims[1]);
-      const int M  = static_cast<int>(A.dims[2]);
-      const int K  = static_cast<int>(A.dims[3]);
-      const int N  = static_cast<int>(B2.dims[3]);
-      cl_mem da = A.mem, db = B2.mem, dy = out.mem;
-      clSetKernelArg(kBmm_, 0, sizeof(da), &da);
-      clSetKernelArg(kBmm_, 1, sizeof(db), &db);
-      clSetKernelArg(kBmm_, 2, sizeof(dy), &dy);
-      clSetKernelArg(kBmm_, 3, sizeof(B0), &B0);
-      clSetKernelArg(kBmm_, 4, sizeof(B1), &B1);
-      clSetKernelArg(kBmm_, 5, sizeof(M), &M);
-      clSetKernelArg(kBmm_, 6, sizeof(K), &K);
-      clSetKernelArg(kBmm_, 7, sizeof(N), &N);
-      const size_t g = static_cast<size_t>(B0) * B1 * M * N;
-      timed("bmm", kBmm_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "bmm", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("bmm", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "gap")
     {
-      int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      const int WGS = 128;
-      cl_kernel k = getKernel("ops", "gap_r", "-DGAP_WGS=" + std::to_string(WGS));
-      clSetKernelArg(k, 0, sizeof(dx), &dx);
-      clSetKernelArg(k, 1, sizeof(dy), &dy);
-      clSetKernelArg(k, 2, sizeof(C), &C);
-      clSetKernelArg(k, 3, sizeof(HW), &HW);
-      const size_t lws[1] = {static_cast<size_t>(WGS)};
-      const size_t gws[1] = {static_cast<size_t>(C) * WGS};
-      timed("gap", k, 1, gws, lws);
+      const int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
+      const OpSignature sig = OpSignature::gap(C, HW);
+      std::string kern = "gap_r", opts = "-DGAP_WGS=128";
+      if (const TuningEntry * e = tuning_.lookup(sig)) {
+        if (!e->kernel.empty()) kern = e->kernel;
+        if (!e->options.empty()) opts = e->options;
+      }
+      cl_kernel k = getKernel("ops", kern, opts);
+      cl_uint   dim;
+      size_t    gws[3], lws[3];
+      bool      useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("gap", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "bias_add")
     {
@@ -1046,6 +1385,13 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
       const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
       if (G == Cin && (K == 3 || K == 5) && Cin == Cout)
         add(OpSignature::depthwise(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), S, P, Cin, K, act));
+    } else if (want(n.op) &&
+               (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
+                n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
+                n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
+                n.op == "gap")) {
+      // Round 28: 小算子签名（与 dispatch/autotune 完全一致）。
+      add(smallSig(n));
     }
   }
   return out;
@@ -1354,9 +1700,67 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       }
       continue;
     }
+
+    // Round 28: 小算子（launch/带宽受限）自动调优。所有候选都是**数值等价**的
+    // 变体（逐元素表达式/归约顺序不变），只是每 work-item 处理多少元素或网格维度
+    // 不同，所以调优只改性能、不改数值。flops 统一取 2·元素数 作为「越小越快」的
+    // 单调代理；autotuneOp 实际按最小 ms 选优。
+    {
+      const bool smallOp =
+        (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
+         n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
+         n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
+         n.op == "gap");
+      if (smallOp && opInList(ops, n.op))
+      {
+        const OpSignature sig = smallSig(n);
+        if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
+        if (!shouldTune(sig)) continue;
+        const std::vector<Candidate> cands = candidatesSmall(sig);
+        if (cands.empty()) continue;
+        const double flops = 2.0 * static_cast<double>(ref(n.outs[0]).numel());
+        auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+          cl_kernel   k = getKernel("ops", c.kernel, c.options);
+          cl_uint     dim;
+          size_t      gws[3], lws[3];
+          bool        useLws;
+          smallLaunch(n, k, c.kernel, c.options, dim, gws, lws, useLws);
+          return [this, k, dim, gws, lws, useLws]() {
+            return ClRuntime::enqueueND(rt_.queue(), k, dim, gws, useLws ? lws : nullptr);
+          };
+        };
+        TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+        if (!e.kernel.empty()) {
+          done[sig.str()] = e;
+          ++n_tuned;
+          if (merge) tuning_.put(sig, e);
+          if (verbose)
+            std::printf("  [tune] %-40s best=%-18s %6.3f ms  ops=%5.2f ratio=%.2f (%s)\n",
+                        sig.str().c_str(), e.kernel.c_str(), e.ms, e.ops, e.ratio,
+                        e.config.c_str());
+        }
+        continue;
+      }
+    }
   }
 
   return done;
+}
+
+int PlanModel::onlineTuneMissing(int budget, int iters, const std::vector<std::string> & ops)
+{
+  if (budget <= 0 || iters <= 0) return 0;
+  try
+  {
+    auto done = autotune(ops, "", budget, iters, /*merge=*/true, /*verbose=*/false,
+                         /*retune=*/false);
+    return static_cast<int>(done.size());
+  }
+  catch (const std::exception & e)
+  {
+    std::fprintf(stderr, "[online-tune] skipped: %s\n", e.what());
+    return 0;
+  }
 }
 
 }  // namespace gk

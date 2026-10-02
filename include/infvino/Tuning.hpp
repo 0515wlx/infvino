@@ -37,6 +37,10 @@ struct OpSignature
   int batch = 1;
   int M = 0, N = 0;    // gemm 专用（M=Cout, N=HW, K=Cin）
   std::string dtype = "f16";
+  // 通用小算子（Round 28）：op 专属维度的有序列表，参与签名串。用于
+  // ew/unary/copy/slice/pool/resize/permute/bmm/concat/softmax 等无专用字段的算子，
+  // 使「加一个新小算子」不必再改 OpSignature 结构。
+  std::vector<int> params;
 
   std::string str() const;
   static OpSignature conv3x3(int Wout, int Hout, int stride, int pad, int Cin, int Cout, int act);
@@ -46,6 +50,8 @@ struct OpSignature
   static OpSignature conv1x1(int Cout, int N, int Cin, int act, int res);
   static OpSignature depthwise(int Wout, int Hout, int stride, int pad, int Cin, int K, int act);
   static OpSignature gap(int C, int HW);
+  /** @brief 通用小算子签名（Round 28）：op 名 + 有序维度列表。*/
+  static OpSignature custom(const std::string & op, std::vector<int> params, int act = 0);
 };
 
 /** @brief 一个缓存条目：最优 kernel + config（+ 实测与期望指标，用于分析）。 */

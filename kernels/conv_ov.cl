@@ -71,6 +71,16 @@
 #ifndef OSV
 #define OSV 32           // OSV_SIZE
 #endif
+// Round 28 (P2): compile-time shape specialization. When the output is exactly
+// tile-aligned / channel-aligned the per-output predicates are dead code and IGC
+// can drop them (no runtime branch — the earlier R24 attempt used a *runtime*
+// interior test and lost). Set by the autotuner as extra candidates.
+#ifndef FIT_WH
+#define FIT_WH 0         // Wout % OBW == 0 && Hout % OBH == 0
+#endif
+#ifndef FIT_COUT
+#define FIT_COUT 0       // Cout % (2*SG) == 0
+#endif
 
 // OV's get_bfyx_req_input_block_dims(): round the required input width up to a
 // whole sub-group (read_chunk_size == SUB_GROUP_SIZE == 16), min one chunk.
@@ -160,16 +170,22 @@ __kernel void conv3x3_ov(
 #pragma unroll
   for (int fid = 0; fid < 2; ++fid) {
     const int ch = fmg * OSV + fid * SG + lid;
+#if !FIT_COUT
     if (ch >= Cout) continue;
+#endif
     const half b = (bias != 0) ? bias[ch] : (half)0;
 #pragma unroll
     for (int r = 0; r < OBH; ++r) {
       const int oy = orr + r;
+#if !FIT_WH
       if (oy >= Hout) continue;
+#endif
 #pragma unroll
       for (int c = 0; c < OBW; ++c) {
         const int ox = oc + c;
+#if !FIT_WH
         if (ox >= Wout) continue;
+#endif
         const half2 a = out[r * OBW + c];
         const half v = (fid == 0) ? a.s0 : a.s1;
         const size_t oidx = ((size_t)ch * Hout + oy) * Wout + ox;

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <string>
 
+#include "infvino/Autotuner.hpp"
 #include "infvino/Tuning.hpp"
 
 namespace
@@ -65,8 +66,27 @@ int main()
   in.setDeviceId("different_device_eu16_clk300");
   CHECK(in.lookup(a) == nullptr, "device key mismatch -> miss（回退启发式）");
 
-  // --- expected_ops：单调 + 上界 ---
+  // --- Round 28: 通用小算子签名 + 候选枚举 ---
   DeviceInfo d = dev();
+  const auto ew1 = OpSignature::custom("ew_binary", {409600, 0, 0});
+  const auto ew2 = OpSignature::custom("ew_binary", {409600, 0, 0});
+  const auto ew3 = OpSignature::custom("ew_binary", {204800, 0, 0});
+  CHECK(ew1.str() == ew2.str(), "custom signature stable");
+  CHECK(ew1.str() != ew3.str(), "custom signature encodes params");
+  CHECK(ew1.str().find("ew_binary|409600,0,0") != std::string::npos,
+        "custom signature string format");
+  const auto cands = candidatesSmall(ew1);
+  CHECK(cands.size() >= 4, "ew_binary has scalar + vector variants");
+  bool hasVec = false;
+  for (const auto & c : cands) if (c.kernel.find("_v") != std::string::npos) hasVec = true;
+  CHECK(hasVec, "ew_binary candidate set includes a vectorized variant");
+  const auto copyc = candidatesSmall(OpSignature::custom("copy_c", {25600, 16}));
+  bool has3d = false;
+  for (const auto & c : copyc) if (c.kernel == "copy_c2") has3d = true;
+  CHECK(has3d, "copy_c candidate set includes the 2-D grid variant");
+  CHECK(expectedOps(ew1, d) > 0.0, "small-op expected_ops is positive");
+
+  // --- expected_ops：单调 + 上界 ---
   const double big = expectedOps(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1), d);
   const double mid = expectedOps(OpSignature::conv3x3(40, 40, 1, 1, 64, 64, 1), d);
   const double small = expectedOps(OpSignature::conv3x3(20, 20, 1, 1, 64, 64, 1), d);

@@ -102,9 +102,16 @@ public:
 
   /** @brief 列出计划里可调优的唯一签名（不触碰 GPU，用于分批/审计）。 */
   std::vector<std::string> tuningTargets(const std::vector<std::string> & ops = {}) const;
-
   /** @brief 把 current tuning_ 写回文件。 */
   bool saveTuning(const std::string & path) const { return tuning_.save(path); }
+
+  /**
+   * @brief P3 在线调优：对缓存里尚未命中的签名，按顺序在线 benchmark 至多 `budget`
+   *        个并 merge 进 tuning_（需要 profiling=true 的 runtime 才能计时）。
+   *        与离线 `kernel_autotune` 共享同一套候选/中间标准；失败静默跳过。
+   * @return 本次实际调优的签名数。
+   */
+  int onlineTuneMissing(int budget, int iters, const std::vector<std::string> & ops);
 
   /** @brief 最近一次 run() 的墙钟耗时（ms）。 */
   double lastRunMs() const { return last_run_ms_; }
@@ -147,6 +154,20 @@ private:
   cl_mem  blkInput(const std::string & name, Tensor & x, int Cin, int H, int W);
   /** @brief Build (once) and cache a kernel keyed by source|name|options. */
   cl_kernel getKernel(const std::string & src, const std::string & name, const std::string & opts);
+  /**
+   * @brief Round 28: set up a small-op kernel — args + launch geometry.
+   *
+   * 供 run() 与 autotune() 共用：给定 op 节点、已 build 的 kernel 及其编译宏，
+   * 统一设置参数并返回 dim/gws/lws（kernel 变体如 `_v`/`_ch`/3-D 网格的差异都在这里
+   * 处理，避免两处各写一遍）。kernel 语义不变，这里只做接线。
+   */
+  void smallLaunch(const Node & n, cl_kernel k, const std::string & kernel,
+                   const std::string & opts, cl_uint & dim, size_t * gws, size_t * lws,
+                   bool & useLws);
+  /** @brief Round 28: 带缓存的广播维度缓冲（`ew_binary_bcast` 用）。*/
+  cl_mem bcastDims(const std::string & spec);
+  /** @brief Round 28: 小算子的稳定签名（dispatch / autotune / tuningTargets 共用）。*/
+  OpSignature smallSig(const Node & n) const;
 
   ClRuntime         rt_;
   std::string       plan_path_;
@@ -164,6 +185,8 @@ private:
   std::unordered_map<std::string, cl_mem> blk_w_;
   std::unordered_map<std::string, cl_mem> blk_in_;
   std::vector<cl_mem>                     owned_blk_;
+  // Round 28: cached broadcast-dim buffers for the small-op autotune/tuning path.
+  std::unordered_map<std::string, cl_mem> small_buf_;
   std::vector<Node>                       nodes_;
   std::vector<std::string>                outputs_;   // 输出张量名（按声明顺序）
   std::string                             input_name_;

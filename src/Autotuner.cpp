@@ -46,11 +46,17 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
   for (auto [obw, obh] : blocks) {
     if (sig.W > 0 && obw > sig.W) continue;   // 超过输出宽度无意义
     if (sig.H > 0 && obh > sig.H) continue;
+    // Round 28 (P2)：形状整除时编译期去掉输出谓词（数值不变，IGC 直接折叠）。
+    std::string extra;
+    if (sig.W > 0 && sig.H > 0 && sig.W % obw == 0 && sig.H % obh == 0)
+      extra += " -DFIT_WH=1";
+    if (sig.Cout > 0 && sig.Cout % 32 == 0) extra += " -DFIT_COUT=1";
     Candidate c;
     c.kernel = "conv3x3_ov";
     c.source = "conv_ov";
-    c.options = ovOptions(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0);
-    c.config = ovConfig(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0);
+    c.options = ovOptions(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0) + extra;
+    c.config = ovConfig(obw, obh, sig.stride, sig.pad, sig.act, sig.groups == 2 ? 1 : 0) +
+               (extra.empty() ? "" : " fit");
     out.push_back(std::move(c));
   }
   // R25: OpenVINO blocked conv port (kernels/conv_blk.cl).  Lane=output channel,
@@ -66,9 +72,13 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
       std::ostringstream o;
       o << "-DOBW=" << obw << " -DSTRIDE=" << sig.stride << " -DPAD=" << sig.pad
         << " -DACT=" << sig.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+      if (sig.W > 0 && sig.W % obw == 0) o << " -DFIT_WH=1";
+      if (sig.Cout > 0 && sig.Cout % 16 == 0) o << " -DFIT_COUT=1";
+      if (sig.Cin > 0 && sig.Cin % 16 == 0) o << " -DFIT_CIN=1";
       c.options = o.str();
       std::ostringstream cc;
-      cc << "OBW=" << obw << ",STRIDE=" << sig.stride << ",PAD=" << sig.pad << ",ACT=" << sig.act;
+      cc << "OBW=" << obw << ",STRIDE=" << sig.stride << ",PAD=" << sig.pad
+         << ",ACT=" << sig.act;
       c.config = cc.str();
     }
     out.push_back(std::move(c));
@@ -84,10 +94,14 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
       cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = 16;
       cfg.STRIDE = sig.stride; cfg.PAD = sig.pad; cfg.ACT = sig.act;
       cfg.SG = 16; cfg.WC = 1;
+      std::string opts = cfg.options();
+      if (sig.W > 0 && sig.H > 0 && sig.W % tx == 0 && sig.H % 8 == 0) opts += " -DFIT_WH=1";
+      if (sig.Cin > 0 && sig.Cin % 16 == 0) opts += " -DFIT_CIN=1";
+      if (sig.Cout > 0 && sig.Cout % cb == 0) opts += " -DFIT_CB=1";
       Candidate c;
       c.kernel = "conv3x3_f16";
       c.source = "conv";
-      c.options = cfg.options();
+      c.options = opts;
       c.config = cfg.label();
       out.push_back(std::move(c));
     }
@@ -106,6 +120,10 @@ std::vector<Candidate> candidatesGemm(const OpSignature & sig)
     {128, 64, 8,  8, 4, 0},
     {64,  64, 16, 8, 4, 1},
     {64,  64, 8,  8, 4, 0},
+    // Round 28 (P1): 小 M/N 形状（conv1x1 的 expansion/projection 常见）的更小块，
+    // 减少尾部浪费/增加 work-group 数；大块网格饥饿时由调优器选。
+    {64,  32, 32, 8, 4, 0},
+    {32,  64, 32, 8, 4, 0},
   };
   for (const auto & o : opts) {
     Tiles t;
@@ -167,6 +185,102 @@ std::vector<Candidate> candidatesDepthwise(const OpSignature & sig)
   c.options = opts;
   c.config = cfg;
   out.push_back(std::move(c));
+  return out;
+}
+
+namespace
+{
+void addSmall(std::vector<Candidate> & out, const char * kernel, const char * src,
+              const std::string & opts, const std::string & cfg)
+{
+  Candidate c;
+  c.kernel = kernel;
+  c.source = src;
+  c.options = opts;
+  c.config = cfg;
+  out.push_back(std::move(c));
+}
+std::string vecOpts(const char * macro, int v)
+{
+  std::ostringstream o;
+  o << "-D" << macro << "=" << v << " -cl-mad-enable -cl-fast-relaxed-math";
+  return o.str();
+}
+}  // namespace
+
+std::vector<Candidate> candidatesSmall(const OpSignature & sig)
+{
+  std::vector<Candidate> out;
+  const std::string op = sig.op;
+  if (op == "ew_binary" || op == "ew_unary")
+  {
+    const bool binary = (op == "ew_binary");
+    addSmall(out, binary ? "ew_binary" : "ew_unary", "ops", "", "scalar");
+    for (int v : {2, 4, 8})
+      addSmall(out, binary ? "ew_binary_v" : "ew_unary_v", "ops", vecOpts("EW_VEC", v),
+               "VEC=" + std::to_string(v));
+    return out;
+  }
+  if (op == "ew_binary_bcast")
+  {
+    addSmall(out, "ew_binary_bcast", "ops", "", "bcast");
+    // 仅当其中一个是「每通道一个标量」时才加入通道特化变体。
+    const int n = sig.params.size() > 0 ? sig.params[0] : 0;
+    const int C = sig.params.size() > 3 ? sig.params[3] : 0;
+    if (C > 0 && C < n && n % C == 0)
+      addSmall(out, "ew_binary_ch", "ops", "", "channel");
+    return out;
+  }
+  if (op == "concat4")
+  {
+    addSmall(out, "concat4", "ops", "", "scalar");
+    for (int v : {2, 4, 8})
+      addSmall(out, "concat4_v", "ops", vecOpts("EW_VEC", v), "VEC=" + std::to_string(v));
+    return out;
+  }
+  if (op == "copy_c")
+  {
+    addSmall(out, "copy_c", "ops", "", "grid1");
+    addSmall(out, "copy_c2", "ops", "", "grid2");
+    return out;
+  }
+  if (op == "slice_axis")
+  {
+    addSmall(out, "slice_axis", "ops", "", "grid1");
+    addSmall(out, "slice_axis3", "ops", "", "grid3");
+    return out;
+  }
+  if (op == "maxpool")
+  {
+    addSmall(out, "maxpool", "ops", "", "grid1");
+    addSmall(out, "maxpool3", "ops", "", "grid3");
+    return out;
+  }
+  if (op == "resize_nn")
+  {
+    addSmall(out, "resize_nn", "ops", "", "grid1");
+    addSmall(out, "resize_nn3", "ops", "", "grid3");
+    return out;
+  }
+  if (op == "permute_0213")
+  {
+    addSmall(out, "permute_0213", "ops", "", "grid1");
+    addSmall(out, "permute_0213_3d", "ops", "", "grid3");
+    return out;
+  }
+  if (op == "bmm")
+  {
+    addSmall(out, "bmm", "ops", "", "grid1");
+    addSmall(out, "bmm2", "ops", "", "grid3");
+    return out;
+  }
+  if (op == "gap")
+  {
+    for (int w : {64, 128, 256})
+      addSmall(out, "gap_r", "ops", "-DGAP_WGS=" + std::to_string(w),
+               "WGS=" + std::to_string(w));
+    return out;
+  }
   return out;
 }
 

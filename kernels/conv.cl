@@ -92,6 +92,34 @@
 #ifndef WGL
 #define WGL 0
 #endif
+// Round 28 (P2): compile-time shape specialization. Removing the leftover
+// predicates when the shape is exactly chunk/block/tile aligned lets IGC fold
+// them away (no runtime interior branch — see R24's negative). Numerically
+// identical; exposed to the autotuner as extra candidates.
+#ifndef FIT_WH
+#define FIT_WH 0     // Wout % TX == 0 && Hout % TY == 0
+#endif
+#ifndef FIT_CIN
+#define FIT_CIN 0    // Cin % CINC == 0
+#endif
+#ifndef FIT_CB
+#define FIT_CB 0     // Cout % CB == 0
+#endif
+// Combined weight-staging predicate: keep only the leftover tests that can still
+// fire (folds to constant 1 when both Cin and Cout are block-aligned).
+#if FIT_CB
+#if FIT_CIN
+#define W_TILE_OK 1
+#else
+#define W_TILE_OK (gout < Cout)
+#endif
+#else
+#if FIT_CIN
+#define W_TILE_OK (gc < Cin)
+#else
+#define W_TILE_OK (gout < Cout && gc < Cin)
+#endif
+#endif
 
 #define KH 3
 #define KW 3
@@ -167,10 +195,19 @@ __kernel void conv3x3_f16(
       half v = (half)0;
 #if (PROBE & 16)
       const half pc_x = (half)((idx & 3) + 1);   // R18: staging sans global read
+#if FIT_CIN
+      if (yy >= 0 && yy < H && xx >= 0 && xx < W) v = pc_x;
+#else
       if (gc < Cin && yy >= 0 && yy < H && xx >= 0 && xx < W) v = pc_x;
+#endif
+#else
+#if FIT_CIN
+      if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+        v = X[((size_t)gc * H + yy) * W + xx];
 #else
       if (gc < Cin && yy >= 0 && yy < H && xx >= 0 && xx < W)
         v = X[((size_t)gc * H + yy) * W + xx];
+#endif
 #endif
       Xs[ci][r][c] = v;
     }
@@ -188,9 +225,9 @@ __kernel void conv3x3_f16(
       half v = (half)0;
 #if (PROBE & 16)
       const half pc_w = (half)((idx & 3) + 1);   // R18: staging sans global read
-      if (gout < Cout && gc < Cin) v = pc_w;
+      if (W_TILE_OK) v = pc_w;
 #else
-      if (gout < Cout && gc < Cin) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
+      if (W_TILE_OK) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
 #endif
       Ws[ci][kk][t] = v;
     }
@@ -205,9 +242,9 @@ __kernel void conv3x3_f16(
       half v = (half)0;
 #if (PROBE & 16)
       const half pc_w = (half)((idx & 3) + 1);   // R18: staging sans global read
-      if (gout < Cout && gc < Cin) v = pc_w;
+      if (W_TILE_OK) v = pc_w;
 #else
-      if (gout < Cout && gc < Cin) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
+      if (W_TILE_OK) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
 #endif
       Ws[ci][kk][t] = v;
     }
@@ -329,12 +366,20 @@ __kernel void conv3x3_f16(
   const int oy = gy * TY + ly;
   for (int t = 0; t < CB; ++t) {
     const int gout = out_c0 + t;
+#if FIT_CB
+    {
+#else
     if (gout < Cout) {
+#endif
       half b = Bias ? Bias[gout] : (half)0;
 #pragma unroll
       for (int i = 0; i < TM; ++i) {
         const int ox = gx * TX + lx * TM + i;
+#if FIT_WH
+        {
+#else
         if (oy < Hout && ox < Wout) {
+#endif
 #if VECC
           half v = ((t & 1) ? acc[i][t / 2].s1 : acc[i][t / 2].s0) + b;
 #else

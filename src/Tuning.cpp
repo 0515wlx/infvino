@@ -95,7 +95,13 @@ std::string OpSignature::str() const
   } else if (op == "gap") {
     o << "|C" << Cin << "_HW" << N;
   } else {
-    o << "|" << Cin << "x" << Cout << "@" << W << "x" << H;
+    // Round 28: 通用小算子 —— params 是有序维度列表，保证签名稳定、可区分。
+    o << "|";
+    if (!params.empty()) {
+      for (size_t i = 0; i < params.size(); ++i) { if (i) o << ","; o << params[i]; }
+    } else {
+      o << Cin << "x" << Cout << "@" << W << "x" << H;
+    }
   }
   o << "_act" << act << "_" << dtype;
   if (batch > 1) o << "_b" << batch;
@@ -141,6 +147,12 @@ OpSignature OpSignature::gap(int C, int HW)
 {
   OpSignature s;
   s.op = "gap"; s.Cin = C; s.N = HW;
+  return s;
+}
+OpSignature OpSignature::custom(const std::string & op, std::vector<int> params, int act)
+{
+  OpSignature s;
+  s.op = op; s.params = std::move(params); s.act = act;
   return s;
 }
 
@@ -362,6 +374,14 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
     // R22: 并行树归约，受 SLM 与 C 数限制。
     return std::max(0.5, 6.0 * gridFactor(static_cast<long>(s.Cin), eu));
   }
+
+  // Round 28：小算子（launch/带宽受限）没有严格的 roofline 语义；给一个稳定的正
+  // 期望值，使 ratio 在同一量纲下可比。调优器实际按最小 ms 选优。
+  if (s.op == "ew_binary" || s.op == "ew_binary_bcast" || s.op == "ew_unary" ||
+      s.op == "concat4" || s.op == "copy_c" || s.op == "slice_axis" ||
+      s.op == "maxpool" || s.op == "resize_nn" || s.op == "permute_0213" ||
+      s.op == "bmm" || s.op == "bias_add")
+    return 8.0;
 
   return 1.0;
 }

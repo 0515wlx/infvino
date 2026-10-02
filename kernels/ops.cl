@@ -235,4 +235,186 @@ __kernel void bmm(__global const half *restrict A, __global const half *restrict
   Y[idx] = (half)acc;
 }
 
+// ===========================================================================
+// Round 28: autotunable variants for the small (launch/bandwidth-bound) ops.
+//
+// These are numerically identical to the scalar versions above (same per-element
+// expression, same reduction order) — they only change how many elements one
+// work-item handles / how the grid indexes the output, so the autotuner can pick
+// the fastest variant per shape without any numeric risk.
+// ===========================================================================
+
+// ---- elementwise binary specialized for the "one operand broadcast per channel"
+// pattern (e.g. SE Mul: [C,1,1] * [C,HW]). 2-D grid (spatial, channel) removes the
+// rank loop/div/mod; `a_channel` says which input is the per-channel one. ----
+__kernel void ew_binary_ch(__global const half *restrict a, __global const half *restrict b,
+                           __global half *restrict y, const int HW, const int C,
+                           const int op, const int a_channel) {
+  const int r = get_global_id(0);
+  const int c = get_global_id(1);
+  if (r >= HW || c >= C) return;
+  const half av = a_channel ? a[c] : a[c * HW + r];
+  const half bv = a_channel ? b[c * HW + r] : b[c];
+  const int i = c * HW + r;
+  float af = (float)av, bf = (float)bv, res = af;
+  if (op == 0) res = af + bf;
+  else if (op == 1) res = af - bf;
+  else if (op == 2) res = af * bf;
+  else res = af / bf;
+  y[i] = (half)res;
+}
+
+// ---- vectorized elementwise binary: EW_VEC contiguous elements per work-item ----
+#ifndef EW_VEC
+#define EW_VEC 4
+#endif
+__kernel void ew_binary_v(__global const half *restrict a, __global const half *restrict b,
+                          __global half *restrict y, const int n, const int op,
+                          const int b_scalar) {
+  const int base = get_global_id(0) * EW_VEC;
+#pragma unroll
+  for (int j = 0; j < EW_VEC; ++j) {
+    const int i = base + j;
+    if (i >= n) return;
+    const float av = (float)a[i];
+    const float bv = (float)(b_scalar ? b[0] : b[i]);
+    float r = av;
+    if (op == 0) r = av + bv;
+    else if (op == 1) r = av - bv;
+    else if (op == 2) r = av * bv;
+    else r = av / bv;
+    y[i] = (half)r;
+  }
+}
+
+// ---- vectorized elementwise unary ----
+__kernel void ew_unary_v(__global const half *restrict x, __global half *restrict y,
+                         const int n, const int op) {
+  const int base = get_global_id(0) * EW_VEC;
+#pragma unroll
+  for (int j = 0; j < EW_VEC; ++j) {
+    const int i = base + j;
+    if (i >= n) return;
+    const float v = (float)x[i];
+    float r = v;
+    if (op == 0) r = 1.0f / (1.0f + exp(-v));
+    else if (op == 1) r = v / (1.0f + exp(-v));
+    else if (op == 2) r = fmax(v, 0.0f);
+    else if (op == 3) r = v * fmin(fmax(v + 3.0f, 0.0f), 6.0f) / 6.0f;
+    else if (op == 4) r = fmin(fmax(v + 3.0f, 0.0f), 6.0f) / 6.0f;
+    y[i] = (half)r;
+  }
+}
+
+// ---- vectorized concat4: EW_VEC contiguous inner elements per work-item ----
+__kernel void concat4_v(__global const half *restrict a, const int ca,
+                        __global const half *restrict b, const int cb,
+                        __global const half *restrict c, const int cc,
+                        __global const half *restrict d, const int cd,
+                        __global half *restrict y, const int outer, const int inner) {
+  const int r0 = get_global_id(0) * EW_VEC;
+  const int ax = get_global_id(1);
+  const int o  = get_global_id(2);
+  if (o >= outer) return;
+  const int sum = ca + cb + cc + cd;
+  if (ax >= sum) return;
+  __global const half *src;
+  int off = 0;
+  if (ax < ca) { src = a; off = (o * ca + ax) * inner; }
+  else if (ax < ca + cb) { src = b; off = (o * cb + (ax - ca)) * inner; }
+  else if (ax < ca + cb + cc) { src = c; off = (o * cc + (ax - ca - cb)) * inner; }
+  else { src = d; off = (o * cd + (ax - ca - cb - cc)) * inner; }
+  const int dst = (o * sum + ax) * inner;
+#pragma unroll
+  for (int j = 0; j < EW_VEC; ++j) {
+    const int r = r0 + j;
+    if (r >= inner) return;
+    y[dst + r] = src[off + r];
+  }
+}
+
+// ---- copy_c on a 2-D grid (row, channel): no per-element div/mod ----
+__kernel void copy_c2(__global const half *restrict x, __global half *restrict y,
+                      const int HW, const int c0, const int cnt, const int dst_off) {
+  const int r = get_global_id(0);
+  const int c = get_global_id(1);
+  if (r >= HW || c >= cnt) return;
+  y[dst_off + c * HW + r] = x[(c0 + c) * HW + r];
+}
+
+// ---- slice_axis on a 3-D grid (inner, len, outer): no per-element div/mod ----
+__kernel void slice_axis3(__global const half *restrict x, __global half *restrict y,
+                          const int outer, const int axdim, const int inner,
+                          const int start, const int len) {
+  const int r = get_global_id(0);
+  const int a = get_global_id(1);
+  const int o = get_global_id(2);
+  if (r >= inner || a >= len || o >= outer) return;
+  y[(o * len + a) * inner + r] = x[(o * axdim + start + a) * inner + r];
+}
+
+// ---- maxpool on a 3-D grid (Wout, Hout, C): no per-element div/mod ----
+__kernel void maxpool3(__global const half *restrict x, __global half *restrict y,
+                       const int C, const int H, const int W, const int Hout,
+                       const int Wout, const int K, const int S, const int P) {
+  const int ow = get_global_id(0);
+  const int oh = get_global_id(1);
+  const int c  = get_global_id(2);
+  if (ow >= Wout || oh >= Hout || c >= C) return;
+  float m = -3.4e38f;
+  for (int kh = 0; kh < K; ++kh)
+    for (int kw = 0; kw < K; ++kw) {
+      const int yy = oh * S - P + kh, xx = ow * S - P + kw;
+      if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+        m = fmax(m, (float)x[(c * H + yy) * W + xx]);
+    }
+  y[(c * Hout + oh) * Wout + ow] = (half)m;
+}
+
+// ---- resize_nn on a 3-D grid (Wout, Hout, C): no per-element div/mod ----
+__kernel void resize_nn3(__global const half *restrict x, __global half *restrict y,
+                         const int C, const int H, const int W, const int S) {
+  const int Hout = H * S, Wout = W * S;
+  const int ow = get_global_id(0);
+  const int oh = get_global_id(1);
+  const int c  = get_global_id(2);
+  if (ow >= Wout || oh >= Hout || c >= C) return;
+  y[(c * Hout + oh) * Wout + ow] = x[(c * H + oh / S) * W + ow / S];
+}
+
+// ---- permute_0213 on a 3-D grid: no per-element div/mod ----
+//   mode 0: [1,D1,D2,I] -> [1,D2,D1,I]; grid (I, D2, D1)
+//   mode 1: [1,D1,D2,I] -> [1,D1,I,D2]; grid (D2, I, D1)
+__kernel void permute_0213_3d(__global const half *restrict x, __global half *restrict y,
+                              const int D1, const int D2, const int I, const int mode) {
+  const int a = get_global_id(0);
+  const int b = get_global_id(1);
+  const int d1 = get_global_id(2);
+  if (d1 >= D1) return;
+  if (mode == 0) {
+    const int r = a, d2 = b;
+    if (r >= I || d2 >= D2) return;
+    y[(d2 * D1 + d1) * I + r] = x[(d1 * D2 + d2) * I + r];
+  } else {
+    const int d2 = a, r = b;
+    if (d2 >= D2 || r >= I) return;
+    y[(d1 * I + r) * D2 + d2] = x[(d1 * D2 + d2) * I + r];
+  }
+}
+
+// ---- bmm on a 3-D grid (n, m, b): no per-element div/mod, same K order ----
+__kernel void bmm2(__global const half *restrict A, __global const half *restrict B2,
+                   __global half *restrict Y,
+                   const int B0, const int B1, const int M, const int K, const int N) {
+  const int n = get_global_id(0);
+  const int m = get_global_id(1);
+  const int b = get_global_id(2);
+  if (n >= N || m >= M || b >= B0 * B1) return;
+  __global const half *ap = A + ((size_t)b * M * K) + (size_t)m * K;
+  __global const half *bp = B2 + ((size_t)b * K * N) + n;
+  float acc = 0.0f;
+  for (int k = 0; k < K; ++k) acc += (float)ap[k] * (float)bp[(size_t)k * N];
+  Y[((size_t)b * M + m) * N + n] = (half)acc;
+}
+
 // ---- softmax over last axis of [outer, axdim] flattened (inner=1) ----

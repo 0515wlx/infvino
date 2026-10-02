@@ -40,6 +40,15 @@ std::vector<Candidate> candidatesGemm(const OpSignature & sig);
 std::vector<Candidate> candidatesConv1x1(const OpSignature & sig);
 /** @brief depthwise：GEMM 式 lane=空间 vs 标量 coalesced（R16）。*/
 std::vector<Candidate> candidatesDepthwise(const OpSignature & sig);
+/**
+ * @brief Round 28：小算子（launch/带宽受限）的候选变体。
+ *
+ * 覆盖 ew_binary / ew_binary_bcast / ew_unary / concat4 / copy_c / slice_axis /
+ * maxpool / resize_nn / permute_0213 / bmm / gap。变体都是**数值等价**的
+ * （逐元素表达式与归约顺序不变），只改「每 work-item 处理多少元素 / 网格维度」，
+ * 因此调优只影响性能、不影响数值。
+ */
+std::vector<Candidate> candidatesSmall(const OpSignature & sig);
 
 /**
  * @brief 在设备上对一个具体配置计时。
