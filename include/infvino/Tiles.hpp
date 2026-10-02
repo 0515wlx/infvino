@@ -114,6 +114,17 @@ struct Conv3x3Cfg
   // Round 16: register-tiled kernel (conv3x3_rt): TN channels per thread.
   int TN = 8;
   int RT = 0;
+  // Round 17: output-channel-vectorized kernel (conv3x3_osv): sub-group lanes = output
+  // channels (SG), each lane owns VECO consecutive channels x TM output columns.
+  int OSV = 0;
+  int VECO = 2;
+  // Round 17b: SLM-free sub-group-broadcast kernel (conv3x3_sg). TX=OBW, TY=OBH,
+  // CB=SG*VECO; SGK=1 selects it.
+  int SGK = 0;
+  // Round 17: SLM weight-load vector width for conv3x3_f16 (2/4/8 halfs).
+  int WVEC = 2;
+  // Round 17: diagnostic probe (0/1/2/3) — see conv.cl.
+  int PROBE = 0;
   // Round 15: SIMD width override (0 = IGC decides; 16 avoids the SIMD8 cliff).
   int SG = 0;
 
@@ -124,7 +135,8 @@ struct Conv3x3Cfg
       << " -DCB=" << CB
       << " -DCINC=" << CINC << " -DSTRIDE=" << STRIDE
       << " -DPAD=" << PAD << " -DACT=" << ACT << " -DUNROLL_CI=" << UNROLL_CI
-      << " -DVECC=" << VECC << " -DSG=" << SG
+      << " -DVECC=" << VECC << " -DSG=" << SG << " -DVECO=" << VECO
+      << " -DWVEC=" << WVEC << " -DPROBE=" << PROBE
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -133,7 +145,7 @@ struct Conv3x3Cfg
     std::ostringstream o;
     o << "TX" << TX << " TY" << TY << " TM" << TM << " TN" << TN << " CB" << CB
       << " CINC" << CINC << " s" << STRIDE << " act" << ACT << " u" << UNROLL_CI
-      << " v" << VECC << " sg" << SG << (RT ? " rt" : "");
+      << " v" << VECC << " sg" << SG << " veco" << VECO << (RT ? " rt" : "") << (OSV ? " osv" : "") << (SGK ? " sgk" : "");
     return o.str();
   }
 };
@@ -159,6 +171,11 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 10) c.SG = v[10];
   if (v.size() > 11) c.TN = v[11];
   if (v.size() > 12) c.RT = v[12];
+  if (v.size() > 13) c.OSV = v[13];
+  if (v.size() > 14) c.VECO = v[14];
+  if (v.size() > 15) c.SGK = v[15];
+  if (v.size() > 16) c.WVEC = v[16];
+  if (v.size() > 17) c.PROBE = v[17];
   return c;
 }
 

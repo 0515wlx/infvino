@@ -1153,6 +1153,139 @@ mobilevert 的 3×3/5×5 depthwise、yolo11 的 grouped conv 原本都走 `conv_
 ./build/kernel_run --plan models/mobilenetv3-small/model.plan --report --iters 5
 ```
 
+## Round 17 —— 算法层（三）：走向 OpenVINO 的输出通道向量化（两个负结果）
+
+GEMM 封顶后，单 kernel 横评（vs OpenVINO 2025.2，per-node profiling）显示：
+**GEMM 已赢 OV（13.9 vs 10.4），但 conv3x3 全输（9.9 vs 16.0）**，而 conv 占整网 ~68%。
+本轮按 OV 的 `convolution_gpu_bfyx_os_iyx_osv32` 思路做两个新 kernel，结论：**都没打赢现有
+`conv3x3_f16`（9.9 ops/EU/cyc）**，但把 conv 的真实瓶颈从「权重加载」上挪开了。
+
+### 17.1 动机：把 SIMD lane 换成输出通道
+
+现有 `conv3x3_f16` 是 **lane=空间、输出通道在寄存器里展开**（CB=32），所以：
+- 输入 strip 只载一次就被 32 个通道复用（这是它的最大优势）；
+- 但每个 (ci,kh,kw) 要载 `CB/2` 个 half2 权重、做 `CB/2` 个 half2 mad —— TM=1 时
+  **权重加载 : mad = 1 : 1**（R15.4 的判断）。
+
+OV 的 `os_iyx_osv32` 相反：**lane=输出通道（SG=16，每 lane 2 个通道）**，每个 (ci,kh,kw)
+只载 1 个权重向量、做 `OBW*OBH` 个 mad，权重复用度高；输入用 `sub_group_broadcast`
+在 lane 间广播。于是做了两个复刻。
+
+### 17.2 `conv3x3_osv`（lane=通道，仍用 SLM）——最好 7.2，负结果
+
+设计（`kernels/conv_osv.cl`）：WG 覆盖 TX×TY 空间 × CB 通道；`local(0)=RX*SG`（rx=空间块、
+lane=通道），`local(1)=TY*CG`；每 lane 拥有 `VECO` 个连续通道 × TM 列；权重 `Ws[ci][kk][CB]`
+按通道连续存，lane 读自己那段。**权重:mad = 1:TM**，累加器只有 `TM*VECO/2` 个 half2
+（通道摊到 lane 上，不再随 CB 膨胀）。
+
+实测（64→64 @80×80 s1，ops/EU/cyc）：
+
+| 配置 | TM | VECO | CB | ops/EU/cyc |
+|---|---|---|---|---|
+| `conv3x3_f16` 基线 | 1 | – | 32 | **9.88** |
+| osv 标量 | 4 | 1 | 16 | 3.81 |
+| osv 标量 | 8 | 1 | 16 | 5.84 |
+| osv | 8 | 2 | 32 | **7.19** |
+| osv | 4 | 4 | 64 | 5.95 |
+| osv | 8 | 4 | 64 | 6.81 |
+| osv | 16 | 1 | 32 | 6.05 |
+
+**为什么输**：lane=通道把「输入被 CB 个通道复用」这条最优路径拆掉了——每个 work-item
+只服务 `VECO` 个通道，strip 的载入次数按 `CB/VECO` 放大；同时 work-group 数翻数倍，
+staging/launch 开销上升。**减少权重加载并没有换来加速 → 说明权重加载不是主瓶颈。**
+
+### 17.3 `conv3x3_sg`（lane=通道 + 无 SLM + `sub_group_broadcast`）——1.5，负结果
+
+进一步照搬 OV 的数据通路（`kernels/conv_sg.cl`）：**完全不用 `__local`、不用 barrier**。
+输入块按 lane 分布载进寄存器数组 `in[]`（lane 持有 lane, lane+SG, …），用
+`sub_group_broadcast(in[e/SG], e%SG)` 取标量；权重每 lane 直接 coalesced 全局读。
+结构上就是 OV 的 `out = mad(w, broadcast(in,...), out)`。
+
+实测（同 shape）：VECO2/OBW4/OBH4 **1.24**、VECO4 **1.50**、VECO4 OBW8/OBH2 1.40、
+VECO8 0.48。ISA 反汇编：288 条 `mad :hf`、407 条 `mov`（broadcast）、**scratch=0**，
+指令数 ~2.4/mad 并不离谱，但**跑不起来**。
+
+**为什么输**：`ci` 循环无法展开（`Cin` 运行时），每个 `ci` 开头要从**全局**载入 `in[]`
+（延迟 ~200+ cyc），紧跟着 144 个依赖它的 mad；全局延迟在单个 rolled 循环里完全暴露。
+GEMM 的 `GN=1`（R12）已经证伪过「无 SLM 直读全局」，这里换 conv 复现了同一堵墙：
+**SLM 是延迟隐藏的载体，不是可绕开的开销**。（当时以为 OV 的 16 ops 是「1 broadcast + 1 mad
+的发射上限」，此说法已在 17.5 用探针更正：OV 快是因为**不做 staging**，不是发射宽度。）
+
+### 17.4 顺手证伪：SLM 权重宽载（half4/half8）无效
+
+给 `conv3x3_f16` 加了 `WVEC`（权重一次载 half2/half4/half8 再拆成多个 half2 mad）：
+
+| WVEC | ops/EU/cyc |
+|---|---|
+| 2（原）| 9.77 |
+| 4 | 9.76 |
+| 8 | 9.93 |
+
+**无变化** —— IGC 本来就把相邻 half2 载入合并了。再次说明扫描指令数不是方向。
+
+### 17.5 物理极限探针（**更正** 17.1–17.4 的推断）
+
+给 `conv3x3_f16` 加 `PROBE`（`-DPROBE=k`）：bit0=权重读换运行时寄存器常量、bit1=strip 同理、
+bit2=跳过 staging、bit3=跳过 barrier。**关键：必须反汇编确认执行宽度**——当操作数变成编译期
+常量时，IGC 会把整核从 **SIMD16 静默降成标量 `mad (1|M0)`**，此时数字完全失真（下表标 ✗）。
+
+| PROBE | 含义 | ops/EU/cyc | SIMD | 有效 |
+|---|---|---|---|---|
+| 0 | 基线 | 9.83 | 16 | ✓ |
+| 1 | 权重读→寄存器常量 | 12.31 | 16 | ✓ |
+| 2 | strip→常量 | 12.29 | **1** | ✗ |
+| 3 | 两者 | 18.03 | **1** | ✗ |
+| 4 | **跳过 staging** | **16.44** | 16 | ✓ |
+| 5 | 跳过 staging + 权重常量 | 16.75 | 16 | ✓ |
+| 12 | 跳过 staging + barrier | 17.16 | 16 | ✓ |
+| 13 | 跳过 staging + barrier + 权重常量 | 20.10 | 16 | ✓ |
+| — | 纯寄存器 half2 FMA（`fmalat h2`）| **27.4** | 16 | 参考 |
+
+**结论（推翻了 17.1–17.4 的「发射宽度」说法）**：
+
+1. **FPU 能被填满**：纯寄存器 packed-half2 FMA 达 **27.4 / 32（86%）**。所以「用最宽指令也
+   填不满 FPU」是不成立的——只要操作数在寄存器里，`mad` 就能逼近峰值。
+2. conv 基线的 9.83（31%）**不是发射宽度**造成的：主循环是 SIMD16、864 条 `mad`，非 FMA
+   指令只有 126 条 `mov: hf`，指令数远不是 2:1。
+3. 真正的大头是**存储层级的数据供给**：
+   - **staging（global→SLM + barrier）≈ 1.67×**：9.83 → 16.44（跳过 staging）；
+   - barrier 本身很小：16.44 → 17.16；
+   - **SLM 权重读 ≈ 15%**：16.44 →（跳过 staging+权重常量）20.10；
+   - 再往上到 27.4 是纯 mad 结构上限。
+4. 所以这台机器上 conv 的物理极限和 GEMM 是**同一个家族**：**staging 延迟 + SLM 操作数带宽**
+   （R10/R11 的「容量↔带宽↔并发」，R14 的 staging 31% + loads 17%），**不是 FMA 发射宽度、
+   也不是寄存器读带宽**（`fmalat` 证明 RF 可以在 3 操作数 `mad` 下喂到 86%）。OV 的 16.0 高，
+   是因为它用 `sub_group_broadcast` + 块读**根本不做 SLM staging**。
+
+### 17.6 下一步
+
+1. **`conv3x3_f16` 的 `CINC` 分块做双缓冲软件流水**（R9 在 GEMM 上验证过 +75%），把
+   global→SLM staging 与 compute 重叠掉——这是探针指出的最大单项（1.67×），优先做。
+2. 减少 staging 冗余：权重被每个 (gx,gy) work-group 重复从 global 载入 SLM；
+   可考虑用更大 `TX/TY` 或把权重常驻。
+3. 若复刻 OV：必须 `_sub_group_block_read` + 权重预重排 + **不做 staging**，而不是我们那种
+   逐 lane `broadcast`（17.3 的 sg kernel 因全局延迟暴露而失败）。
+
+### 17.7 复现
+
+```bash
+# 基线 vs osv vs sg（64→64 @80×80 s1）
+./build/kernel_bench --op conv3x3    --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2
+./build/kernel_bench --op conv3x3osv --conv-shape 64,64,80,80 --conv 16,8,8,32,16,1,1,0,3,1,16,8,0,0,2
+./build/kernel_bench --op conv3x3sg  --conv-shape 64,64,80,80 --conv 4,4,1,64,16,1,1,0,3,1,16,8,0,0,4
+# 权重宽载对照
+./build/kernel_bench --op conv3x3    --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,8
+# 物理极限探针（0基线 / 4跳staging / 12+barrier / 13+权重常量）
+./build/kernel_bench --op conv3x3    --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,4
+./build/kernel_bench --op conv3x3    --conv-shape 64,64,80,80 --conv 40,8,1,32,16,1,1,0,3,1,16,8,0,0,2,0,2,13
+# 纯寄存器 FMA 参考
+./build/kernel_bench --op fmalat --width h2 --depth 8 --sg 16
+```
+
+> 对照数据：OpenVINO 2025.2 单节点 GPU 时间（per-node profiling）conv3x3 = **16.0**
+> （`convolution_gpu_bfyx_os_iyx_osv32`，direct conv，非 Winograd），
+> gemm = 10.4；infvino gemm 13.9（见上一轮横评，脚本 `/tmp/opencode/ov_ops.py`）。
+
 ## 稳定性事故记录（重要）
 
 - **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成

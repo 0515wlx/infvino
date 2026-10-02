@@ -50,6 +50,18 @@
 #ifndef UNROLL_CI
 #define UNROLL_CI 1
 #endif
+// Round 17: SLM weight-load vector width (halfs): 2 (half2, original), 4, 8.
+// The weight tile Ws[ci][kk][CB] is channel-contiguous, so one wide load can feed
+// several half2 mads (CB must be a multiple of WVEC).
+#ifndef WVEC
+#define WVEC 2
+#endif
+// Round 17 diagnostic (R14 style): PROBE bit0 = replace SLM weight load with a
+// runtime register constant (keeps the mad structure); bit1 = same for the input
+// strip. Isolates operand/L1/SLM feed cost from the mad issue itself.
+#ifndef PROBE
+#define PROBE 0
+#endif
 // Round 15: force the sub-group (SIMD) width, like the GEMM (SG=16 avoids the
 // IGC SIMD8 cliff). 0 = let IGC decide.
 #ifndef SG
@@ -118,6 +130,7 @@ __kernel void conv3x3_f16(
   const int cchunks = (Cin + CINC - 1) / CINC;
   for (int cc = 0; cc < cchunks; ++cc) {
     const int cbase = cc * CINC;
+#if !(PROBE & 4)
     // ---- stage input halo tile (once per Cin chunk) ----
     for (int idx = tid; idx < CINC * IN_ROWS * IN_COLS; idx += NTHREADS) {
       int ci = idx / (IN_ROWS * IN_COLS);
@@ -142,7 +155,10 @@ __kernel void conv3x3_f16(
       if (gout < Cout && gc < Cin) v = Wt[((size_t)gout * Cin + gc) * KHKW + kk];
       Ws[ci][kk][t] = v;
     }
+#endif
+#if !(PROBE & 8)
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
     const int lrow = ly * STRIDE;
     const int lcol0 = lx * TM * STRIDE;
@@ -153,20 +169,59 @@ __kernel void conv3x3_f16(
       for (int kh = 0; kh < KH; ++kh) {
         // Contiguous input strip for this row, reused across all kw.
         half strip[STRIPN];
+#if (PROBE & 2)
+        const half pc_x = (half)((H & 7) | 1);
+#pragma unroll
+        for (int i = 0; i < STRIPN; ++i) strip[i] = pc_x;
+#else
 #pragma unroll
         for (int i = 0; i < STRIPN; ++i) strip[i] = Xs[ci][lrow + kh][lcol0 + i];
+#endif
 #if VECC
 #pragma unroll
         for (int kw = 0; kw < KW; ++kw) {
+#if WVEC == 8
+#pragma unroll
+          for (int t8 = 0; t8 < CB / 8; ++t8) {
+            const half8 w8 = *(__local half8 *)&Ws[ci][kh * KW + kw][8 * t8];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+              const half x = strip[i * STRIDE + kw];
+#pragma unroll
+              for (int q = 0; q < 4; ++q)
+                acc[i][4 * t8 + q] =
+                  mad((half2)(x, x), (half2)(w8[2 * q], w8[2 * q + 1]), acc[i][4 * t8 + q]);
+            }
+          }
+#elif WVEC == 4
+#pragma unroll
+          for (int t4 = 0; t4 < CB / 4; ++t4) {
+            const half4 w4 = *(__local half4 *)&Ws[ci][kh * KW + kw][4 * t4];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+              const half x = strip[i * STRIDE + kw];
+#pragma unroll
+              for (int q = 0; q < 2; ++q)
+                acc[i][2 * t4 + q] =
+                  mad((half2)(x, x), (half2)(w4[2 * q], w4[2 * q + 1]), acc[i][2 * t4 + q]);
+            }
+          }
+#else
 #pragma unroll
           for (int t2 = 0; t2 < CB / 2; ++t2) {
+#if (PROBE & 1)
+            const half pc_w = (half)((W & 7) | 1);
+            const half2 w2 = (half2)(pc_w, pc_w);
+#else
             const half2 w2 = *(__local half2 *)&Ws[ci][kh * KW + kw][2 * t2];
+#endif
 #pragma unroll
             for (int i = 0; i < TM; ++i) {
               const half x = strip[i * STRIDE + kw];
               acc[i][t2] = mad((half2)(x, x), w2, acc[i][t2]);
             }
           }
+#endif
         }
 #else
 #pragma unroll
@@ -184,7 +239,9 @@ __kernel void conv3x3_f16(
 #endif
       }
     }
+#if !(PROBE & 8)
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
   }
 
   // ---- store ----
