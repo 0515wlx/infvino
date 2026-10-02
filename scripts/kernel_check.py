@@ -44,6 +44,53 @@ def gen_inputs(shape, workdir):
     return pa, pb, ref
 
 
+# R29: attention bmm + softmax numeric coverage.
+DEFAULT_BMM = [
+    (1, 2, 400, 32, 400, "attn QK^T"),
+    (1, 2, 64, 400, 400, "attn PV"),
+]
+BMM_VARIANTS = [
+    ("bmm", ""),
+    ("bmm2", ""),
+    ("bmm_t", "-DBMM_TM=4 -DBMM_TN=8 -DBMM_UK=4"),
+    ("bmm_t", "-DBMM_TM=8 -DBMM_TN=4 -DBMM_UK=4"),
+]
+DEFAULT_SOFTMAX = [
+    (800, 400, 1, "attn"),
+    (1, 16, 33600, "dfl"),
+]
+SOFTMAX_VARIANTS = [
+    ("softmax_axis", ""),
+    ("softmax_axis_r", "-DSM_WGS=64"),
+]
+
+
+def gen_bmm(shape, workdir):
+    B0, B1, M, K, N, _ = shape
+    rng = np.random.default_rng(0)
+    a = rng.random((B0 * B1, M, K)).astype(np.float16)
+    b = rng.random((B0 * B1, K, N)).astype(np.float16)
+    pa = os.path.join(workdir, f"bmmA_{B0}x{B1}x{M}x{K}x{N}.bin")
+    pb = os.path.join(workdir, f"bmmB_{B0}x{B1}x{M}x{K}x{N}.bin")
+    a.tofile(pa)
+    b.tofile(pb)
+    ref = np.einsum("bmk,bkn->bmn", a.astype(np.float32), b.astype(np.float32)).astype(np.float16)
+    return pa, pb, ref
+
+
+def gen_softmax(shape, workdir):
+    outer, axdim, inner, _ = shape
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((outer, axdim, inner)).astype(np.float16)
+    px = os.path.join(workdir, f"sm_{outer}x{axdim}x{inner}.bin")
+    x.tofile(px)
+    xs = x.astype(np.float32)
+    mx = xs.max(axis=1, keepdims=True)
+    e = np.exp(xs - mx)
+    ref = (e / e.sum(axis=1, keepdims=True)).astype(np.float16)
+    return px, ref
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=os.getcwd())
@@ -89,6 +136,20 @@ def main() -> int:
         px, pw, pb, ref = gen_conv(shape, args.workdir)
         ov_jobs.append((shape, px, pw, pb, ref))
         print(f"[ref] conv3x3ov {Cin}x{Cout}x{H}x{W}s{s} {label}")
+
+    bmm_jobs = []
+    for shape in DEFAULT_BMM:
+        pa, pb, ref = gen_bmm(shape, args.workdir)
+        for kern, opts in BMM_VARIANTS:
+            bmm_jobs.append((shape, kern, opts, pa, pb, ref))
+        print(f"[ref] bmm {shape[0]}x{shape[1]}x{shape[2]}x{shape[3]}x{shape[4]} {shape[5]}")
+
+    sm_jobs = []
+    for shape in DEFAULT_SOFTMAX:
+        px, ref = gen_softmax(shape, args.workdir)
+        for kern, opts in SOFTMAX_VARIANTS:
+            sm_jobs.append((shape, kern, opts, px, ref))
+        print(f"[ref] softmax {shape[0]}x{shape[1]}x{shape[2]} {shape[3]}")
 
     tiles_arg = f"--tiles {args.tiles}" if args.tiles else ""
     inner = [
@@ -142,6 +203,26 @@ def main() -> int:
         )
     inner.append("if dmesg 2>/dev/null | grep -q 'GPU HANG'; then "
                  "echo '[kernel_check] GPU HANG detected'; exit 3; fi")
+    for shape, kern, opts, pa, pb, _ in bmm_jobs:
+        B0, B1, M, K, N, _ = shape
+        tag = f"{kern}_{B0}x{B1}x{M}x{K}x{N}"
+        optarg = f'--opts "{opts}"' if opts else ""
+        inner.append(
+            f"timeout 30 /tmp/build/kernel_numtest --op bmm --kernel {kern} {optarg} "
+            f"--b0 {B0} --b1 {B1} --m {M} --n {N} --k {K} "
+            f"--input-a /work/{os.path.basename(pa)} --input-b /work/{os.path.basename(pb)} "
+            f"--dump /work/out_{tag}.bin || echo RUNFAIL bmm {tag}"
+        )
+    for shape, kern, opts, px, _ in sm_jobs:
+        outer, axdim, inn, _ = shape
+        tag = f"{kern}_{outer}x{axdim}x{inn}"
+        optarg = f'--opts "{opts}"' if opts else ""
+        inner.append(
+            f"timeout 30 /tmp/build/kernel_numtest --op softmax --kernel {kern} {optarg} "
+            f"--outer {outer} --axdim {axdim} --inner {inn} "
+            f"--input-x /work/{os.path.basename(px)} --dump /work/out_{tag}.bin "
+            f"|| echo RUNFAIL softmax {tag}"
+        )
     run(["docker", "run", "--rm",
          "--memory=3g", "--memory-swap=3g", "--pids-limit=256",
          "--device=/dev/dri/renderD128",
@@ -203,6 +284,30 @@ def main() -> int:
         ok, msg = _cmp(got, ref)
         ok_all &= ok
         print(f"  conv3x3ov {Cin}x{Cout}x{H}x{W}s{s} {label:16s} {msg} -> {'PASS' if ok else 'FAIL'}")
+    for shape, kern, opts, _, _, ref in bmm_jobs:
+        B0, B1, M, K, N, label = shape
+        tag = f"{kern}_{B0}x{B1}x{M}x{K}x{N}"
+        path = os.path.join(args.workdir, f"out_{tag}.bin")
+        if not os.path.exists(path):
+            ok_all = False
+            print(f"  bmm {kern:10s} {M}x{N}x{K} B{B0}.{B1} MISSING -> FAIL")
+            continue
+        got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
+        ok, msg = _cmp(got, ref)
+        ok_all &= ok
+        print(f"  bmm {kern:10s} {M}x{N}x{K} B{B0}.{B1} {label:12s} {msg} -> {'PASS' if ok else 'FAIL'}")
+    for shape, kern, opts, _, ref in sm_jobs:
+        outer, axdim, inn, label = shape
+        tag = f"{kern}_{outer}x{axdim}x{inn}"
+        path = os.path.join(args.workdir, f"out_{tag}.bin")
+        if not os.path.exists(path):
+            ok_all = False
+            print(f"  softmax {kern:16s} {outer}x{axdim}x{inn} MISSING -> FAIL")
+            continue
+        got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
+        ok, msg = _cmp(got, ref)
+        ok_all &= ok
+        print(f"  softmax {kern:16s} {outer}x{axdim}x{inn} {label:6s} {msg} -> {'PASS' if ok else 'FAIL'}")
     print("\nRESULT:", "ALL PASS" if ok_all else "SOME FAILED")
     return 0 if ok_all else 1
 

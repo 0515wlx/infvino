@@ -465,3 +465,66 @@ mobilenet `1.31e-2 / 1.09e-2`，**三模型 PASS**。
 > `bmm`/`softmax` 仍偏慢（yolo11 0.80/0.54 ms）：`bmm2` 只是去索引开销，
 > 计算仍是「1 WI/输出 + 串行 K」，本质是 R22 记的 attention 网格饥饿，属 kernel 本体待改。
 
+---
+
+## 12. Round 29：串行数据通路的专用 kernel（attention bmm / softmax）
+
+> 用户问题：bmm 这类算子「软件流水没写、串行堵塞」。用 R18.7 的硬件模型
+> `ops/EU/cyc = 32 × mad_frac × SIMD/16` 分析并写专用 kernel。
+
+### 12.1 诊断（硬件模型 + ops/EU/cyc）
+
+yolo11 的 attention（R28 缓存）实测：
+
+| 算子 | ms | FLOPs | ops/EU/cyc | 卡在哪 |
+|---|---:|---:|---:|---|
+| `bmm` 1（400×400×32, B2）| 0.27 | 20.5 M | **0.73** | 每输出 1 WI、串行 K、A/B 每次重载（mad_frac≈0.33）|
+| `bmm` 2（64×400×400, B2）| 0.54 | 41.0 M | **0.73** | 同上，且 B 被每个 m-tile 重读 |
+| `softmax`（800×400）| ~0.47 | — | — | **1 WI 串行扫 400 三遍**，仅 800 WI → 延迟堵塞 |
+| `softmax`（1×16×33600）| 0.07 | — | — | 轴短、inner 大，串行已合适 |
+
+FP32 峰值为 16 ops/EU/cyc（8 FMA/EU/cyc）；`0.73` = **4.6%**。Isa 反汇编确认
+`bmm_t`（初版）762 条指令里只有 64 条 `mad`、289 条 `mov`、52 条 `send.dc0`——纯标量、
+无向量载入、无流水。
+
+### 12.2 专用 kernel
+
+- **`bmm_t`（寄存器分块）**：一个 WI 算 `BMM_TM×BMM_TN` 个输出，A 复用 TN 次、B 复用
+  TM 次（标量版每次都从 L3 重载）。K 按 `BMM_UK` 展开、B 用 `half8` 显式向量载入，
+  把「K 次依赖链」变成 `BMM_UK` 路独立链以隐藏 `half→float`/FMA 延迟。fp32 累加，
+  K 顺序与旧 `bmm` 一致 → **逐位相同**（kernel_check 实测 `max_abs=0`）。
+- **`softmax_axis_r`（并行归约）**：一个 work-group 处理一行，`SM_WGS` 个 lane 分块扫
+  `axdim`，SLM 上做 fp32 max/sum 树归约（三趟：max → exp-sum → 写回）。
+  轴长时选它，轴短（dfl 16）时串行版更优，由调优器按 shape 选。
+
+### 12.3 R29 实测
+
+| 指标 | R28 | **R29** | 加速 |
+|---|---:|---:|---:|
+| bmm 合计 | 0.810 ms | **0.305 ms** | **2.66×** |
+| softmax 合计 | 0.544 ms | **0.128 ms** | **4.25×** |
+| yolo11 kernel busy | 17.04 ms | **16.11 ms** | −5.5% |
+
+调优器选择：`bmm` → `bmm_t`（`TM8x4u4` / `TM4x4u4`）、attention softmax → `softmax_axis_r`
+（`WGS=64`）、dfl softmax → 串行 `softmax_axis`。
+
+**数值**（`kernel_check.py`，新增 bmm/softmax 用例）：bmm 三个变体
+（`bmm`/`bmm2`/`bmm_t`）**逐位相同**（`max_abs=0`）；`softmax_axis_r` vs numpy FP32
+`mean_rel≈8e-8`，与串行版一致。整网 `model_check` 三模型 PASS。
+
+### 12.4 mobilenet logits 的 `mean_rel≈1.3e-2`（口径澄清）
+
+用户质疑该值偏大。查证结论：**既非抖动也非 bug**。
+
+- 3 次运行输出**逐位相同**；R22 起记录一直是 1.31e-2。
+- 误差来源：classifier 前 ~50 层 fp16 激活累积，使 `Flatten` 输出 `h` 有 mean rel
+  `8.9e-3`；classifier 权重 `sum|W3|≈73` 把它放大成 logits 绝对误差 `1.6e-2`；
+  而 `mean_rel = 1.6e-2 / mean|logits|(=1.22) = 1.3e-2`。
+  直接验证：用 infvino 的 `h` 与参考 `h` 经 fp64 classifier，得到 logits 误差
+  `mean=1.598e-2`，与实测 `1.593e-2` 吻合。
+- yolo 的输出是坐标（`|x|≈200`），同样的绝对误差读成 `5e-4`；**两者数值质量一致**，
+  差异纯粹来自输出量级。
+- 已给 `model_check.py` 增加尺度无关指标：`quant_rel`（逐元素相对误差中位数）、
+  `ulp_frac`（落在 1 ULP 内的比例）、`scale_rel`（误差/输出动态范围），避免分类
+  logits 这类小量级输出被误读。
+

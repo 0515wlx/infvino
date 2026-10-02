@@ -9,6 +9,8 @@
 // 约定：输入/输出均为 fp16 little-endian 裸数据（*.bin），row-major。
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -48,8 +50,10 @@ int main(int argc, char ** argv)
 {
   std::string op = "gemm", kernel_dir = INFVINO_KERNEL_DIR;
   std::string in_a, in_b, dump, in_x, in_w, in_bias;
+  std::string knl, opts;
   int M = 0, N = 0, K = 0, iters = 1;
   int Cin = 0, Cout = 0, H = 0, W = 0, stride = -1, pad = -1;
+  int B0 = 1, B1 = 1, outer = 0, axdim = 0, inner = 1;
   gk::Tiles tiles;
   gk::Conv3x3Cfg conv;
 
@@ -57,10 +61,17 @@ int main(int argc, char ** argv)
     const std::string a = argv[i];
     auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
     if (a == "--op") op = next();
+    else if (a == "--kernel") knl = next();
+    else if (a == "--opts") opts = next();
     else if (a == "--kernel-dir") kernel_dir = next();
     else if (a == "--m") M = std::atoi(next().c_str());
     else if (a == "--n") N = std::atoi(next().c_str());
     else if (a == "--k") K = std::atoi(next().c_str());
+    else if (a == "--b0") B0 = std::atoi(next().c_str());
+    else if (a == "--b1") B1 = std::atoi(next().c_str());
+    else if (a == "--outer") outer = std::atoi(next().c_str());
+    else if (a == "--axdim") axdim = std::atoi(next().c_str());
+    else if (a == "--inner") inner = std::atoi(next().c_str());
     else if (a == "--cin") Cin = std::atoi(next().c_str());
     else if (a == "--cout") Cout = std::atoi(next().c_str());
     else if (a == "--h") H = std::atoi(next().c_str());
@@ -297,6 +308,84 @@ int main(int argc, char ** argv)
       clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dY);
       if (dB) clReleaseMemObject(dB);
       clReleaseKernel(k);
+    } else if (op == "bmm") {
+      if (M <= 0 || N <= 0 || K <= 0) throw std::runtime_error("need --m --n --k");
+      const std::string kern = knl.empty() ? "bmm" : knl;
+      auto hA = readBin(in_a, static_cast<size_t>(B0) * B1 * M * K);
+      auto hB = readBin(in_b, static_cast<size_t>(B0) * B1 * K * N);
+      cl_kernel k = rt.buildKernel("ops", kern, opts);
+      cl_mem dA = rt.alloc(static_cast<size_t>(B0) * B1 * M * K * 2, CL_MEM_READ_ONLY);
+      cl_mem dB = rt.alloc(static_cast<size_t>(B0) * B1 * K * N * 2, CL_MEM_READ_ONLY);
+      cl_mem dY = rt.alloc(static_cast<size_t>(B0) * B1 * M * N * 2, CL_MEM_WRITE_ONLY);
+      rt.write(dA, static_cast<size_t>(B0) * B1 * M * K * 2, hA.data());
+      rt.write(dB, static_cast<size_t>(B0) * B1 * K * N * 2, hB.data());
+      clSetKernelArg(k, 0, sizeof(dA), &dA);
+      clSetKernelArg(k, 1, sizeof(dB), &dB);
+      clSetKernelArg(k, 2, sizeof(dY), &dY);
+      clSetKernelArg(k, 3, sizeof(B0), &B0);
+      clSetKernelArg(k, 4, sizeof(B1), &B1);
+      clSetKernelArg(k, 5, sizeof(M), &M);
+      clSetKernelArg(k, 6, sizeof(K), &K);
+      clSetKernelArg(k, 7, sizeof(N), &N);
+      auto optInt = [&](const char * key, int def) {
+        const auto p = opts.find(key);
+        return p == std::string::npos ? def : std::atoi(opts.c_str() + p + std::strlen(key));
+      };
+      if (kern == "bmm2") {
+        const size_t g[3] = {(size_t)N, (size_t)M, (size_t)B0 * B1};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+      } else if (kern == "bmm_t") {
+        const int TM = optInt("-DBMM_TM=", 4), TN = optInt("-DBMM_TN=", 8);
+        const size_t g[3] = {(size_t)((N + TN - 1) / TN), (size_t)((M + TM - 1) / TM),
+                             (size_t)B0 * B1};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+      } else {
+        const size_t g[1] = {(size_t)B0 * B1 * M * N};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+      }
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hY(static_cast<size_t>(B0) * B1 * M * N);
+        rt.read(dY, static_cast<size_t>(B0) * B1 * M * N * 2, hY.data());
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (bmm %dx%dx%d B%d.%d fp16)\n",
+                     dump.c_str(), M, N, K, B0, B1);
+      }
+      clReleaseMemObject(dA); clReleaseMemObject(dB); clReleaseMemObject(dY); clReleaseKernel(k);
+    } else if (op == "softmax") {
+      if (outer <= 0 || axdim <= 0 || inner <= 0)
+        throw std::runtime_error("need --outer --axdim --inner");
+      const std::string kern = knl.empty() ? "softmax_axis" : knl;
+      auto hX = readBin(in_x, static_cast<size_t>(outer) * axdim * inner);
+      cl_kernel k = rt.buildKernel("ops", kern, opts);
+      cl_mem dX = rt.alloc(hX.size() * 2, CL_MEM_READ_ONLY);
+      cl_mem dY = rt.alloc(hX.size() * 2, CL_MEM_WRITE_ONLY);
+      rt.write(dX, hX.size() * 2, hX.data());
+      clSetKernelArg(k, 0, sizeof(dX), &dX);
+      clSetKernelArg(k, 1, sizeof(dY), &dY);
+      clSetKernelArg(k, 2, sizeof(outer), &outer);
+      clSetKernelArg(k, 3, sizeof(axdim), &axdim);
+      clSetKernelArg(k, 4, sizeof(inner), &inner);
+      if (kern == "softmax_axis_r") {
+        const auto p = opts.find("-DSM_WGS=");
+        const int wgs = p == std::string::npos ? 128
+                                               : std::atoi(opts.c_str() + p + std::strlen("-DSM_WGS="));
+        const size_t lws[2] = {(size_t)wgs, 1};
+        const size_t gws[2] = {(size_t)outer * wgs, (size_t)inner};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
+      } else {
+        const size_t g[1] = {(size_t)outer * inner};
+        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+      }
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hY(hX.size());
+        rt.read(dY, hX.size() * 2, hY.data());
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (softmax %dx%dx%d fp16)\n",
+                     dump.c_str(), outer, axdim, inner);
+      }
+      clReleaseMemObject(dX); clReleaseMemObject(dY); clReleaseKernel(k);
     } else {
       throw std::runtime_error("unsupported op: " + op);
     }

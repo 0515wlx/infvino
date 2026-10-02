@@ -380,7 +380,7 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
   if (s.op == "ew_binary" || s.op == "ew_binary_bcast" || s.op == "ew_unary" ||
       s.op == "concat4" || s.op == "copy_c" || s.op == "slice_axis" ||
       s.op == "maxpool" || s.op == "resize_nn" || s.op == "permute_0213" ||
-      s.op == "bmm" || s.op == "bias_add")
+      s.op == "bmm" || s.op == "bias_add" || s.op == "softmax_axis")
     return 8.0;
 
   return 1.0;

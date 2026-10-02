@@ -388,6 +388,9 @@ OpSignature PlanModel::smallSig(const Node & n) const
   if (n.op == "permute_0213")
     return OpSignature::custom("permute_0213", {attrInt(n, "D1", 1), attrInt(n, "D2", 1),
                                                 attrInt(n, "I", 1), attrInt(n, "mode", 0)});
+  if (n.op == "softmax_axis")
+    return OpSignature::custom("softmax_axis", {attrInt(n, "outer", 1), attrInt(n, "axdim", 0),
+                                                attrInt(n, "inner", 1)});
   if (n.op == "bmm")
   {
     // dims: A=[B0,B1,M,K], B=[B0,B1,K,N]（这里的首两维可能是 1，需按张量自身形状取）。
@@ -679,10 +682,46 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
       gws[1] = static_cast<size_t>(M);
       gws[2] = static_cast<size_t>(B0) * static_cast<size_t>(B1);
     }
+    else if (kernel == "bmm_t")
+    {
+      const int TM = std::max(1, optInt("-DBMM_TM=", 4));
+      const int TN = std::max(1, optInt("-DBMM_TN=", 8));
+      dim = 3;
+      gws[0] = static_cast<size_t>((N + TN - 1) / TN);
+      gws[1] = static_cast<size_t>((M + TM - 1) / TM);
+      gws[2] = static_cast<size_t>(B0) * static_cast<size_t>(B1);
+    }
     else
     {
       gws[0] = static_cast<size_t>(B0) * static_cast<size_t>(B1) * static_cast<size_t>(M) *
                static_cast<size_t>(N);
+    }
+    return;
+  }
+  if (n.op == "softmax_axis")
+  {
+    int outer = attrInt(n, "outer", 1), axdim = attrInt(n, "axdim", 0),
+        inner = attrInt(n, "inner", 1);
+    cl_mem dx = inMem(0);
+    clSetKernelArg(k, 0, sizeof(dx), &dx);
+    clSetKernelArg(k, 1, sizeof(dy), &dy);
+    clSetKernelArg(k, 2, sizeof(outer), &outer);
+    clSetKernelArg(k, 3, sizeof(axdim), &axdim);
+    clSetKernelArg(k, 4, sizeof(inner), &inner);
+    if (kernel == "softmax_axis_r")
+    {
+      const int wgs = std::max(1, optInt("-DSM_WGS=", 128));
+      useLws = true;
+      dim = 2;
+      lws[0] = static_cast<size_t>(wgs);
+      lws[1] = 1;
+      // one work-group per (outer, inner) row; the group's WGS lanes reduce the axis.
+      gws[0] = static_cast<size_t>(outer) * static_cast<size_t>(wgs);
+      gws[1] = static_cast<size_t>(inner);
+    }
+    else
+    {
+      gws[0] = static_cast<size_t>(outer) * static_cast<size_t>(inner);
     }
     return;
   }
@@ -1263,15 +1302,14 @@ void PlanModel::run()
     }
     else if (n.op == "softmax_axis")
     {
-      int outer = attrInt(n, "outer", 1), axdim = attrInt(n, "axdim", 0), inner = attrInt(n, "inner", 1);
-      cl_mem dx = in(0).mem, dy = out.mem;
-      clSetKernelArg(kSoftmax_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kSoftmax_, 1, sizeof(dy), &dy);
-      clSetKernelArg(kSoftmax_, 2, sizeof(outer), &outer);
-      clSetKernelArg(kSoftmax_, 3, sizeof(axdim), &axdim);
-      clSetKernelArg(kSoftmax_, 4, sizeof(inner), &inner);
-      const size_t g = static_cast<size_t>(outer) * inner;
-      timed("softmax_axis", kSoftmax_, 1, &g, nullptr);
+      const OpSignature sig = smallSig(n);
+      std::string kern, opts;
+      cl_kernel   k = smallKernelFor(sig, "softmax_axis", kern, opts);
+      cl_uint     dim;
+      size_t      gws[3], lws[3];
+      bool        useLws;
+      smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
+      timed("softmax_axis", k, dim, gws, useLws ? lws : nullptr);
     }
     else if (n.op == "permute_0213")
     {
@@ -1398,7 +1436,7 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
                (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
                 n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
                 n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
-                n.op == "gap")) {
+                n.op == "softmax_axis" || n.op == "gap")) {
       // Round 28: 小算子签名（与 dispatch/autotune 完全一致）。
       add(smallSig(n));
     }
@@ -1719,7 +1757,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
          n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
          n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
-         n.op == "gap");
+         n.op == "softmax_axis" || n.op == "gap");
       if (smallOp && opInList(ops, n.op))
       {
         const OpSignature sig = smallSig(n);

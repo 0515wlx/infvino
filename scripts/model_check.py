@@ -118,9 +118,27 @@ def main():
     mean_rel = float(diff.mean() / (np.abs(r).mean() + 1e-12))
     max_rel = float(diff.max() / (np.abs(r).max() + 1e-12))
     ok = (mean_rel < MEAN_REL_TOL) and (max_rel < MAX_REL_TOL)
+
+    # R28: 补充两个**尺度无关**指标，解释 mean_rel 的口径问题。
+    #   * mean_rel 是 mean|diff| / mean|ref|，当输出是分类 logits（mean|ref|~1）时，
+    #     一个固定的绝对误差（~0.5 fp16 ULP 量级）会被读成 ~1e-2；而 yolo 的坐标输出
+    #     量级 ~200，同样的绝对误差读成 ~5e-4。两者数值质量其实一致。
+    #   * quant_rel：逐元素相对误差的中位数（仅 |ref| 明显非零），衡量「典型元素」精度。
+    #   * ulp_frac ：落在参考值 1 个 fp16 ULP 内的元素比例（接近 1 = 达 fp16 精度极限）。
+    den = np.abs(r)
+    nz = den > 1e-3
+    quant_rel = float(np.median(diff[nz] / den[nz])) if nz.any() else 0.0
+    ulp = np.abs(r) * (2 ** -10) + 1e-6          # fp16 半 ULP 上界（含次正规近似）
+    ulp_frac = float((diff <= ulp).mean())
+    # 相对输出动态范围（scale-normalized）：不因输出量级小而虚高。
+    scale_rel = float(diff.mean() / (np.abs(r).max() + 1e-12))
+
     print(f"\n=== {args.model} end-to-end (相对误差) ===")
     print(f"  mean_rel={mean_rel:.3e} max_rel(amax)={max_rel:.3e} "
           f"max_abs={float(diff.max()):.3e} -> {'PASS' if ok else 'FAIL'}")
+    print(f"  [scale-normalized] quant_rel(median)={quant_rel:.3e} "
+          f"ulp_frac={ulp_frac:.3f} scale_rel={scale_rel:.3e} "
+          f"(mean|ref|={np.abs(r).mean():.3e} max|ref|={np.abs(r).max():.3e})")
 
     # 5) ops/EU/cyc（单流，kernel 自身时间之和）
     gf = conv_flops(onnx_path) / 1e9

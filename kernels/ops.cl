@@ -417,4 +417,146 @@ __kernel void bmm2(__global const half *restrict A, __global const half *restric
   Y[((size_t)b * M + m) * N + n] = (half)acc;
 }
 
+// ---- register-tiled batched matmul: one work-item computes a BMM_TM x BMM_TN
+// output tile, so each A value is reused BMM_TN times and each B value BMM_TM
+// times (the scalar bmm above re-loads both from L3 for every output ->
+// mad_frac ~ 1/3 and 0.73 ops/EU/cyc).  fp32 accumulation, K consumed in the
+// same order as `bmm`, so the result is numerically equivalent (<=1 ulp).
+//   knobs: BMM_TM, BMM_TN
+#ifndef BMM_TM
+#define BMM_TM 4
+#endif
+#ifndef BMM_TN
+#define BMM_TN 8
+#endif
+#ifndef BMM_UK
+#define BMM_UK 4
+#endif
+__kernel void bmm_t(__global const half *restrict A, __global const half *restrict B2,
+                    __global half *restrict Y,
+                    const int B0, const int B1, const int M, const int K, const int N) {
+  const int n0 = get_global_id(0) * BMM_TN;
+  const int m0 = get_global_id(1) * BMM_TM;
+  const int b  = get_global_id(2);
+  if (m0 >= M || n0 >= N || b >= B0 * B1) return;
+
+  float acc[BMM_TM][BMM_TN];
+#pragma unroll
+  for (int i = 0; i < BMM_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < BMM_TN; ++j) acc[i][j] = 0.0f;
+
+  __global const half *ap = A + ((size_t)b * M + m0) * K;
+  __global const half *bp = B2 + (size_t)b * K * N + n0;
+  const bool full = (m0 + BMM_TM <= M) && (n0 + BMM_TN <= N);
+  if (full) {
+    int k = 0;
+    // K unrolled by BMM_UK: 4 independent k-iterations interleave, hiding the
+    // half->float and FMA latency (the plain loop was latency-bound).
+    for (; k + BMM_UK <= K; k += BMM_UK) {
+      float bv[BMM_UK][BMM_TN];
+#pragma unroll
+      for (int u = 0; u < BMM_UK; ++u) {
+#if BMM_TN == 8
+        const half8 bw = *(__global const half8 *)&bp[(size_t)(k + u) * N];
+#pragma unroll
+        for (int j = 0; j < BMM_TN; ++j) bv[u][j] = (float)bw[j];
+#else
+#pragma unroll
+        for (int j = 0; j < BMM_TN; ++j) bv[u][j] = (float)bp[(size_t)(k + u) * N + j];
+#endif
+      }
+#pragma unroll
+      for (int i = 0; i < BMM_TM; ++i) {
+        float av[BMM_UK];
+#pragma unroll
+        for (int u = 0; u < BMM_UK; ++u) av[u] = (float)ap[(size_t)i * K + k + u];
+#pragma unroll
+        for (int u = 0; u < BMM_UK; ++u)
+#pragma unroll
+          for (int j = 0; j < BMM_TN; ++j) acc[i][j] += av[u] * bv[u][j];
+      }
+    }
+    for (; k < K; ++k) {
+      float bv[BMM_TN];
+#pragma unroll
+      for (int j = 0; j < BMM_TN; ++j) bv[j] = (float)bp[(size_t)k * N + j];
+#pragma unroll
+      for (int i = 0; i < BMM_TM; ++i) {
+        const float av = (float)ap[(size_t)i * K + k];
+#pragma unroll
+        for (int j = 0; j < BMM_TN; ++j) acc[i][j] += av * bv[j];
+      }
+    }
+  } else {
+    for (int k = 0; k < K; ++k) {
+      float av[BMM_TM], bv[BMM_TN];
+#pragma unroll
+      for (int i = 0; i < BMM_TM; ++i)
+        av[i] = (m0 + i < M) ? (float)ap[(size_t)i * K + k] : 0.0f;
+#pragma unroll
+      for (int j = 0; j < BMM_TN; ++j)
+        bv[j] = (n0 + j < N) ? (float)bp[(size_t)k * N + j] : 0.0f;
+#pragma unroll
+      for (int i = 0; i < BMM_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < BMM_TN; ++j) acc[i][j] += av[i] * bv[j];
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < BMM_TM; ++i) {
+    const int mm = m0 + i;
+    if (mm >= M) continue;
+#pragma unroll
+    for (int j = 0; j < BMM_TN; ++j) {
+      const int nn = n0 + j;
+      if (nn < N) Y[((size_t)b * M + mm) * N + nn] = (half)acc[i][j];
+    }
+  }
+}
+
+// ---- parallel softmax over one axis: one work-group per (outer, inner) row,
+// the SM_WGS lanes reduce the `axdim` axis in SLM (fp32), instead of the single
+// work-item scanning it serially 3x.  Chosen by the tuner when axdim is large
+// (attention: 800x400); the serial `softmax_axis` wins for short axes (dfl: 16).
+#ifndef SM_WGS
+#define SM_WGS 128
+#endif
+__kernel void softmax_axis_r(__global const half *restrict x, __global half *restrict y,
+                             const int outer, const int axdim, const int inner) {
+  const int o = get_group_id(0);
+  const int r = get_group_id(1);
+  const int lid = get_local_id(0);
+  if (o >= outer || r >= inner) return;
+  __local float red[SM_WGS];
+  __global const half *base = x + ((size_t)o * axdim) * inner + r;
+
+  float m = -3.4e38f;
+  for (int a = lid; a < axdim; a += SM_WGS) m = fmax(m, (float)base[(size_t)a * inner]);
+  red[lid] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = SM_WGS / 2; off > 0; off >>= 1) {
+    if (lid < off) red[lid] = fmax(red[lid], red[lid + off]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mx = red[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  float s = 0.0f;
+  for (int a = lid; a < axdim; a += SM_WGS) s += exp((float)base[(size_t)a * inner] - mx);
+  red[lid] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = SM_WGS / 2; off > 0; off >>= 1) {
+    if (lid < off) red[lid] += red[lid + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float sm = red[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  for (int a = lid; a < axdim; a += SM_WGS)
+    y[((size_t)o * axdim + a) * inner + r] =
+      (half)(exp((float)base[(size_t)a * inner] - mx) / sm);
+}
+
+
 // ---- softmax over last axis of [outer, axdim] flattened (inner=1) ----

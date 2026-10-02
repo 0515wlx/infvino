@@ -272,6 +272,24 @@ std::vector<Candidate> candidatesSmall(const OpSignature & sig)
   {
     addSmall(out, "bmm", "ops", "", "grid1");
     addSmall(out, "bmm2", "ops", "", "grid3");
+    // Register-tiled variants (explicit x reuse).  BMM_TM x BMM_TN outputs/WI.
+    for (auto [tm, tn] : {std::pair<int,int>{4,8}, {8,8}, {8,4}, {4,4}}) {
+      for (int uk : {4, 8}) {
+        std::ostringstream o;
+        o << "-DBMM_TM=" << tm << " -DBMM_TN=" << tn << " -DBMM_UK=" << uk
+          << " -cl-mad-enable -cl-fast-relaxed-math";
+        addSmall(out, "bmm_t", "ops", o.str(),
+                 "TM" + std::to_string(tm) + "x" + std::to_string(tn) + "u" + std::to_string(uk));
+      }
+    }
+    return out;
+  }
+  if (op == "softmax_axis")
+  {
+    addSmall(out, "softmax_axis", "ops", "", "serial");
+    for (int w : {32, 64, 128, 256})
+      addSmall(out, "softmax_axis_r", "ops", "-DSM_WGS=" + std::to_string(w),
+               "WGS=" + std::to_string(w));
     return out;
   }
   if (op == "gap")
