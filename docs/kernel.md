@@ -1753,9 +1753,67 @@ kernel busy（`kernel_run --report`，同会话 HEAD 基线对照）：
 4. 剩余整网大头：yolo 的 `concat4`（DRAM 带宽）与 `bmm/softmax`（attention），
    mobilenet 的 `depthwise`；都不是「换 kernel tile」能解决的，需要改数据通路/图融合。
 
-## 稳定性事故记录（重要）
+## Round 23 —— 小算子/融合收益 + 阻塞式 conv 移植（未成功）+ 现状
 
-- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
+### 23.1 端到端账本（先量化差距）
+
+OSV 2025.2（同一块 iGPU，per-node GPU 时间）整网：yolov8-pose 9.33 ms / yolo11-pose
+9.61 ms / mobilenet 0.96 ms；端到端（含预处理）11.24 / 11.82 / 1.78 ms。
+infvino R22 之后 kernel busy：~19.9 / ~23.0 / ~3.5 ms。**差距主要在 conv3x3**：
+yolov8 里 `conv3x3ov@40x40s1_Cin64_Cout64` 单层 1.49 ms ×10 = ~15 ms，占总时间 ~85%。
+
+### 23.2 已落地的两项**真实、过数值**的收益
+
+| 提交 | 内容 | 效果 | 数值 |
+|---|---|---|---|
+| `b28a6a4` | `.cl` 源码文本缓存 + PlanModel per-node kernel 句柄缓存（纯缓存）| 去除每次推理上百次磁盘读/编译/建 kernel | 逐位不变 |
+| `bef119f` | **concat4 改 3-D 网格**（去掉逐元素 div/mod，纯索引简化）| yolov8n busy 19.9→**17.2**、yolo11n 23.0→**20.1** ms；concat4 1.16→1.02 ms | 精确（copy），三模型 PASS |
+
+（另试了并行 `softmax_axis_r`：0.63→0.155 ms 但它破坏数值（mean_rel 3.7e-2），已回退。）
+
+### 23.3 conv3x3 差距定位：**网格饥饿**，不是单核算术
+
+对 40x40 Cin64 Cout64（占总时 ~85%）做 block 扫描（osv32 的 OBW/OBH）：
+
+| cfg | 8,2 | 5,2 | 6,2 | 4,4 |
+|---|---|---|---|---|
+| ops/EU/cyc | 7.84 | **8.40** | 7.94 | 6.51 |
+
+各 shape 的最优也只是：80x80 13.6（8,2）、40x40 8.4（5,2）、20x20 5.9（4,2）。
+**调参上限 ≤ +7% 且大层回退**，无法弥合 2× 差距 —— 与 R18–R21 的结论一致：
+`os_iyx_osv32` 是 **1 broadcast : 1 mad 的发射上限（~16 ops）**，与 block 大小无关。
+
+### 23.4 OpenVINO 阻塞式 conv（`convolution_gpu_bfyx_f16`）移植尝试（**未成功**）
+
+OV 实际选中的是**阻塞式** kernel（`convolution_gpu_bfyx_f16`，527 行 + 大量 JIT/宏），
+而非 osv32。其要点：lane=通道（16/块），每 lane 持有 `OUTPUT_X_BLOCK_SIZE` 个**连续**
+输出列，输入行 staged 后跨 kx/输出复用，权重用 `block_read`，网格 = `(X_BLOCKS,
+feature_blocks)`（远多于 osv32）。R23 写了一个自包含简化版 `kernels/conv_blk.cl`：
+
+- 首版（lane 各自标量读输入行）：**1.3 ops**，远慢于 osv32 的 7.9——16 lane 冗余读同一行、
+  权重非合并；
+- 改权重 `block_read` + 输入行 `sub_group_broadcast` 分发后：40x40 到 **6.6 ops**，
+  仍**低于** osv32（7.9），且输出出现 NaN（越界 lane/leftover 处理未完成）。
+
+**结论**：在当前工时内，简化版阻塞 conv **没有打赢已调优的 osv32**，且正确性未收口。
+这与 R18–R21 的判断吻合——两条数据通路都撞 ~16 的天花板，阻塞式并不会自动突破；
+OV 的优势更多来自其**全功能 JIT kernel + 逐层 autotune + 布局/融合**的整体工程，
+而非单一“阻塞”技巧。**该移植已回退，保留为负结果记录。**
+（若继续：需完整实现 leftover/OOB/分组路径并用 `kernel_check` 逐 shape 收口。）
+
+### 23.5 现状（R23 收尾）
+
+| 模型 | R22 busy | **R23 busy** | 墙钟(R23) | OV infer |
+|---|---|---|---|---|
+| yolov8n-pose | ~19.9 ms | **~17.2 ms** | ~22 ms | 11.2 ms |
+| yolo11n-pose | ~23.0 ms | **~20.1 ms** | ~25 ms | 11.8 ms |
+| mobilenetv3-small | ~3.5 ms | ~3.5 ms | ~4.6 ms | 1.8 ms |
+
+剩余差距集中在 conv3x3（占 yolov8 ~85%，已到 osv32 的 ~8–13 ops），以及 yolo 的
+`concat4`（已优化到带宽极限）与 attention。下一步若继续，方向应是
+「完整移植 OV 阻塞 conv + 逐层 autotune」，属大工程。
+
+## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
   `outer=800, axdim=400, inner=320000` → **2.56 亿工作项 → 假死**（表现为开发板卡死）。
   已修（axis 归一化为非负），并在 `kernel_run` 加 **gws 安全阀**（>3e8 直接报错退出）。
 - **带宽测试 OOM**：`kernel_bench --op bandwidth --mb 1024` 分配 2×1 GB buffer + host 1 GB，
