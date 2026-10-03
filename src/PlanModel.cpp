@@ -159,7 +159,17 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
   clSetKernelArg(k, 4, sizeof(W), &W);
   const size_t gws[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
                          static_cast<size_t>(Cin)};
-  ClRuntime::enqueueND(rt_.queue(), k, 3, gws, nullptr);
+  cl_event ev = ClRuntime::enqueueND(rt_.queue(), k, 3, gws, nullptr);
+  if (profiling_ && ev)
+  {
+    clWaitForEvents(1, &ev);
+    cl_ulong s = 0, e = 0;
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
+    tprof_["reorder(blk)"].first += static_cast<double>(e - s) * 1e-6;
+    tprof_["reorder(blk)"].second += 1;
+    clReleaseEvent(ev);
+  }
   return m;
 }
 

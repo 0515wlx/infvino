@@ -180,13 +180,36 @@ R30 里所有「贴 DRAM 墙」的算子。Route A 已经证明了这条路（�
 
 **学什么**：`prepare_primitive_fusing` 的 `fuse_simple_primitives`（activation/eltwise/
 quantize/bias）+ JIT 的 `FUSED_OPS` 代码生成。
-**怎么做**：
-1. 短期（低成本）：把现有「手写融合」扩成**一个通用的 epilogue 宏**——
-   在 `gemm.cl`/`conv_ov.cl`/`conv_blk.cl` 里支持 `-DEPI_ACTS`（可组合 bias+act+residual+
-   简单 broadcast），用 autotune 选择是否融合。我们已有 `-DEPI/-DACT` 的基础。
-2. 中期：把 `onnx2plan.py` 的融合从「硬编码 SiLU / 残差」升级成**模式匹配 pass**
-   （学 `prepare_primitive_fusing`），让「producer→单一消费者 activation/ew」自动折叠。
-3. 运行时：把 `reshape/permute/concat` 的**零 launch alias**（学 SKIP 路径）纳入 P0。
+
+**已落地（R-P1a）**：把 `onnx2plan.py` 的激活融合从「只覆盖 1×1/SiLU」扩到
+**通用/depthwise conv 的 epilogue**（`conv_general`/`depthwise_*` 内核本就支持
+act=1 SiLU / 2 Hardswish / 3 ReLU / 4 Hardsigmoid）。mobilenet 的 11 条
+`Conv(depthwise) → ReLU/HardSwish` 全部折进 conv，`ew_unary` **11→0**；
+yolo 无此类模式（其 general conv 后是 SiLU，无独立激活节点）。
+对折进的 depthwise 签名补跑 autotune（9 条新条目）。
+实测 mobilenet busy **2.65→2.59 ms（−2.4%）**，数值**逐位一致**。
+`INFVINO_NO_FUSE_GENERAL=1` 可关闭以做 A/B。
+
+**后续**：
+1. 把 epilogue 扩成**可组合**（bias+act+residual+简单 broadcast），接 autotune；
+2. `onnx2plan.py` 的融合从「硬编码模式」升级成**模式匹配 pass**。
+3. 运行时：`reshape/permute/concat` 的**零 launch alias**（部分已在 P0 落地）。
+
+### P1 — 布局：blocked format（**本机天花板 ~5%，需大重构**）
+
+**实测（R-P1 调研）**：`conv_blk` 每层**每帧都要做一次 bfyx→b_fs_yx_fsv16 输入重排**，
+y8/y11 各 **24/23 次 dispatch、0.66–0.68 ms（≈5% busy）**。这是 ov-style 持久 blocked
+布局能省掉的部分。**但**：
+- 重排是**launch floor + 小 dispatch** 主导（~9 GB/s），**不是带宽问题**：
+  试过向量化 store 版本（`reorder_bfyx_to_fsv16_v`），实测**更慢**（0.76 vs 0.67 ms）——
+  gather 读主导，写放大不是瓶颈。**负结果，已回退。**
+- 真正要省掉它需要**持久 blocked 布局**（生产者直接输出 blocked、跨层传播），
+  是 multi-hour 重构，且当前 blk/ov/native 按 shape 混选，只有部分相邻 conv 能受益。
+- 因此 **P1-layout 在本机的现实收益 ≈5%，风险高，暂缓**；若做，优先「持久 blocked 链」。
+
+> **结论**：P1 的融合项已落地（−2.4% mobilenet）；布局项的余额（reorder ~5%）需要
+> 持久 blocked 重构，ROI 与风险不匹配，建议先看 P2（调度/墙钟）或 depthwise 内核
+> （R30 记录 5–9× ISA 配额空间，比 reorder 更大且自包含）。
 
 ### P2 — 调度：事件 + out-of-order + 参数缓存（预期收窄墙钟 gap）
 

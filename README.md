@@ -214,6 +214,14 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > 顺带**修掉一个跨推理陈旧 bug**：`blkInput`（conv_blk 的输入重排）按张量名缓存且只重排
 > 一次 → 第 2 帧及以后用上一帧数据（单输入重复跑的测试发现不了）。修复后新增
 > `reuse_check` 护栏：同进程 A→B 与全新进程 B 的输出必须一致。
+>
+> **R-P1a（融合通用化，P1）**：把激活融合从「只覆盖 1×1/SiLU」扩到
+> **通用/depthwise conv 的 epilogue**（内核本就支持 act=1..4）。mobilenet 的 11 条
+> `depthwise→ReLU/HardSwish` 全部折进 conv，`ew_unary` **11→0**；补跑 9 条 autotune。
+> mobilenet busy **2.65→2.59 ms（−2.4%）**，数值**逐位一致**。yolo 无此模式（不变量）。
+> **R-P1 调研（布局）**：`conv_blk` 每层每帧重排输入，y8/y11 **24/23 次、0.66–0.68 ms
+> （≈5% busy）**；但重排是 **launch floor 主导**（向量化 store 实测更慢，负结果），
+> 真正要省需**持久 blocked 布局**（大重构、ROI 不匹配）→ **P1-layout 暂缓**。
 
 ## 状态
 

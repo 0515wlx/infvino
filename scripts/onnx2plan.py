@@ -131,6 +131,9 @@ def main():
     # (1=SiLU, 2=Hardswish) so only HardSwish can be folded there.
     ACT_CODE_1X1 = {"Sigmoid": 5, "Relu": 2, "HardSwish": 3, "HardSigmoid": 4}
     ACT_CODE_CONV = {"HardSwish": 2}
+    # generic/depthwise kernel (conv_general.cl) act codes: 1 SiLU / 2 Hardswish /
+    # 3 ReLU / 4 Hardsigmoid (no Sigmoid).
+    ACT_CODE_GENERAL = {"HardSwish": 2, "Relu": 3, "HardSigmoid": 4}
 
     def fuse_act(producer_out, allowed):
         """producer_out -> (final_out, act_code). Fuses a sole activation consumer."""
@@ -205,9 +208,18 @@ def main():
             c.node_line("conv1x1", [w, x, b or "-", res or "-"], [out], act=(act or None))
             return
         # 通用（含 depthwise / 5x5 / stride2）
-        out = conv_act.get(raw_out, raw_out)
+        # P1：把「conv → 单一激活消费者」折进 conv_general/depthwise 的 epilogue
+        # （kernel 已支持 act=1 SiLU / 2 Hardswish / 3 ReLU / 4 Hardsigmoid；
+        #  注意通用核不支持 Sigmoid，故不纳入）。数值逐位一致（同一 acc+b 后激活）。
+        if raw_out in conv_act:
+            out, act = conv_act[raw_out], 1
+        elif os.environ.get("INFVINO_NO_FUSE_GENERAL", "0") == "1":
+            out, act = raw_out, 0
+        else:
+            out, act = fuse_act(raw_out, ACT_CODE_GENERAL)
+            if act == 0:
+                out = raw_out
         c.declare(out, oshape)
-        act = 1 if raw_out in conv_act else 0
         c.node_line("conv_general", [x, w, b or "-"], [out], K=kh, S=sh, P=ph,
                     G=groups, Hout=oshape[2], Wout=oshape[3], act=(act or None))
 
