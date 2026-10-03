@@ -109,10 +109,11 @@ def _measure(ov, model_path: Path, device: str, iters: int, warmup: int) -> dict
     model = core.read_model(str(model_path))
 
     inp = model.input(0)
+    input_name = inp.get_any_name()
     pshape = inp.partial_shape
     if not pshape.is_static:
         raise RuntimeError(
-            f"{model_path.name}: 输入 {inp.any_name} 是动态 shape {pshape}，"
+            f"{model_path.name}: 输入 {input_name} 是动态 shape {pshape}，"
             "请在脚本中固定输入尺寸后再跑基线"
         )
     shape = [int(d.get_length()) for d in pshape]
@@ -121,13 +122,14 @@ def _measure(ov, model_path: Path, device: str, iters: int, warmup: int) -> dict
     compiled = core.compile_model(model, device)
     infer = compiled.create_infer_request()
 
+    # 注意：新版本 OpenVINO 的 infer() 不接受 Output 节点作为 key，须用输入名。
     for _ in range(warmup):
-        infer.infer({inp: data})
+        infer.infer({input_name: data})
 
     times_ms = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        infer.infer({inp: data})
+        infer.infer({input_name: data})
         times_ms.append((time.perf_counter() - t0) * 1e3)
 
     times_ms.sort()
