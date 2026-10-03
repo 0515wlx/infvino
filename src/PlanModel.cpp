@@ -138,12 +138,19 @@ cl_mem PlanModel::blkWeight(const std::string & name, Tensor & w, int Cout, int 
 
 cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H, int W)
 {
+  // 注意：**每次调用都要重跑 reorder**——输入张量在每次 run() 里会被重新计算/写入，
+  // 之前「按名字缓存 reordered buffer 且只重排一次」会让第 2 次及以后的推理用上一帧
+  // 的数据（跨推理陈旧 bug；见 2026-10 修复）。这里只缓存**设备 buffer**，重排每 run 一次。
   auto it = blk_in_.find(name);
-  if (it != blk_in_.end()) return it->second;
-  const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
-  cl_mem m = rt_.alloc(bytes, CL_MEM_READ_WRITE);
-  blk_in_[name] = m;
-  owned_blk_.push_back(m);
+  cl_mem m;
+  if (it != blk_in_.end()) { m = it->second; }
+  else
+  {
+    const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
+    m = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+    blk_in_[name] = m;
+    owned_blk_.push_back(m);
+  }
   cl_kernel k = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
   clSetKernelArg(k, 0, sizeof(x.mem), &x.mem);
   clSetKernelArg(k, 1, sizeof(m), &m);

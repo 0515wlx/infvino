@@ -68,6 +68,9 @@ target_link_libraries(infvino_bench PRIVATE infvino opencv_imgcodecs)
 add_executable(infvino_numtest src/tools/infvino_numtest.cpp)
 target_link_libraries(infvino_numtest PRIVATE infvino opencv_imgcodecs)
 
+add_executable(reuse_check src/tools/reuse_check.cpp)
+target_link_libraries(reuse_check PRIVATE infvino)
+
 add_executable(kernel_run src/tools/kernel_run.cpp)
 target_link_libraries(kernel_run PRIVATE infvino)
 
@@ -86,7 +89,7 @@ target_link_libraries(tuning_test PRIVATE infvino)
 enable_testing()
 add_test(NAME tuning_test COMMAND tuning_test)
 
-install(TARGETS infvino infvino_bench infvino_numtest kernel_run kernel_bench kernel_numtest kernel_autotune tuning_test
+install(TARGETS infvino infvino_bench infvino_numtest reuse_check kernel_run kernel_bench kernel_numtest kernel_autotune tuning_test
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin

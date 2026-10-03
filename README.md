@@ -112,6 +112,9 @@ python3 scripts/numerical_check.py --repo $PWD --image infvino-dev:latest
 
 # 引擎级检验（预处理 + ClBackend，喂图片）
 python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
+
+# 跨推理一致性（同进程 A→B vs 全新进程 B；抓缓存陈旧 bug）
+python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvino-dev:latest
 ```
 
 ## 文档
@@ -200,6 +203,13 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 > 的开销部分随**常驻 `cl_mem` 数**增长，不只是 per-dispatch 固定成本。
 > 见 [`docs/memory-reuse-design.md`](docs/memory-reuse-design.md) 与
 > [`docs/openvino-gap-analysis.md`](docs/openvino-gap-analysis.md)。
+>
+> **R-P0b（连续 `copy_c` 别名 + 跨推理陈旧 bug 修复）**：8 条 `Split_output_1` 用
+> `clCreateSubBuffer` 直接别名父张量的连续通道段（零 launch，消费者零改动）；busy 再
+> −1~1.5%（y8 13.07→**12.98**、y11 13.87→**13.80**、mb 2.72→**2.66**）。
+> 顺带**修掉一个跨推理陈旧 bug**：`blkInput`（conv_blk 的输入重排）按张量名缓存且只重排
+> 一次 → 第 2 帧及以后用上一帧数据（单输入重复跑的测试发现不了）。修复后新增
+> `reuse_check` 护栏：同进程 A→B 与全新进程 B 的输出必须一致。
 
 ## 状态
 
