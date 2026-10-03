@@ -141,7 +141,19 @@ int main(int argc, char ** argv)
         "activation pool: requested %.1f MB -> allocated %.1f MB (%zu buffers, reuse %.0f%%)\n",
         req / 1e6, alc / 1e6, model.poolBufferCount(),
         req ? 100.0 * (1.0 - static_cast<double>(alc) / static_cast<double>(req)) : 0.0);
-      std::printf("total kernel time: %.3f ms (iters=%d)\n", total / iters, iters);
+      const double busy = total / iters;
+      std::printf("total kernel time: %.3f ms (iters=%d)\n", busy, iters);
+      // P2: wall - busy 的构成（仅 profiling 下有 host 分段）：入队提交 / 同步等待 /
+      // 其余 host（setArg、循环/视图簿记）。wait 含 GPU 执行，故 host_total = wall - wait。
+      {
+        const double wall = model.lastRunMs();
+        const double enq = model.hostEnqueueMs() / iters;
+        const double wait = model.hostWaitMs() / iters;
+        std::printf(
+          "host segmentation: wall=%.3f busy=%.3f enqueue=%.3f sync=%.3f "
+          "host_total~=%.3f setarg_est~=%.3f ms\n",
+          wall, busy, enq, wait, wall - wait, wall - wait - enq);
+      }
       std::vector<std::pair<std::string, std::pair<double, int>>> v(
         model.opProfile().begin(), model.opProfile().end());
       std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });

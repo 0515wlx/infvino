@@ -186,6 +186,11 @@ kernel_autotune --plan models/yolov8n-pose/model.plan \
 >
 > 本轮（P0）落地的是**JIT 变量的枚举与选择**（例如 depthwise 的 K/S/P/ACT 全组合、
 > conv3x3 的 OV block 与 native tile），P2 再把「形状整除」这类新的编译期常量加进 kernel。
+>
+> **P3（未做，低优先）**：当前只有**内存内** program 缓存（`ClRuntime::programs_`，key =
+> `source|options`）。下一步是 JIT 生成完整 `.cl` 源码再编译，并把**编译产物落盘缓存**
+> （key = `source + options + 设备`），避免每次冷启动重新 JIT。Level-Zero/SYCL 后端、
+> USM、i8/u8、动态 shape 当前需求不足，暂缓。
 
 ### 6.1 JIT 与 `expected_ops` 的相互作用
 
@@ -554,5 +559,28 @@ FP32 峰值为 16 ops/EU/cyc（8 FMA/EU/cyc）；`0.73` = **4.6%**。Isa 反汇�
 
 新增 op 级数值覆盖：`kernel_check.py` 增加 bmm（3 变体）、softmax（2 变体）、
 depthwise（3 变体）用例——**ALL PASS**（bmm/depthwise 变体逐位相同）。
+
+### 12.7 R31 —— `depthwise_vp`（padded）候选：opt-in + pad 成本入账
+
+R31 增加了 `depthwise_vp`（零边 `depthwise_pad` + 无边界卷积）候选，并把它从普通候选里
+**单独拆出来计时**：vp 的每帧真实成本 = `depthwise_vp` + **单独量到的 pad 一趟**
+（`benchCandidate` 量 `depthwise_pad` 后加到 vp 的 ms 上，再与其它候选比）。
+这样「额外一趟 pad」不会被漏算（对比 §4「运行时接入」里普通候选只比单 kernel 时间）。
+
+实测（见 `docs/kernel.md` Round 31）：vp 把 depthwise 分项砍 7–11%，但 pad 是带宽受限的
+额外一趟，二者相当，**整网持平/略负**（y11 +0.6%、mb 持平）。因此：
+
+- vp 候选**默认不进候选集**；只有 `INFVINO_DW_PAD=1` 时才枚举（便于复验/换硬件再试）。
+- 生产 `config/tuning.json` 不含 vp 条目；`kernel_check.py` 仍保留 vp 的算子级用例
+  （TW4/8，vs numpy PASS、与 `depthwise_v` 逐位相同）。
+- 该 op 的 `expectedOps` 仍按 R30 的 ISA 配额（不随 kernel 变体改变，只用于 ratio 报告）。
+
+### 12.8 R31 —— P2 host 分段统计（供调优之外用）
+
+`PlanModel::run()` profiling 下新增 `hostEnqueueMs()`（入队提交累计）与
+`hostWaitMs()`（同步等待累计），`kernel_run --report` 打印
+`wall / busy / enqueue / sync / host_total / setarg_est`。这不是调优项，而是 P2 的
+「先测什么」：实测 busy 只占墙钟 52–74%，host 开销 = 入队 + setArg/其它两块。
+数据与结论见 `docs/benchmark.md` §2.4。
 
 

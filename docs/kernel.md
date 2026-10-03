@@ -1937,6 +1937,86 @@ copy(read+write) 带宽-足迹：1 MB **89.7 GB/s**（L3 峰）、2 MB 62.4、4 
    `tuning_test` 新增 6 条断言。
 3. 新增 `scripts/analyze_smallops.py`（逐节点流量 vs 内存上限，不需要 GPU）。
 
+## Round 31 —— P1 收口 + padded depthwise（A 方向，负结果）
+
+> 本节是把交接文档 `docs/roadmap-p0-p3.md` 的结论规范化后的落点（该交接文档已删除，
+> P2 的量化见 [`docs/benchmark.md`](benchmark.md) §2.4，调优接线见
+> [`docs/autotuning.md`](autotuning.md)）。
+
+### 31.1 P1 融合通用化（正结果，已落地）
+
+- `onnx2plan.py`：把「conv → 单一尾部激活消费者」的折叠从「只覆盖 1×1/SiLU」扩到
+  **通用 / depthwise conv 的 epilogue**。内核本就支持 act=1 SiLU / 2 Hardswish /
+  3 ReLU / 4 Hardsigmoid（无 Sigmoid），collect 时把 `conv3x3`/`conv_general` 的
+  act 属性带上即可。
+- 结果：mobilenet `ew_unary` **11→0**（全部折进 depthwise），整网 busy
+  **2.65→2.59 ms（−2.4%）**，数值**逐位一致**；yolo 无此模式，plan 逐字节不变。
+  补跑 9 条 depthwise autotune。
+- 开关：`INFVINO_NO_FUSE_GENERAL=1` 关闭（A/B 用）。
+- 下一步（未做，低优先）：epilogue 可组合化（bias+act+residual+简单 broadcast）接
+  autotune；融合从硬编码升级成模式匹配 pass。
+
+### 31.2 P1 布局（调研后**关闭**：ROI 不匹配）
+
+- `conv_blk`（OV 阻塞式 conv 移植）**每层每帧重排输入**：y8/y11 分别为
+  **24/23 次 dispatch、0.66–0.68 ms（≈5% busy）**。
+- 重排是 **launch floor 主导**：试过向量化 store 版（`reorder_bfyx_to_fsv16_v`）
+  **实测更慢**（0.76 vs 0.67 ms）→ **gather 读主导，写放大不是瓶颈**（负结果，已回退）。
+- 真正要省需**持久 blocked 布局**（生产者直接输出 blocked、跨层传播），multi-hour
+  重构，且 blk/ov/native 按 shape 混选，只有部分相邻 conv 受益。
+- **离线 ROI 定量**（本机 plan + `config/tuning.json`）：y8 有 24 个 tuned `conv3x3_blk`，
+  其中 **11** 条是「blk→blk 且中间张量单消费者」（唯一可省重排的边）；y11 为 23/9；
+  mobilenet 0。即使全部省掉也只有 **~0.27–0.30 ms（<2% 墙钟）**，而代价是生产者
+  输出布局改变 + 多消费者需同时物化两种布局。
+- **结论：正式关闭**（ROI 不匹配）。重排问题若将来重开，优先从「相邻 blk 的
+  生产者直接写 fsv16」做最小实验，并单独加多输入数值用例。
+
+### 31.3 depthwise padded（A 方向：指令 −41%，整网**不赚**，负结果）
+
+R30/round30 §4.4 的证据：depthwise 的墙不是 FMA 而是**地址 + 逐元素边界谓词**。
+离线 ISA 证明「输入预填充 + 去边界检查」能把指令数砍掉近一半：
+
+| 版本 | 指令数 | mad | mad 占比 | 指令配额 |
+|---|---:|---:|---:|---:|
+| `depthwise_v`（TW8,K3,S1） | 1063 | 128 | 12% | 3.9 |
+| 原型 `dw_nopad`（无边界 + vload8，仅 ISA） | **627** | 128 | **20%** | **6.5** |
+
+→ 指令 −41%、配额 ×1.7。据此落地了完整实现：
+
+1. `depthwise_pad`：把 `X[C][H][W]` 复制进零边 `Xp[C][Hp][Wpad]`；**边界在分配时
+   一次性写零**，每帧只重写 interior。
+2. `depthwise_vp`：读 `Xp`，**零边界检查**，与 `depthwise_v` 同 (kh,kw) 累加顺序，
+   越界 tap 读零边 → **逐位一致**。
+3. `PlanModel::dwPadInput` 按输入张量名缓存 `Xp`（尺寸按最大候选 TW=8），
+   **每帧跑一趟 pad**（注意不能像旧 `blkInput` 那样只跑一次，见「稳定性事故」）。
+4. autotune 新增 `depthwise_vp` 候选，并把**单独量到的 pad 成本**加进 vp 的每帧成本。
+
+**验证（已过）**：算子级 `kernel_check` 新增 `depthwise_vp`（TW4/8）对 numpy PASS；
+`depthwise_vp` vs `depthwise_v` 在全部 4 个 shape × 2 个 TW 上 **IDENTICAL**；
+三模型整网 `model_check` PASS（含 vp 生效的配置）。
+
+**整网 A/B（同会话、交替、30 iters）— 决定性负结果**：
+
+| 模型 | base busy | vp busy | depthwise 分项 | pad | 净 |
+|---|---:|---:|---|---:|---:|
+| yolo11n | 14.918 ms | 15.012 ms（**+0.6%**） | 0.654→0.605（−7.5%） | +0.070 ms | **+0.021** |
+| mobilenet | 2.694 ms | 2.694 ms（**持平**） | 0.470→0.418（−11%） | +0.035 ms | −0.017 |
+
+autotune 在 15 条 depthwise 签名中选中了 **5 条** vp（单层最多 −17%），但整网被 pad 抵消。
+
+**根因**：pad 是**带宽受限的额外一趟**（读 interior + 写 padded ≈ 2× 输入字节），
+而 depthwise 是**指令/延迟受限**——省下的谓词指令并不减少 pad 的 DRAM 流量，
+两者在量级上恰好抵消。尝试把 pad 每 WI 加宽 4× **更慢**（0.070→0.114 ms；工作项数
+减 4 倍伤了占用率），已回退。
+
+**已证伪、不要重复**（见 roadmap §5）：内部块 fast-path（R24.6 已记）、`DW_TW` 扩到
+16/32（ISA 配额升但真实 shape 上 autotune 都不选）、向量化 store 版 reorder（§31.2）。
+
+**决策**：`depthwise_vp` **默认不进候选集**，仅 `INFVINO_DW_PAD=1` 时参与；
+内核 + 算子级测试保留为已记录路径；生产 `config/tuning.json` **不含 vp 条目**。
+未尝试但可能翻盘的唯一方向：**边框内核拆分**（无谓词 interior kernel + 薄边 kernel，
+彻底免去 pad 那一趟），工作量与收益均需另评估。
+
 ## 稳定性事故记录（重要）
 
 - **跨推理缓存陈旧（R-P0b，2026-10 修复）**：`PlanModel::blkInput`（`conv_blk` 的输入重排）

@@ -220,8 +220,22 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > `depthwise→ReLU/HardSwish` 全部折进 conv，`ew_unary` **11→0**；补跑 9 条 autotune。
 > mobilenet busy **2.65→2.59 ms（−2.4%）**，数值**逐位一致**。yolo 无此模式（不变量）。
 > **R-P1 调研（布局）**：`conv_blk` 每层每帧重排输入，y8/y11 **24/23 次、0.66–0.68 ms
-> （≈5% busy）**；但重排是 **launch floor 主导**（向量化 store 实测更慢，负结果），
-> 真正要省需**持久 blocked 布局**（大重构、ROI 不匹配）→ **P1-layout 暂缓**。
+> （≈5% busy）**；但重排是 **launch floor 主导**（向量化 store 实测更慢，负结果）。
+> 离线 ROI 定量：只有 **11/24（y8）、9/23（y11）** 条边可省（blk→blk 且单消费者），
+> 至多 ~0.3 ms（<2% 墙钟），代价是大重构 → **P1-layout 正式关闭**。
+>
+> **R31（padded depthwise，A 方向，负结果）**：离线 ISA 证明 `depthwise_v` 的墙是
+> 地址/边界谓词，零边预填充后指令 **−41%**（1063→627，配额 3.9→6.5）。完整落地了
+> `depthwise_pad` + 无边界 `depthwise_vp`（与 `depthwise_v` **逐位一致**），并让 autotune
+> 把额外 pad 一趟计入 vp 成本。但整网 A/B：depthwise 分项 **−7~11%**，而 pad 是带宽受限的
+> 额外一趟（y11 +0.070 / mb +0.035 ms），**二者相抵**（y11 +0.6%、mb 持平）。
+> **决策**：vp 默认不进候选（`INFVINO_DW_PAD=1` 才启用），内核与算子级测试保留。
+> 详见 [`docs/kernel.md`](docs/kernel.md) Round 31。
+>
+> **P2（host 分段，先测）**：给 `PlanModel::run` 加了 host 分段计时（入队提交 / 同步 /
+> 其余 host），实测 GPU busy 只占墙钟 **52%（mb）–74%（y8）**，缺口由
+> `clEnqueueNDRangeKernel` 与 `setArg`/簿记两块平分。见
+> [`docs/benchmark.md`](docs/benchmark.md) §2.4。
 
 ## 状态
 
@@ -236,6 +250,10 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] conv3×3 逐层 autotune 重扫（blk 候选 + R24 中间标准）：yolov8n/yolo11n −5%；osv32 大层 ~8–13、blk 小层 +13–87%
 - [x] 剩余 kernel（非 conv/gemm）物理模型：内存 roofline + ISA 配额；concat4 已到 DRAM 墙；标量广播快路径 + `expectedOps` 真实模型（R30）
 - [x] 激活内存池（P0）：按生存期复用 + reshape 视图并集；wall −5%、数值逐位一致（R-P0）
-- [ ] 算子融合、内存复用（byte-offset 子分配）、降低 launch 开销（整网墙钟；busy 13.1 vs 墙钟 16.7 ms）
+- [x] 融合通用化（P1）：通用/depthwise conv 折入激活 epilogue；mobilenet `ew_unary` 11→0、busy −2.4%、逐位一致
+- [x] P1-layout 调研收口：重排 launch floor 主导、可省边 <2% 墙钟 → 关闭（负结果）
+- [x] P2 host 分段实测：busy 占墙钟 52–74%，缺口 = 入队提交 + setArg/簿记（`docs/benchmark.md` §2.4）
+- [x] depthwise padded（A 方向）：指令 −41%、逐位一致，但 pad 带宽相抵 → 整网负结果，默认关闭（Round 31）
+- [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）

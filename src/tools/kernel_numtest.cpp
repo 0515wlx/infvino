@@ -7,6 +7,7 @@
 //       --input-a /work/a.bin --input-b /work/b.bin --dump /work/c.bin
 //
 // 约定：输入/输出均为 fp16 little-endian 裸数据（*.bin），row-major。
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -404,6 +405,7 @@ int main(int argc, char ** argv)
       auto hW = readBin(in_w, static_cast<size_t>(Cin) * dwK * dwK);
       std::vector<uint16_t> hB;
       if (!in_bias.empty()) hB = readBin(in_bias, static_cast<size_t>(Cin));
+      const bool isVp = (kern == "depthwise_vp");
       cl_kernel k = rt.buildKernel("conv_general", kern, o);
       cl_mem dX = rt.alloc(hX.size() * 2, CL_MEM_READ_ONLY);
       cl_mem dW = rt.alloc(hW.size() * 2, CL_MEM_READ_ONLY);
@@ -415,16 +417,47 @@ int main(int argc, char ** argv)
         dB = rt.alloc(hB.size() * 2, CL_MEM_READ_ONLY);
         rt.write(dB, hB.size() * 2, hB.data());
       }
-      clSetKernelArg(k, 0, sizeof(dX), &dX);
+      // R31: depthwise_vp reads a zero-padded input produced by depthwise_pad.
+      cl_mem dXin = dX;
+      int    Hs = H, Ws = W;
+      if (isVp) {
+        const auto p = o.find("-DDW_TW=");
+        const int tw = p == std::string::npos
+                         ? 8
+                         : std::atoi(o.c_str() + p + std::strlen("-DDW_TW="));
+        const int groups = (Wo + tw - 1) / tw;
+        const int strlen = (tw - 1) * S + dwK;  // == DW_STRLEN
+        int wpad = std::max((Wo - 1) * S + dwK, (groups - 1) * tw * S + strlen);
+        if (wpad < P + W) wpad = P + W;
+        Hs = H + 2 * P;
+        Ws = wpad;
+        const size_t nbytes = static_cast<size_t>(Cin) * Hs * wpad * 2;
+        dXin = rt.alloc(nbytes, CL_MEM_READ_WRITE);
+        std::vector<char> zeros(nbytes, 0);
+        rt.write(dXin, nbytes, zeros.data());
+        cl_kernel kpad = rt.buildKernel("conv_general", "depthwise_pad", "");
+        clSetKernelArg(kpad, 0, sizeof(dX), &dX);
+        clSetKernelArg(kpad, 1, sizeof(dXin), &dXin);
+        clSetKernelArg(kpad, 2, sizeof(Cin), &Cin);
+        clSetKernelArg(kpad, 3, sizeof(H), &H);
+        clSetKernelArg(kpad, 4, sizeof(W), &W);
+        clSetKernelArg(kpad, 5, sizeof(Hs), &Hs);
+        clSetKernelArg(kpad, 6, sizeof(wpad), &wpad);
+        clSetKernelArg(kpad, 7, sizeof(P), &P);
+        const size_t gp[3] = {(size_t)W, (size_t)H, (size_t)Cin};
+        gk::ClRuntime::enqueueND(rt.queue(), kpad, 3, gp, nullptr);
+        clReleaseKernel(kpad);
+      }
+      clSetKernelArg(k, 0, sizeof(dXin), &dXin);
       clSetKernelArg(k, 1, sizeof(dW), &dW);
       clSetKernelArg(k, 2, sizeof(dB), &dB);
       clSetKernelArg(k, 3, sizeof(dY), &dY);
       clSetKernelArg(k, 4, sizeof(Cin), &Cin);
-      clSetKernelArg(k, 5, sizeof(H), &H);
-      clSetKernelArg(k, 6, sizeof(W), &W);
+      clSetKernelArg(k, 5, sizeof(Hs), &Hs);
+      clSetKernelArg(k, 6, sizeof(Ws), &Ws);
       clSetKernelArg(k, 7, sizeof(Ho), &Ho);
       clSetKernelArg(k, 8, sizeof(Wo), &Wo);
-      if (kern == "depthwise_v") {
+      if (kern == "depthwise_v" || isVp) {
         const auto p = o.find("-DDW_TW=");
         const int tw = p == std::string::npos
                          ? 4
@@ -444,6 +477,7 @@ int main(int argc, char ** argv)
         std::fprintf(stderr, "[kernel_numtest] wrote %s (depthwise %dx%dx%d fp16)\n",
                      dump.c_str(), Cin, Ho, Wo);
       }
+      if (isVp) clReleaseMemObject(dXin);
       clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dY);
       if (dB) clReleaseMemObject(dB);
       clReleaseKernel(k);

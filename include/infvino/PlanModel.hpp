@@ -130,8 +130,14 @@ public:
    *  耗时在多次 run() 之间**累加**，便于对 warm 后的多次运行求平均；
    *  统计前先调用 clearProfile()。 */
   const std::map<std::string, std::pair<double, int>> & opProfile() const { return tprof_; }
-  /** @brief 清空算子耗时表（在统计循环前调用）。 */
-  void clearProfile() { tprof_.clear(); }
+  /** @brief P2: profiling 下 host 侧累计耗时（ms）：入队 clEnqueueNDRangeKernel 的调用耗时。
+   *  与 opProfile 一样在多次 run 间累加，统计前用 clearProfile() 清空。
+   *  用途：拆解 wall - busy，区分「入队/提交」「同步等待」「其余 host（含 setArg）」。 */
+  double hostEnqueueMs() const { return prof_enqueue_ms_; }
+  /** @brief P2: profiling 下 host 侧累计 clWaitForEvents 等待耗时（含 GPU 执行）。 */
+  double hostWaitMs() const { return prof_wait_ms_; }
+  /** @brief 清空算子耗时表与 host 分段计时（在统计循环前调用）。 */
+  void clearProfile() { tprof_.clear(); prof_enqueue_ms_ = prof_wait_ms_ = 0.0; }
 
 private:
   struct Tensor
@@ -167,6 +173,15 @@ private:
   cl_mem  blkWeight(const std::string & name, Tensor & w, int Cout, int Cin);
   /** @brief R25: reorder a conv input bfyx -> b_fs_yx_fsv16 (cached scratch). */
   cl_mem  blkInput(const std::string & name, Tensor & x, int Cin, int H, int W);
+  /** @brief R31: zero-padded depthwise input Xp[C][Hp][Wpad] (cached by tensor name).
+   *
+   *  Ensures the buffer exists and its zero border is written once (at first use);
+   *  the caller then runs `depthwise_pad` to refresh the interior every frame.
+   *  Sized for DW_TW=8 (the largest candidate) so any tuner TW reads in-bounds.
+   *  @param HpOut/WpadOut 回传实际 padded 尺寸（传给 depthwise_vp）。
+   */
+  cl_mem  dwPadInput(const std::string & name, int Cin, int H, int W, int K, int S, int P,
+                     int * HpOut, int * WpadOut);
   /** @brief Build (once) and cache a kernel keyed by source|name|options. */
   cl_kernel getKernel(const std::string & src, const std::string & name, const std::string & opts);
   /**
@@ -206,6 +221,9 @@ private:
   std::unordered_map<std::string, cl_mem> blk_w_;
   std::unordered_map<std::string, cl_mem> blk_in_;
   std::vector<cl_mem>                     owned_blk_;
+  // R31: cached zero-padded depthwise inputs (keyed by input tensor name).
+  std::unordered_map<std::string, cl_mem> dw_pad_;
+  std::vector<cl_mem>                     owned_dwp_;
   // Round 28: cached broadcast-dim buffers for the small-op autotune/tuning path.
   std::unordered_map<std::string, cl_mem> small_buf_;
   std::vector<Node>                       nodes_;
@@ -223,6 +241,10 @@ private:
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
   double                                        last_run_ms_{0.0};
+  // P2: host-side segmentation (only filled when profiling_): cumulative time in
+  // clEnqueueNDRangeKernel and in clWaitForEvents.
+  double prof_enqueue_ms_{0.0};
+  double prof_wait_ms_{0.0};
 
   // 自动调优缓存（docs/autotuning.md）。查不到 → 回退到 dispatch 里的内置启发式。
   TuningCache tuning_;

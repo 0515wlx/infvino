@@ -101,6 +101,8 @@ DW_VARIANTS = [
     ("depthwise_f16", ""),
     ("depthwise_v", "-DDW_TW=4"),
     ("depthwise_v", "-DDW_TW=8"),
+    ("depthwise_vp", "-DDW_TW=4"),
+    ("depthwise_vp", "-DDW_TW=8"),
 ]
 
 
@@ -277,6 +279,8 @@ def main() -> int:
     for shape, kern, opts, px, pw, pb, _ in dw_jobs:
         C, H, W, K, S, P, act, _ = shape
         tag = f"{kern}_{C}x{H}x{W}x{K}x{S}x{P}x{act}"
+        if "-DDW_TW=" in (opts or ""):
+            tag += "_tw" + opts.split("-DDW_TW=")[1].split()[0]
         optarg = f'--opts "{opts}"' if opts else ""
         inner.append(
             f"timeout 30 /tmp/build/kernel_numtest --op depthwise --kernel {kern} {optarg} "
@@ -373,15 +377,19 @@ def main() -> int:
     for shape, kern, opts, _, _, _, ref in dw_jobs:
         C, H, W, K, S, P, act, label = shape
         tag = f"{kern}_{C}x{H}x{W}x{K}x{S}x{P}x{act}"
+        tw = ""
+        if "-DDW_TW=" in (opts or ""):
+            tw = "tw" + opts.split("-DDW_TW=")[1].split()[0]
+            tag += "_" + tw
         path = os.path.join(args.workdir, f"out_{tag}.bin")
         if not os.path.exists(path):
             ok_all = False
-            print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K} MISSING -> FAIL")
+            print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K} {tw} MISSING -> FAIL")
             continue
         got = np.fromfile(path, dtype=np.float16).reshape(ref.shape)
         ok, msg = _cmp(got, ref)
         ok_all &= ok
-        print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K}s{S} {label:10s} {msg} -> {'PASS' if ok else 'FAIL'}")
+        print(f"  depthwise {kern:14s} {C}x{H}x{W} K{K}s{S} {tw:4s} {label:10s} {msg} -> {'PASS' if ok else 'FAIL'}")
     print("\nRESULT:", "ALL PASS" if ok_all else "SOME FAILED")
     return 0 if ok_all else 1
 

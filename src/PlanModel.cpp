@@ -86,6 +86,8 @@ PlanModel::~PlanModel()
     if (m) clReleaseMemObject(m);
   for (cl_mem m : owned_blk_)
     if (m) clReleaseMemObject(m);
+  for (cl_mem m : owned_dwp_)
+    if (m) clReleaseMemObject(m);
   for (cl_mem m : alias_subs_)
     if (m) clReleaseMemObject(m);
 }
@@ -170,6 +172,32 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     tprof_["reorder(blk)"].second += 1;
     clReleaseEvent(ev);
   }
+  return m;
+}
+
+cl_mem PlanModel::dwPadInput(const std::string & name, int Cin, int H, int W, int K, int S,
+                             int P, int * HpOut, int * WpadOut)
+{
+  // 用最大的候选 DW_TW（=8）定尺寸，这样任何调优候选的 strip 读都不会越出 buffer；
+  // 边界在首次分配时一次性写零，之后每帧只由 depthwise_pad 重写 interior。
+  const int    tw     = 8;
+  const int    Wout   = (W + 2 * P - K) / S + 1;
+  const int    Hp     = H + 2 * P;
+  const int    groups = (Wout + tw - 1) / tw;
+  const int    strlen = (tw - 1) * S + K;
+  int          wpad   = std::max((Wout - 1) * S + K, (groups - 1) * tw * S + strlen);
+  if (wpad < P + W) wpad = P + W;  // 不小于数据行本身
+  if (HpOut) *HpOut = Hp;
+  if (WpadOut) *WpadOut = wpad;
+
+  auto it = dw_pad_.find(name);
+  if (it != dw_pad_.end()) return it->second;
+  const size_t      bytes = static_cast<size_t>(Cin) * Hp * wpad * 2;
+  cl_mem            m     = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+  std::vector<char> zeros(bytes, 0);
+  rt_.write(m, bytes, zeros.data());  // 一次性零边界（之后只写 interior）
+  dw_pad_[name] = m;
+  owned_dwp_.push_back(m);
   return m;
 }
 
@@ -1169,7 +1197,8 @@ std::string sourceOfKernel(const std::string & kernel)
   if (kernel == "conv3x3_osv") return "conv_osv";
   if (kernel == "gemm_f16") return "gemm";
   if (kernel == "conv1x1_gemv_f16" || kernel == "conv1x1_f16") return "conv1x1";
-  if (kernel == "depthwise_f16" || kernel == "conv_general") return "conv_general";
+  if (kernel == "depthwise_f16" || kernel == "depthwise_v" || kernel == "depthwise_vp" ||
+      kernel == "depthwise_pad" || kernel == "conv_general") return "conv_general";
   return "ops";
 }
 }  // namespace
@@ -1189,14 +1218,22 @@ void PlanModel::run()
         "PlanModel: gws too large for " + tag + ": " + std::to_string(total) +
         " items (check plan attrs)");
     cl_event ev = nullptr;
+    const auto enq0 = std::chrono::steady_clock::now();
     try {
       ev = ClRuntime::enqueueND(rt_.queue(), k, dim, gws, lws);
     } catch (const std::exception & e) {
       throw std::runtime_error("node " + tag + ": " + e.what());
     }
+    // P2: host 入队（提交）耗时；即使非 profiling 也可量，但只在 profiling 时统计。
+    if (profiling_)
+      prof_enqueue_ms_ += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - enq0).count();
     if (profiling_)
     {
+      const auto w0 = std::chrono::steady_clock::now();
       clWaitForEvents(1, &ev);
+      prof_wait_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - w0).count();
       cl_ulong s = 0, e = 0;
       clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
       clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
@@ -1412,6 +1449,40 @@ void PlanModel::run()
           if (!e->kernel.empty()) dkern = e->kernel;
           dwopts = e->options;
         }
+        if (dkern == "depthwise_vp") {
+          // R31: 每帧先把 interior 重排进零边 Xp（约 2×输入字节的一趟），再无边界地卷积。
+          int Hp = H + 2 * P, Wpad = 0;
+          cl_mem xp = dwPadInput(n.ins[0], Cin, H, W, K, S, P, &Hp, &Wpad);
+          cl_kernel kp = getKernel("conv_general", "depthwise_pad", "");
+          clSetKernelArg(kp, 0, sizeof(dx), &dx);
+          clSetKernelArg(kp, 1, sizeof(xp), &xp);
+          clSetKernelArg(kp, 2, sizeof(Cin), &Cin);
+          clSetKernelArg(kp, 3, sizeof(H), &H);
+          clSetKernelArg(kp, 4, sizeof(W), &W);
+          clSetKernelArg(kp, 5, sizeof(Hp), &Hp);
+          clSetKernelArg(kp, 6, sizeof(Wpad), &Wpad);
+          clSetKernelArg(kp, 7, sizeof(P), &P);
+          const size_t gp[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                                static_cast<size_t>(Cin)};
+          timed("depthwise_pad", kp, 3, gp, nullptr);
+
+          cl_kernel kd = getKernel("conv_general", dkern, dwopts);
+          clSetKernelArg(kd, 0, sizeof(xp), &xp);
+          clSetKernelArg(kd, 1, sizeof(dw), &dw);
+          clSetKernelArg(kd, 2, sizeof(db), &db);
+          clSetKernelArg(kd, 3, sizeof(dy), &dy);
+          clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
+          clSetKernelArg(kd, 5, sizeof(Hp), &Hp);
+          clSetKernelArg(kd, 6, sizeof(Wpad), &Wpad);
+          int ho = Hout, wo = Wout;
+          clSetKernelArg(kd, 7, sizeof(ho), &ho);
+          clSetKernelArg(kd, 8, sizeof(wo), &wo);
+          auto p = dwopts.find("-DDW_TW=");
+          const int tw = p == std::string::npos ? 8 : std::atoi(dwopts.c_str() + p + 8);
+          const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
+                               static_cast<size_t>(Hout), static_cast<size_t>(Cin)};
+          timed("depthwise", kd, 3, g, nullptr);
+        } else {
         cl_kernel kd = getKernel("conv_general", dkern, dwopts);
         int ho = Hout, wo = Wout;
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
@@ -1432,6 +1503,7 @@ void PlanModel::run()
         } else {
           const size_t gdw[1] = {static_cast<size_t>(Cin) * Hout * Wout};
           timed("depthwise", kd, 1, gdw, nullptr);
+        }
         }
       } else {
       clSetKernelArg(kConvG_, 0, sizeof(dx), &dx);
@@ -2326,9 +2398,55 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       if (!shouldTune(sig)) continue;
       const double flops = 2.0 * Cin * static_cast<double>(Hout) * Wout * K * K;
       const std::vector<Candidate> cands = candidatesDepthwise(sig);
+      // vp 与其它候选分开计时：vp 的真实每帧成本 = depthwise_vp + pad（pad 单独量）。
+      // R31 负结果：pad 受带宽墙限制，省下的边界谓词 ≈ pad 成本，整网基本持平；因此
+      // vp 候选默认不进入候选集，只有 INFVINO_DW_PAD 打开时才参与（见 docs/kernel.md）。
+      std::vector<Candidate> candsNoPad, candsPad;
+      for (const auto & c : cands)
+        (c.kernel == "depthwise_vp" ? candsPad : candsNoPad).push_back(c);
+      int    Hp = H + 2 * P, Wpad = 0;
+      cl_mem xp = nullptr;
+      double padMs = 0.0;
+      if (!candsPad.empty()) {
+        // 为零边输入一次性写零（尺寸按最大 TW），并单独量一趟 pad。
+        xp = dwPadInput(n.ins[0], Cin, H, W, K, S, P, &Hp, &Wpad);
+        cl_kernel kp = getKernel("conv_general", "depthwise_pad", "");
+        clSetKernelArg(kp, 0, sizeof(dx), &dx);
+        clSetKernelArg(kp, 1, sizeof(xp), &xp);
+        clSetKernelArg(kp, 2, sizeof(Cin), &Cin);
+        clSetKernelArg(kp, 3, sizeof(H), &H);
+        clSetKernelArg(kp, 4, sizeof(W), &W);
+        clSetKernelArg(kp, 5, sizeof(Hp), &Hp);
+        clSetKernelArg(kp, 6, sizeof(Wpad), &Wpad);
+        clSetKernelArg(kp, 7, sizeof(P), &P);
+        const size_t gpad[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                                static_cast<size_t>(Cin)};
+        std::function<cl_event()> padEnq = [this, kp, gpad]() {
+          return ClRuntime::enqueueND(rt_.queue(), kp, 3, gpad, nullptr);
+        };
+        benchCandidate(rt_, padEnq, iters, &padMs);
+      }
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
         cl_kernel kd = getKernel("conv_general", c.kernel, c.options);
         int ho = Hout, wo = Wout;
+        if (c.kernel == "depthwise_vp") {
+          clSetKernelArg(kd, 0, sizeof(xp), &xp);
+          clSetKernelArg(kd, 1, sizeof(dw), &dw);
+          clSetKernelArg(kd, 2, sizeof(db), &db);
+          clSetKernelArg(kd, 3, sizeof(dy), &dy);
+          clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
+          clSetKernelArg(kd, 5, sizeof(Hp), &Hp);
+          clSetKernelArg(kd, 6, sizeof(Wpad), &Wpad);
+          clSetKernelArg(kd, 7, sizeof(ho), &ho);
+          clSetKernelArg(kd, 8, sizeof(wo), &wo);
+          auto p = c.options.find("-DDW_TW=");
+          const int tw = p == std::string::npos ? 8 : std::atoi(c.options.c_str() + p + 8);
+          const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
+                               static_cast<size_t>(Hout), static_cast<size_t>(Cin)};
+          return [this, kd, g]() {
+            return ClRuntime::enqueueND(rt_.queue(), kd, 3, g, nullptr);
+          };
+        }
         clSetKernelArg(kd, 0, sizeof(dx), &dx);
         clSetKernelArg(kd, 1, sizeof(dw), &dw);
         clSetKernelArg(kd, 2, sizeof(db), &db);
@@ -2352,7 +2470,19 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kd, 1, gdw, nullptr);
         };
       };
-      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      TuningEntry e = autotuneOp(rt_, sig, candsNoPad, makeEnqueue, flops, iters);
+      if (!candsPad.empty()) {
+        TuningEntry ev = autotuneOp(rt_, sig, candsPad, makeEnqueue, flops, iters);
+        if (!ev.kernel.empty()) {
+          const double eff = ev.ms + padMs;  // 加上每帧 pad 的一趟
+          if (e.kernel.empty() || eff < e.ms) {
+            ev.ms = eff;
+            ev.ops = rt_.opsPerEuCycle(flops, eff);
+            ev.ratio = ev.expected > 0 ? ev.ops / ev.expected : 0.0;
+            e = ev;
+          }
+        }
+      }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
         ++n_tuned;

@@ -131,6 +131,38 @@ OV per-node GPU 时间（`enable_profiling`）与端到端（含预处理）：
 行主序 B（消除转置 staging 的 bank conflict）+ half4 向量化 staging + 按 K 选 BK
 （`K>=256` 用 32，否则 8）。详见 `docs/kernel.md` Round 8。
 
+### 2.4 `wall − busy` 的构成（P2 host 分段，`kernel_run --report`）
+
+P0 发现「内存池对墙钟的收益 > GPU busy」，于是 P2 先量化墙钟里 busy 之外的开销。
+`PlanModel::run()` 在 profiling 下对每个节点分别累计 **host 入队提交**
+（`clEnqueueNDRangeKernel` 的调用耗时）与 **同步等待**（`clWaitForEvents`），`kernel_run`
+打印如下分段（同会话、`--iters 30`、单流、warm）：
+
+| 模型 | wall | busy (%wall) | enqueue | sync | host_total≈wall−sync | setarg_est≈host_total−enqueue |
+|---|---:|---:|---:|---:|---:|---:|
+| yolov8n-pose | 18.202 | 13.469 (74%) | 1.738 | 14.462 | 3.741 | 2.002 |
+| yolo11n-pose | 20.695 | 14.514 (70%) | 2.365 | 16.039 | 4.657 | 2.292 |
+| mobilenet | 4.912 | 2.541 (52%) | 1.139 | 3.471 | 1.441 | 0.302 |
+
+口径：in-order 单队列 + profiling，逐节点 `clWaitForEvents`，故
+`wall = enqueue_host + sync + setarg/其它`；`sync` 含 GPU 执行，故
+`host_total = wall − sync`，`setarg_est` 是扣掉入队后的**其余 host**（主要是
+`clSetKernelArg` + 循环/视图簿记）。
+
+**结论（供 P2 决策）**：
+
+- 墙钟里 busy 只占 **52%（mobilenet）–74%（yolov8）**；mobilenet 的 wall 几乎是 busy 的 2×。
+- host 开销由**两块相当**构成：`clEnqueueNDRangeKernel` **入队提交**（1.1–2.4 ms，
+  即 dispatch/launch floor）与**其余 host（含 `setArg`）**（0.30–2.29 ms）。
+- 因此纯 per-dispatch 优化（如参数缓存）能砍掉 y8/y11 约 2 ms 的一部分，但要实质收窄
+  gap 还需**减少 dispatch 数**（融合/持久化 kernel）——与 R-P0「常驻 `cl_mem` 数影响
+  墙钟」的观察一致。P3 的在线调优与本分段共用同一套统计。
+- **P2 下一步候选**（按风险，尚未做）：① 去掉 profiling 下逐节点 `clWaitForEvents`
+  （部署 `profiling_=false` 本就不等，但可查 host 侧每节点开销）；② **kernel 参数缓存**
+  （记录 `(kernel, 参数签名, 内存指针)`，内存/配置不变则跳过 `setArg`，学 OV
+  `MEMORY_CHANGED`）；③ out-of-order 队列 + event 依赖（需先确认 Intel 驱动行为）；
+  ④ `createSession()` 多 Session 并行缓冲（后端当前用 mutex 串行）。
+
 ## 3. 复现
 
 ```bash

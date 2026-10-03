@@ -174,3 +174,68 @@ __kernel void depthwise_v(
     if (ox < Wo) Y[((size_t)c * Ho + oy) * Wo + ox] = dw_activate((half)(acc[t] + b));
   }
 }
+
+// ---------------------------------------------------------------------------
+// R31: padded depthwise.  ISA reverse-engineering showed the scalar/vector kernels
+// are dominated by addressing + per-element boundary predicates (cmp/shl/add), not
+// FMA.  Here the input is materialised once per frame into a zero border
+// Xp[C][Hp][Wpad] by `depthwise_pad` (borders zero-filled at allocation time, only
+// the interior is rewritten each frame), so `depthwise_vp` has **no boundary
+// checks at all**.  It accumulates in the same (kh,kw) order as `depthwise_v` and
+// out-of-range taps read the zero border => bit-identical output.
+//
+// Layout: Xp[c][P+oy][P+ox] = X[c][oy][ox]; Hp = H + 2P; Wpad covers the deepest
+// tap any work-group reads (see PlanModel::dwPadInput).
+__kernel void depthwise_pad(
+  __global const half *restrict X,   // [C][H][W]
+  __global half *restrict Xp,        // [C][Hp][Wpad], borders pre-zeroed
+  const int C, const int H, const int W, const int Hp, const int Wpad, const int P) {
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  const int c = get_global_id(2);
+  if (x >= W || y >= H || c >= C) return;
+  Xp[((size_t)c * Hp + (y + P)) * Wpad + (x + P)] =
+      X[((size_t)c * H + y) * W + x];
+}
+
+__kernel void depthwise_vp(
+  __global const half *restrict Xp,    // [C][Hp][Wpad] (padded, zero border)
+  __global const half *restrict Wt,    // [C][K][K]
+  __global const half *restrict Bias,  // [C] or null
+  __global half *restrict Y,           // [C][Ho][Wo]
+  const int C, const int Hp, const int Wpad, const int Ho, const int Wo) {
+  const int x0 = get_global_id(0) * DW_TW;
+  const int oy = get_global_id(1);
+  const int c  = get_global_id(2);
+  if (oy >= Ho || c >= C) return;
+
+  half w[DW_K * DW_K];
+#pragma unroll
+  for (int i = 0; i < DW_K * DW_K; ++i) w[i] = Wt[(size_t)c * DW_K * DW_K + i];
+  const __global half *xplane = Xp + (size_t)c * Hp * Wpad;
+
+  half acc[DW_TW];
+#pragma unroll
+  for (int t = 0; t < DW_TW; ++t) acc[t] = (half)0;
+
+#pragma unroll
+  for (int kh = 0; kh < DW_K; ++kh) {
+    // padded row index = oy*S - P + kh + P = oy*S + kh (always in [0, Hp)).
+    const __global half *xrow = xplane + (size_t)(oy * DW_S + kh) * Wpad;
+    half strip[DW_STRLEN];
+#pragma unroll
+    for (int j = 0; j < DW_STRLEN; ++j) strip[j] = xrow[x0 * DW_S + j];
+#pragma unroll
+    for (int t = 0; t < DW_TW; ++t)
+#pragma unroll
+      for (int kw = 0; kw < DW_K; ++kw)
+        acc[t] = mad(strip[t * DW_S + kw], w[kh * DW_K + kw], acc[t]);
+  }
+
+  const half b = Bias ? Bias[c] : (half)0;
+#pragma unroll
+  for (int t = 0; t < DW_TW; ++t) {
+    const int ox = x0 + t;
+    if (ox < Wo) Y[((size_t)c * Ho + oy) * Wo + ox] = dw_activate((half)(acc[t] + b));
+  }
+}

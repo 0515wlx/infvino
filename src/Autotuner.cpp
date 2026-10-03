@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 
@@ -197,6 +198,28 @@ std::vector<Candidate> candidatesDepthwise(const OpSignature & sig)
                   sig.act, tw);
     Candidate v;
     v.kernel = "depthwise_v";
+    v.source = "conv_general";
+    v.options = vo;
+    v.config = vc;
+    out.push_back(std::move(v));
+  }
+  // R31: padded (boundary-free) variant.  The input is pre-padded once per frame by
+  // `depthwise_pad`; that extra pass is measured separately in PlanModel::autotune and
+  // added to this candidate's cost, so the selection accounts for it.  **Opt-in only**:
+  // the measured whole-net result is a wash (pad is bandwidth-bound and cancels the
+  // boundary-predicate saving), so vp is not enumerated by default.  See docs/kernel.md.
+  if (std::getenv("INFVINO_DW_PAD"))
+  for (int tw : {2, 4, 8}) {
+    if (sig.W > 0 && tw > sig.W) continue;
+    char vo[192], vc[128];
+    std::snprintf(vo, sizeof(vo),
+                  "-DDW_K=%d -DDW_S=%d -DDW_P=%d -DDW_ACT=%d -DDW_TW=%d "
+                  "-cl-mad-enable -cl-fast-relaxed-math",
+                  sig.K, sig.stride, sig.pad, sig.act, tw);
+    std::snprintf(vc, sizeof(vc), "K=%d,S=%d,P=%d,ACT=%d,TW=%d,PAD", sig.K, sig.stride, sig.pad,
+                  sig.act, tw);
+    Candidate v;
+    v.kernel = "depthwise_vp";
     v.source = "conv_general";
     v.options = vo;
     v.config = vc;

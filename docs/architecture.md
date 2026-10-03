@@ -108,6 +108,22 @@ output <name>                        # 可多行
 `Preprocessor` 复刻 ultralytics 默认：letterbox（`scale=min`，pad 114）+ BGR→RGB + `/255` + NCHW；
 分类模型可用 `letterbox:false` + `mean`/`std`（ImageNet）。`LetterboxInfo` 保存几何参数用于反映射。
 
+### 6.5 跨推理缓存安全（必须遵守）
+
+`PlanModel` 为性能缓存设备侧结构，分为两类：
+
+| 类别 | 例子 | 跨 run 是否安全 |
+|---|---|---|
+| **常量**（权重/几何）| `ovWeight` / `blkWeight`（重排权重）、`bcastDims`、`small_buf_` | 安全：内容不随帧变 |
+| **激活态** | `blkInput`（conv_blk 输入重排）、`dwPadInput`（depthwise 零边输入）| **每 run 必须重算**；只允许缓存 `cl_mem`，不能缓存结果 |
+
+**历史教训**：`blkInput` 按张量名缓存了重排结果且只算一次 → 第 2 帧起用上一帧输入
+（y8 第 2 帧 `mean_rel≈1.4e-2`，正常 ~5e-4）。因为所有测试都**同一输入重复跑**，
+陈旧值恰好等于正确值，长期未被发现。
+**规则**：任何「按名字缓存、跨 run 复用」的激活态，都必须有**多输入**数值测试覆盖
+（`scripts/reuse_check.py`；`model_check`/`numerical_check`/`engine_check` 均跑两份不同输入、
+取第二帧）。详见 `docs/kernel.md`「稳定性事故记录」。
+
 ## 7. 扩展指引
 
 | 需求 | 做法 |
@@ -134,4 +150,5 @@ output <name>                        # 可多行
 
 - 仅 fp16 计划 / f32 输出；解码只支持 f32。
 - seg / obb 未实现。
-- 非 profiling 模式下整网墙钟受 kernel launch 开销主导（GPU 忙时见 `docs/kernel.md`）。
+- 整网墙钟受 host 开销主导：GPU busy 只占墙钟 52%（mobilenet）–74%（yolov8），其余为
+  **入队提交 + `setArg`/同步**。P2 host 分段实测见 `docs/benchmark.md` §2.4。
