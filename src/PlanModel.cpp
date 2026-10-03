@@ -86,6 +86,8 @@ PlanModel::~PlanModel()
     if (m) clReleaseMemObject(m);
   for (cl_mem m : owned_blk_)
     if (m) clReleaseMemObject(m);
+  for (cl_mem m : alias_subs_)
+    if (m) clReleaseMemObject(m);
 }
 
 cl_mem PlanModel::ovWeight(const std::string & name, Tensor & w, int Cout, int Cin)
@@ -392,14 +394,38 @@ void PlanModel::allocateActivations()
     for (const auto & o : nodes_[i].outs) touch(o, static_cast<int>(i), true);
   }
 
-  // 1b) reshape/flatten 是零拷贝视图：run() 里把 out.mem 指向 in.mem。因此视图与其源
-  //     必须**共享生存期**——否则源 buffer 会在视图仍被读取时被池复用掉（这是 R-P0 第一版
-  //     的数值 FAIL 根因）。这里用并查集把视图链合并，取区间并集。
-  std::unordered_map<std::string, std::string> alias_parent;
+  // 1b) 零拷贝视图 / 连续切片别名：必须与其源**共享生存期**——否则源 buffer 会在视图仍被
+  //     读取时被池复用掉（这是 R-P0 第一版数值 FAIL 的根因）。
+  //     (a) reshape/flatten：run() 里 out.mem = in.mem（整块共享）。
+  //     (b) 连续 copy_c（dst_off=0）：输出是父张量的一段连续通道范围
+  //         [c0*HW, (c0+cnt)*HW)，可用 clCreateSubBuffer 直接别名（消费者零改动）。
+  std::unordered_map<std::string, std::string> alias_parent;   // 输出 -> 源（整块）
+  std::unordered_map<std::string, std::pair<std::string, int64_t>> alias_sub;  // 输出 -> (源, 字节偏移)
   for (const auto & n : nodes_)
-    if ((n.op == "reshape" || n.op == "flatten") && !n.ins.empty() && n.ins[0] != "-" &&
-        !n.outs.empty() && n.outs[0] != "-")
+  {
+    if (n.ins.empty() || n.outs.empty() || n.ins[0] == "-" || n.outs[0] == "-") continue;
+    if (n.op == "reshape" || n.op == "flatten")
       alias_parent[n.outs[0]] = n.ins[0];
+    else if (n.op == "copy_c" && attrInt(n, "dst_off", 0) == 0)
+    {
+      const int64_t HW = attrInt(n, "HW", 0), c0 = attrInt(n, "c0", 0),
+                    cnt = attrInt(n, "cnt", 0);
+      auto pit = T_.find(n.ins[0]);
+      auto oit = T_.find(n.outs[0]);
+      // 需求：源是连续张量；输出的元素数 == cnt*HW 且等于父张量的一段（父的通道数
+      // 可不严格等于 c0+cnt，但必须有足够数据）。offset = c0*HW 元素 → 字节 = ×2。
+      if (HW > 0 && cnt > 0 && pit != T_.end() && oit != T_.end())
+      {
+        const int64_t need = static_cast<int64_t>(c0 + cnt) * HW;
+        if (pit->second.numel() >= need &&
+            oit->second.numel() == static_cast<int64_t>(cnt) * HW)
+        {
+          alias_sub[n.outs[0]] = {n.ins[0], static_cast<int64_t>(c0) * HW * 2};
+          alias_parent[n.outs[0]] = n.ins[0];   // 用于生存期并集
+        }
+      }
+    }
+  }
   auto root_of = [&](std::string t) {
     int guard = 0;
     while (alias_parent.count(t) && guard++ < 1000) t = alias_parent[t];
@@ -495,6 +521,7 @@ void PlanModel::allocateActivations()
   for (size_t k : order)
   {
     auto & l = lives[k];
+    if (alias_parent.count(l.name)) continue;   // 别名：不单独分配，稍后指向源
     if (static_cast<size_t>(l.id) >= pool_limit) continue;
     cl_mem m = act_pool_.acquire(
       [&](size_t bytes) { return rt_.alloc(bytes, CL_MEM_READ_WRITE); }, l.bytes,
@@ -509,7 +536,57 @@ void PlanModel::allocateActivations()
     }
     T_[l.name].mem = m;
   }
+
+  // 4b) 视图/切片别名：reshape/flatten 直接指向源；连续 copy_c 建子 buffer（源内偏移）。
+  //     源此刻已经拿到池 buffer（root_of 保证别名在源之后处理：源不是别名）。
+  for (auto & kv : alias_parent)
+  {
+    const std::string & out_name = kv.first;
+    auto oit = T_.find(out_name);
+    if (oit == T_.end()) continue;
+    cl_mem old = oit->second.mem;
+    if (old)
+    {
+      auto fit = std::find(owned_.begin(), owned_.end(), old);
+      if (fit != owned_.end()) owned_.erase(fit);
+      if (old_ref.count(old) == 1) { clReleaseMemObject(old); old_ref.erase(old); }
+    }
+    const std::string & src = kv.second;
+    auto sit = T_.find(src);
+    if (sit == T_.end()) { continue; }
+    auto sub = alias_sub.find(out_name);
+    if (sub == alias_sub.end())
+    {
+      oit->second.mem = sit->second.mem;             // 整块视图（reshape/flatten）
+    }
+    else
+    {
+      cl_buffer_region region{static_cast<size_t>(sub->second.second), 0};
+      region.size = static_cast<size_t>(oit->second.numel() * 2);
+      cl_int err = CL_SUCCESS;
+      cl_mem sb = clCreateSubBuffer(sit->second.mem, CL_MEM_READ_WRITE,
+                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+      oit->second.mem = (err == CL_SUCCESS && sb) ? sb : sit->second.mem;
+      if (err == CL_SUCCESS && sb) alias_subs_.push_back(sb);
+    }
+  }
+
+  // 4c) 标记「被别名取代」的 copy_c 节点：run() 不再 launch 它（源数据已在别名里）。
+  node_skipped_.assign(N, 0);
+  for (size_t i = 0; i < N; ++i)
+    if (nodes_[i].op == "copy_c" && !nodes_[i].outs.empty() &&
+        alias_sub.count(nodes_[i].outs[0]))
+      node_skipped_[i] = 1;
   verify();
+  if (std::getenv("INFVINO_POOL_MAP"))
+  {
+    std::fprintf(stderr, "[map] requested=%zu allocated=%zu bufs=%zu\n",
+                 act_pool_.requestedBytes(), act_pool_.allocatedBytes(),
+                 act_pool_.bufferCount());
+    for (auto & s : act_pool_.debugSharing()) std::fprintf(stderr, "[map] %s\n", s.c_str());
+    for (const auto & l : lives)
+      std::fprintf(stderr, "[map] id=%d [%d,%d] %s\n", l.id, l.birth, l.death, l.name.c_str());
+  }
 }
 
 void PlanModel::buildKernels()
@@ -1112,8 +1189,10 @@ void PlanModel::run()
     clReleaseEvent(ev);
   };
 
-  for (const auto & n : nodes_)
+  for (size_t ni = 0; ni < nodes_.size(); ++ni)
   {
+    const auto & n = nodes_[ni];
+    if (ni < node_skipped_.size() && node_skipped_[ni]) continue;  // P0: 已被别名取代
     auto & out = ref(n.outs[0]);
     if (n.op == "reshape" || n.op == "flatten")
     {
@@ -1784,6 +1863,21 @@ void PlanModel::readOutput(size_t i, void * fp16_host)
 {
   const Tensor & t = T_.at(outputs_.at(i));
   rt_.read(t.mem, static_cast<size_t>(t.numel()) * 2, fp16_host);
+}
+
+bool PlanModel::readTensor(const std::string & name, void * fp16_host) const
+{
+  auto it = T_.find(name);
+  if (it == T_.end() || it->second.mem == nullptr) return false;
+  const_cast<ClRuntime &>(rt_).read(it->second.mem, static_cast<size_t>(it->second.numel()) * 2,
+                                   fp16_host);
+  return true;
+}
+
+size_t PlanModel::tensorNumel(const std::string & name) const
+{
+  auto it = T_.find(name);
+  return it == T_.end() ? 0 : static_cast<size_t>(it->second.numel());
 }
 
 // ---------------------------------------------------------------------------

@@ -169,6 +169,50 @@ wall 降幅（5.2–5.8%）明显大于 busy 降幅（3.4–4.9%）。说明墙�
 
 ---
 
+## 5.2 P0 第二步：连续 `copy_c` → sub-buffer alias（已落地）
+
+Post-fusion 的 8 条 `copy_c` 都是 `Split_output_1`：父张量的**一段连续通道范围**
+`[c0*HW, (c0+cnt)*HW)`（`c0=Cin/2`、`dst_off=0`）。这类切片**不需要 kernel 改动**：
+用 `clCreateSubBuffer` 在父 buffer 的字节偏移 `c0*HW*2` 处建子 buffer，消费者照常读
+一个 `cl_mem`。节点在 `run()` 里被跳过（不再 launch）。
+
+条件（全部满足才别名）：`dst_off==0`；源张量连续；输出元素数 == `cnt*HW`；
+源元素数 ≥ `(c0+cnt)*HW`；偏移 1024 对齐（Intel `CL_DEVICE_MEM_BASE_ADDR_ALIGN`）。
+
+实测（同二进制，`INFVINO_NO_POOL=1` 作为基线对照）：
+
+| 模型 | baseline busy | pool+alias busy | 变化 | 分配量 |
+|---|---|---|---|---|
+| yolov8n-pose | 13.57 | **12.98** | **−4.3%** | 60.5 → 24.0 MB |
+| yolo11n-pose | 14.64 | **13.80** | **−5.7%** | 69.0 → 26.3 MB |
+| mobilenetv3-small | 2.86 | **2.66** | **−7.1%** | 4.3 → 0.7 MB |
+
+`copy_c` 从报告消失（−0.092 ms）；随机输入下三模型输出与基线**逐位一致**。
+
+### 仍未做（低 ROI，明确记录）
+
+- **`slice_axis`（0.040 ms）**：沿 `axdim` 带内 stride，不是连续段，别名需要消费者
+  支持跨步 offset（要改多个 kernel）——**不划算**。
+- **尾部 `concat4`（0.222 ms，6 条）**：`outer=17/64/51`、`inner=1` 的检测头拼接，
+  可仿 Route A 让 `ew`/`reshape` 直接读多源，但收益小、风险高，暂缓。
+
+> **P0 第二步小结**：post-fusion 后这些小算子的余额只剩 ~0.35 ms（~2.7% busy），
+> 其中 `copy_c` 已用 alias 吃掉。**继续攻 view/alias 的边际收益很低**，
+> 结构性收益应转向 P1（布局/精度分层）。
+
+---
+
+## 5.3 顺带确认：mobilenet 的 1.3e-2 与 P0 无关
+
+对 mobilenet 做了 `pool` vs `INFVINO_NO_POOL` 的逐位对比：**输出完全相同**，
+且两者 vs onnxruntime 都是 mean_abs=1.5944e-2。差别在 `nopool` 下 dump 中间张量
+才能读到正确值——`--dump-tensor` 是 **run() 之后**读，池化缓冲里只剩最后一个写者，
+**是 dump 工具的语义限制，不是数值 bug**。
+mobilenet 的误差根因与判据改进见 `docs/benchmark.md` §1.2。
+
+
+---
+
 ## 6. 与后续阶段的关系
 
 - **P1 布局**：memory pool 是 blocked 布局传播的前提（reorder 的中间 buffer 也要复用）。

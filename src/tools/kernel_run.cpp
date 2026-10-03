@@ -34,7 +34,7 @@ bool readFile(const std::string & path, std::vector<uint16_t> & buf)
 
 int main(int argc, char ** argv)
 {
-  std::string plan_path, kernel_dir, input_path, output_path, out_dir;
+  std::string plan_path, kernel_dir, input_path, output_path, out_dir, dump_tensor;
   int         iters  = 1;
   bool        report = false;
 
@@ -49,6 +49,7 @@ int main(int argc, char ** argv)
     else if (a == "--out-dir") out_dir = next();
     else if (a == "--iters") iters = std::atoi(next().c_str());
     else if (a == "--report") report = true;
+    else if (a == "--dump-tensor") dump_tensor = next();
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
   }
   if (plan_path.empty()) { std::fprintf(stderr, "usage: kernel_run --plan <plan.txt>\n"); return 2; }
@@ -92,6 +93,24 @@ int main(int argc, char ** argv)
       std::ofstream f(path, std::ios::binary);
       f.write(reinterpret_cast<const char *>(buf.data()), static_cast<std::streamsize>(buf.size() * 2));
       std::fprintf(stderr, "[kernel_run] wrote %s\n", path.c_str());
+    }
+
+    if (!dump_tensor.empty())
+    {
+      // P0 诊断：把任意中间张量写到 <dump_tensor>.bin（fp16，行主序）。
+      const size_t n = model.tensorNumel(dump_tensor);
+      if (n == 0) std::fprintf(stderr, "[kernel_run] no tensor: %s\n", dump_tensor.c_str());
+      else
+      {
+        std::vector<uint16_t> buf(n);
+        model.readTensor(dump_tensor, buf.data());
+        std::string safe = dump_tensor;
+        for (char & c : safe) if (c == '/') c = '_';
+        const std::string path = safe + ".bin";
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char *>(buf.data()), static_cast<std::streamsize>(buf.size() * 2));
+        std::fprintf(stderr, "[kernel_run] wrote %s (%zu elems)\n", path.c_str(), n);
+      }
     }
 
     if (report)

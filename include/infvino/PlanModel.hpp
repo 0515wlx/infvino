@@ -77,6 +77,12 @@ public:
   /** @brief 把第 i 个输出拷贝到 fp16 主机缓冲（outputNumel(i) 个元素）。 */
   void readOutput(size_t i, void * fp16_host);
 
+  /** @brief P0 诊断：按名字读取任意已声明张量（fp16 主机缓冲，numel 个元素）。
+   *  返回 false 表示无此张量。用于逐层误差定位。 */
+  bool readTensor(const std::string & name, void * fp16_host) const;
+  /** @brief P0 诊断：任意张量的元素数；0 表示无此张量。 */
+  size_t tensorNumel(const std::string & name) const;
+
   const ClRuntime &   runtime() const { return rt_; }
   const DeviceInfo &  device() const { return rt_.info(); }
 
@@ -190,6 +196,8 @@ private:
   // parse(), zero runtime cost).  Weights/input/output are kept out of the pool.
   ActPool                                act_pool_;
   std::vector<std::string>               act_names_;   // P0: activation tensors in the pool
+  std::vector<cl_mem>                    alias_subs_;  // P0: sub-buffers for sliced aliases
+  std::vector<char>                      node_skipped_;  // P0: per-node "alias, don't launch"
   // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;

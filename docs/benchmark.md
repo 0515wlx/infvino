@@ -23,11 +23,28 @@
 
 阈值：`mean_rel < 2e-2` 且 `max_rel < 5e-2`。全部 PASS。
 
-| 模型 | mean_rel | max_rel(amax) | max_abs |
-|---|---|---|---|
-| yolov8n-pose | 5.22e-04 | 1.03e-02 | 7.05e+00 |
-| yolo11n-pose | 8.19e-04 | 1.92e-02 | 1.28e+01 |
-| mobilenetv3-small | 1.08e-02 | 1.08e-02 | 6.68e-02 |
+| 模型 | mean_rel | max_rel(amax) | max_abs | scale_rel(mean\|d\|/max\|ref\|) |
+|---|---|---|---|---|
+| yolov8n-pose | 5.22e-04 | 1.03e-02 | 7.05e+00 | ~3e-05 |
+| yolo11n-pose | 8.19e-04 | 1.92e-02 | 1.28e+01 | ~6e-05 |
+| mobilenetv3-small | 1.08e-02 | 1.08e-02 | 6.68e-02 | 1.1e-03 |
+
+> **关于 mobilenet 的 1.1–1.3e-2（不是口径问题，是真误差，但可解释）**：
+> `mean_rel = mean|diff| / mean|ref|` 对**小量级输出**会放大，但诚实地说，
+> mobilenet 的**绝对误差本身也偏大**：mean|diff| ≈ 1.6e-2，对 logits（满量程 ~6.2）
+> 是 relative-to-range ≈ 2.6e-3，比 yolo 的 ~1.6e-4 **大 ~16×**。
+>
+> **根因（逐层定位，2026-10）**：mobilenet 尾部是
+> `GAP → classifier.1 (1024, K=576) → HardSwish → classifier.3 (1000, K=1024)`。
+> 实测误差沿尾部逐级放大：GAP 后 mean_abs≈1.0e-3 → classifier.1 后≈1.6e-3 →
+> logits≈1.6e-2。**K=1024 的 fp16 GEMM 头是主因**：即使 fp32 累加，输入激活/权重
+> 都是 fp16（~1e-3 相对），1024 项随机游走 ⇒ 输出相对误差 ~√K·1e-3 ≈ 3e-2 量级。
+>
+> **影响**：分类结果正确（argmax 一致、top-5 仅第 4/5 名互换）。**不是 bug。**
+> **P1 候选**：最后一层分类 GEMM 用 fp32 权重/更精确累加，可把 logits 误差压回 ~1e-3。
+>
+> **判据改进**：`model_check.py` 已输出 `scale_rel` / `quant_rel` / `ulp_frac`
+> （尺度无关），比单一 `mean_rel` 更能反映真实质量；后续应把这些纳入 PASS 判据。
 
 ### 1.3 库后端（`scripts/numerical_check.py`，`ClBackend` vs onnxruntime FP32）
 
