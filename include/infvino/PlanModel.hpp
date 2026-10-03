@@ -225,6 +225,8 @@ private:
   void    replayNode(size_t ni);
   /** @brief P2: 克隆一个 kernel（独立参数状态，用于跨帧跳过 setArg）。 */
   cl_kernel cloneKernel(cl_kernel src);
+  /** @brief R32 原型：把整帧 dispatch 录制进 cl_khr_command_buffer（CUDA-graph 类比）。*/
+  void buildCommandBuffer();
   /**
    * @brief Round 28: set up a small-op kernel — args + launch geometry.
    *
@@ -289,6 +291,13 @@ private:
   bool                              capturing_{false}; // 正在录制
   bool                              launch_cache_{true};  // INFVINO_NO_LAUNCH_CACHE 可关
   size_t                            cap_node_{0};      // 正在录制的节点序号
+
+  // R32 原型：cl_khr_command_buffer 整帧重放（INFVINO_CMDBUF=1 开启）。
+  void * cmdbuf_{nullptr};                 // cl_command_buffer_khr
+  void * cmdbuf_enqueue_{nullptr};         // clEnqueueCommandBufferKHR_fn
+  void * cmdbuf_release_{nullptr};         // clReleaseCommandBufferKHR_fn
+  bool   cmdbuf_enabled_{false};
+  bool   cmdbuf_failed_{false};
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
   double                                        last_run_ms_{0.0};

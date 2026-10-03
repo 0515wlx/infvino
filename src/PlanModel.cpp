@@ -2,6 +2,8 @@
 
 #include "infvino/PlanModel.hpp"
 
+#include <CL/cl_ext.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -58,6 +60,8 @@ PlanModel::PlanModel(
   {
     const char * nc = std::getenv("INFVINO_NO_LAUNCH_CACHE");
     if (nc && std::string(nc) != "0" && std::string(nc) != "") launch_cache_ = false;
+    const char * cb = std::getenv("INFVINO_CMDBUF");
+    if (cb && std::string(cb) != "0" && std::string(cb) != "") cmdbuf_enabled_ = true;
   }
   parse();
   buildKernels();
@@ -85,6 +89,8 @@ PlanModel::PlanModel(
 
 PlanModel::~PlanModel()
 {
+  if (cmdbuf_ && cmdbuf_release_)
+    reinterpret_cast<clReleaseCommandBufferKHR_fn>(cmdbuf_release_)(static_cast<cl_command_buffer_khr>(cmdbuf_));
   for (cl_kernel k : clone_kernels_)
     if (k) clReleaseKernel(k);
   releaseKernels();
@@ -726,7 +732,7 @@ cl_event PlanModel::enqueueCmd(cl_kernel k, cl_uint dim, const size_t * gws, con
     c.k   = cloneKernel(k);
     c.dim = dim;
     for (cl_uint i = 0; i < dim && i < 3; ++i) c.gws[i] = gws[i];
-    c.useLws = (lws != nullptr);
+    c.useLws = useLws;
     if (lws)
       for (cl_uint i = 0; i < dim && i < 3; ++i) c.lws[i] = lws[i];
     c.tag = tag ? tag : "";
@@ -770,6 +776,72 @@ void PlanModel::replayNode(size_t ni)
     }
     if (ev) clReleaseEvent(ev);
   }
+}
+
+// ---------------------------------------------------------------------------
+// R32 原型：cl_khr_command_buffer 整帧重放（CUDA-graph 类比）。
+//
+// 在首帧 launch 缓存录制完成后调用：把所有节点的 dispatch（含 blk 重排等）录制进
+// 一个 command buffer，之后每帧只用一次 clEnqueueCommandBufferKHR 提交。
+// 目的：量「每 dispatch host 提交」与「kernel 间前端气泡」到底占 net 多少。
+// 驱动不导出符号，用 clGetExtensionFunctionAddressForPlatform 解析。
+// ---------------------------------------------------------------------------
+void PlanModel::buildCommandBuffer()
+{
+  if (!cmdbuf_enabled_ || cmdbuf_failed_ || cmdbuf_) return;
+  cl_platform_id plat = nullptr;
+  if (clGetDeviceInfo(rt_.device(), CL_DEVICE_PLATFORM, sizeof(plat), &plat, nullptr) != CL_SUCCESS ||
+      !plat) {
+    cmdbuf_failed_ = true;
+    return;
+  }
+  auto pCreate  = reinterpret_cast<clCreateCommandBufferKHR_fn>(
+    clGetExtensionFunctionAddressForPlatform(plat, "clCreateCommandBufferKHR"));
+  auto pNDR     = reinterpret_cast<clCommandNDRangeKernelKHR_fn>(
+    clGetExtensionFunctionAddressForPlatform(plat, "clCommandNDRangeKernelKHR"));
+  auto pFinal   = reinterpret_cast<clFinalizeCommandBufferKHR_fn>(
+    clGetExtensionFunctionAddressForPlatform(plat, "clFinalizeCommandBufferKHR"));
+  auto pRelease = reinterpret_cast<clReleaseCommandBufferKHR_fn>(
+    clGetExtensionFunctionAddressForPlatform(plat, "clReleaseCommandBufferKHR"));
+  auto pEnqueue = reinterpret_cast<clEnqueueCommandBufferKHR_fn>(
+    clGetExtensionFunctionAddressForPlatform(plat, "clEnqueueCommandBufferKHR"));
+  if (!pCreate || !pNDR || !pFinal || !pRelease || !pEnqueue) {
+    std::fprintf(stderr, "[cmdbuf] cl_khr_command_buffer not resolvable; falling back to replay\n");
+    cmdbuf_failed_ = true;
+    return;
+  }
+  cl_command_queue q = rt_.queue();
+  cl_int err = CL_SUCCESS;
+  cl_command_buffer_khr cb = pCreate(1, &q, nullptr, &err);
+  if (!cb || err != CL_SUCCESS) {
+    std::fprintf(stderr, "[cmdbuf] create failed (%d); falling back\n", (int)err);
+    cmdbuf_failed_ = true;
+    return;
+  }
+  int nrec = 0;
+  for (size_t ni = 0; ni < node_cmds_.size(); ++ni) {
+    for (const PlanCmd & c : node_cmds_[ni]) {
+      cl_int e = pNDR(cb, q, nullptr, c.k, c.dim, nullptr, c.gws,
+                      c.useLws ? c.lws : nullptr, 0, nullptr, nullptr, nullptr);
+      if (e != CL_SUCCESS) {
+        std::fprintf(stderr, "[cmdbuf] record failed at node %zu (%d)\n", ni, (int)e);
+        pRelease(cb);
+        cmdbuf_failed_ = true;
+        return;
+      }
+      ++nrec;
+    }
+  }
+  if (pFinal(cb) != CL_SUCCESS) {
+    std::fprintf(stderr, "[cmdbuf] finalize failed; falling back\n");
+    pRelease(cb);
+    cmdbuf_failed_ = true;
+    return;
+  }
+  cmdbuf_ = cb;
+  cmdbuf_enqueue_ = reinterpret_cast<void *>(pEnqueue);
+  cmdbuf_release_ = reinterpret_cast<void *>(pRelease);
+  std::fprintf(stderr, "[cmdbuf] recorded %d dispatches into one command buffer\n", nrec);
 }
 
 cl_mem PlanModel::bcastDims(const std::string & spec)
@@ -1303,6 +1375,38 @@ std::string sourceOfKernel(const std::string & kernel)
 void PlanModel::run()
 {
   const auto t0 = std::chrono::steady_clock::now();
+
+  // R32 原型：command buffer 录制完成后，整帧一次提交。
+  if (cmdbuf_)
+  {
+    cl_command_queue q = rt_.queue();
+    cl_event          ev = nullptr;
+    const auto        enq0 = std::chrono::steady_clock::now();
+    cl_int err = reinterpret_cast<clEnqueueCommandBufferKHR_fn>(cmdbuf_enqueue_)(
+      1, &q, static_cast<cl_command_buffer_khr>(cmdbuf_), 0, nullptr, &ev);
+    if (err != CL_SUCCESS)
+      throw std::runtime_error("PlanModel: clEnqueueCommandBufferKHR failed: " +
+                               std::to_string(err));
+    if (profiling_)
+    {
+      prof_enqueue_ms_ += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - enq0).count();
+      const auto w0 = std::chrono::steady_clock::now();
+      clWaitForEvents(1, &ev);
+      prof_wait_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - w0).count();
+      cl_ulong s = 0, e = 0;
+      clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
+      clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
+      tprof_["cmdbuf"].first += static_cast<double>(e - s) * 1e-6;
+      tprof_["cmdbuf"].second += 1;
+    }
+    if (ev) clReleaseEvent(ev);
+    rt_.finish();
+    last_run_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return;
+  }
 
   auto timed = [&](const std::string & tag, cl_kernel k, cl_uint dim, const size_t * gws,
                    const size_t * lws) {
@@ -2078,6 +2182,9 @@ void PlanModel::run()
 
   captured_ = true;
 
+  // R32 原型：首帧录制完成后，若开启则把整帧 dispatch 录进一个 command buffer。
+  buildCommandBuffer();
+
   rt_.finish();
   last_run_ms_ =
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -2736,7 +2843,15 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
   }
 
   // P2: 调优改变了 kernel/options ⇒ 已录制的 dispatch 失效，下一次 run() 重新录制。
-  if (merge && !done.empty()) { captured_ = false; node_cmds_.clear(); }
+  if (merge && !done.empty()) {
+    captured_ = false;
+    node_cmds_.clear();
+    if (cmdbuf_ && cmdbuf_release_) {
+      reinterpret_cast<clReleaseCommandBufferKHR_fn>(cmdbuf_release_)(
+        static_cast<cl_command_buffer_khr>(cmdbuf_));
+      cmdbuf_ = nullptr;
+    }
+  }
 
   return done;
 }

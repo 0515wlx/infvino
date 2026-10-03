@@ -9,6 +9,7 @@
 // 设计：每个 case 只计 kernel 自身时间（OpenCL event profiling），与
 // infvino_bench 的 “net only” 口径一致，便于逐轮对比。
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -191,6 +192,66 @@ int benchGemmSk(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const Shape & s, i
   }
   std::printf("\n");
   clReleaseMemObject(dA); clReleaseMemObject(dB); clReleaseMemObject(dC); clReleaseKernel(k);
+  return 0;
+}
+
+// R32: 纯 launch 开销探针 —— 连续入队 N 个极小 kernel（同一 buffer，in-order 队列
+// 隐含依赖），分别量 host 入队、GPU busy 之和、以及 wall。用于回答「每 dispatch 的
+// 非重叠开销到底在 host 还是 GPU 前端」。
+int benchChain(gk::ClRuntime & rt, int iters)
+{
+  if (iters < 1) iters = 1;
+  const char * src = "__kernel void nop_k(__global int * a){ int x=get_global_id(0);"
+                     " for(int i=0;i<1024;i++) x=x*1103515245+12345; a[get_global_id(0)]=(int)x; }";
+  cl_kernel k;
+  try {
+    k = rt.buildFromSource(src, "nop_k");
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "[build-fail] %s\n", e.what());
+    return 1;
+  }
+  const size_t N = 8192;
+  cl_mem d = rt.alloc(N * 4, CL_MEM_READ_WRITE);
+  std::vector<int> h(N, 0);
+  rt.write(d, N * 4, h.data());
+  clSetKernelArg(k, 0, sizeof(d), &d);
+  const size_t gws[1] = {N};
+  for (int i = 0; i < 5; ++i) {
+    cl_event e = gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr);
+    clWaitForEvents(1, &e);
+    clReleaseEvent(e);
+  }
+  std::vector<cl_event> evs;
+  evs.reserve(static_cast<size_t>(iters));
+  auto   t0      = std::chrono::steady_clock::now();
+  double host_us = 0.0;
+  for (int i = 0; i < iters; ++i) {
+    const auto h0 = std::chrono::steady_clock::now();
+    evs.push_back(gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr));
+    host_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count();
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  clWaitForEvents(static_cast<cl_uint>(evs.size()), evs.data());
+  const auto t2 = std::chrono::steady_clock::now();
+  double busy_us = 0.0;
+  for (cl_event e : evs) {
+    cl_ulong s = 0, en = 0;
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, sizeof(en), &en, nullptr);
+    busy_us += static_cast<double>(en - s) * 1e-3;
+    clReleaseEvent(e);
+  }
+  const double wall_ms  = std::chrono::duration<double, std::milli>(t2 - t0).count();
+  const double burst_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double host_ms  = host_us / 1e3;
+  const double busy_ms  = busy_us / 1e3;
+  std::printf("  chain N=%d (8192WI x1024loop): wall=%.3f ms  enqueue_phase=%.3f  host=%.3f  sum_busy=%.3f\n",
+              iters, wall_ms, burst_ms, host_ms, busy_ms);
+  std::printf("    per-dispatch: wall=%.2f us  host=%.2f us  gpu_busy=%.2f us  wall-busy=%.2f us\n",
+              wall_ms * 1000 / iters, host_ms * 1000 / iters, busy_ms * 1000 / iters,
+              (wall_ms - busy_ms) * 1000 / iters);
+  clReleaseMemObject(d);
+  clReleaseKernel(k);
   return 0;
 }
 
@@ -1037,6 +1098,8 @@ int main(int argc, char ** argv)
   } else if (op == "gemm_sk") {
     std::printf("[gemm_sk] split-K %s\n", c1x1.label().c_str());
     for (const auto & s : shapes) rc |= benchGemmSk(rt, c1x1, s, iters, verify);
+  } else if (op == "chain") {
+    rc |= benchChain(rt, iters);
   } else if (op == "conv1x1") {
     std::printf("[conv1x1] (== gemm: M=Cout, N=H*W, K=Cin) %s\n", tiles.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "c1x1"}, {256, 256, 20, 20, "c1x1"}};
@@ -1048,8 +1111,7 @@ int main(int argc, char ** argv)
     std::printf("[conv1x1k] %s\n", c1x1.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "c1x1"}, {96, 576, 7, 7, "c1x1-mb"}};
     for (const auto & s : conv_shapes) rc |= benchConv1x1(rt, c1x1, s, iters, verify);
-  } else if (op == "conv1x1g") {
-    std::printf("[conv1x1g] gemv %s\n", c1x1.label().c_str());
+  } else if (op == "conv1x1g") {    std::printf("[conv1x1g] gemv %s\n", c1x1.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{576, 1024, 1, 1, "fc"}, {1024, 1000, 1, 1, "cls"}};
     for (const auto & s : conv_shapes) rc |= benchConv1x1Gemv(rt, c1x1, s, iters, verify);
   } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov" || op == "conv3x3blk") {
