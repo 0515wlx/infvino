@@ -139,6 +139,61 @@ int benchGemm(gk::ClRuntime & rt, const gk::Tiles & t, const Shape & s, int iter
   return 0;
 }
 
+// Specialized small-GEMM: lane-over-K split-K with sub-group reduction (R32).
+int benchGemmSk(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const Shape & s, int iters, bool verify)
+{
+  const int M = s.M, N = s.N, K = s.K;
+  const int TM = c.TM, TN = c.TN, SG = c.SG, UK = c.UNROLL;
+  char opts[256];
+  std::snprintf(opts, sizeof(opts),
+                "-DSK_TM=%d -DSK_TN=%d -DSK_SG=%d -DSK_UK=%d -DACT=%d -DRES=%d "
+                "-cl-mad-enable -cl-fast-relaxed-math", TM, TN, SG, UK, c.ACT, c.RES);
+  cl_kernel k;
+  try {
+    k = rt.buildKernel("gemm_sk", "gemm_sk_f16", opts);
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "[build-fail] %s\n", e.what());
+    return 1;
+  }
+  std::vector<uint16_t> hA((size_t)M * K), hB((size_t)K * N), hC((size_t)M * N);
+  fillRandom(hA, 1234);
+  fillRandom(hB, 5678);
+  cl_mem dA = rt.alloc((size_t)M * K * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)K * N * 2, CL_MEM_READ_ONLY);
+  cl_mem dC = rt.alloc((size_t)M * N * 2, CL_MEM_WRITE_ONLY);
+  rt.write(dA, (size_t)M * K * 2, hA.data());
+  rt.write(dB, (size_t)K * N * 2, hB.data());
+  cl_mem dNull = nullptr;
+  clSetKernelArg(k, 0, sizeof(dA), &dA);
+  clSetKernelArg(k, 1, sizeof(dB), &dB);
+  clSetKernelArg(k, 2, sizeof(dC), &dC);
+  clSetKernelArg(k, 3, sizeof(M), &M);
+  clSetKernelArg(k, 4, sizeof(N), &N);
+  clSetKernelArg(k, 5, sizeof(K), &K);
+  clSetKernelArg(k, 6, sizeof(dNull), &dNull);
+  clSetKernelArg(k, 7, sizeof(dNull), &dNull);
+  const size_t lws[2] = {static_cast<size_t>(SG), 1};
+  const size_t gws[2] = {
+    static_cast<size_t>((N + TN - 1) / TN) * lws[0],
+    static_cast<size_t>((M + TM - 1) / TM)};
+  const double med = rt.timeMs(
+    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
+  const double flops = 2.0 * static_cast<double>(M) * N * K;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  gemm_sk %-14s M=%-5d N=%-5d K=%-5d TM%d TN%d u%d  %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), M, N, K, TM, TN, UK, med, flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+  if (verify) {
+    rt.read(dC, (size_t)M * N * 2, hC.data());
+    const Accuracy a = verifyGemm(hA, hB, hC, M, N, K);
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e", a.mean_rel, a.max_rel, a.max_abs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dA); clReleaseMemObject(dB); clReleaseMemObject(dC); clReleaseKernel(k);
+  return 0;
+}
+
 struct ConvShape
 {
   int Cin, Cout, H, W;
@@ -979,6 +1034,9 @@ int main(int argc, char ** argv)
   if (op == "gemm") {
     std::printf("[gemm] tiles %s\n", tiles.label().c_str());
     for (const auto & s : shapes) rc |= benchGemm(rt, tiles, s, iters, verify);
+  } else if (op == "gemm_sk") {
+    std::printf("[gemm_sk] split-K %s\n", c1x1.label().c_str());
+    for (const auto & s : shapes) rc |= benchGemmSk(rt, c1x1, s, iters, verify);
   } else if (op == "conv1x1") {
     std::printf("[conv1x1] (== gemm: M=Cout, N=H*W, K=Cin) %s\n", tiles.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{64, 64, 80, 80, "c1x1"}, {256, 256, 20, 20, "c1x1"}};

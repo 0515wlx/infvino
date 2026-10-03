@@ -44,6 +44,7 @@ int main(int argc, char ** argv)
   std::vector<std::string> ops;
   int  limit = 0, iters = 30;
   bool report = false, expected = false, bake = false, list = false, retune = false;
+  bool refresh = false;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -60,6 +61,7 @@ int main(int argc, char ** argv)
     else if (a == "--expected") expected = true;
     else if (a == "--list") list = true;
     else if (a == "--retune") retune = true;
+    else if (a == "--refresh-expected") refresh = true;
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -72,6 +74,7 @@ int main(int argc, char ** argv)
         "  --iters N          每个候选的计时迭代数（默认 30）\n"
         "  --list             只列出唯一签名，不跑 GPU 计时\n"
         "  --retune           忽略缓存里已有的 tuned 条目，强制重新扫描（候选/标准更新后用）\n"
+        "  --refresh-expected  仅用当前中间标准重算缓存命中项的 expected/ratio（**零 GPU**）\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
         "  --bake <out.plan>  额外复制一份 plan（审计；运行时以 cache 为准）\n"
@@ -101,6 +104,25 @@ int main(int argc, char ** argv)
       auto targets = model.tuningTargets(ops);
       std::printf("unique tuning signatures: %zu\n", targets.size());
       for (const auto & t : targets) std::printf("  %s\n", t.c_str());
+      return 0;
+    }
+
+    if (refresh)
+    {
+      const int n = model.refreshExpected(ops);
+      std::printf("refresh-expected: recomputed %d cached entries (no GPU timing)\n", n);
+      // 按 ratio 升序打印（最远离中间标准的层排前面），便于定位热点。
+      struct Row { std::string sig; double ops, exp, ratio; };
+      std::vector<Row> rows;
+      for (const auto & kv : model.tuning().entries())
+        rows.push_back({kv.first, kv.second.ops, kv.second.expected, kv.second.ratio});
+      std::sort(rows.begin(), rows.end(),
+                [](const Row & a, const Row & b) { return a.ratio < b.ratio; });
+      std::printf("%-52s %8s %8s %6s\n", "signature", "measured", "expected", "ratio");
+      for (const auto & r : rows)
+        std::printf("%-52s %8.2f %8.2f %6.2f\n", r.sig.c_str(), r.ops, r.exp, r.ratio);
+      if (!cache_path.empty() && model.saveTuning(cache_path))
+        std::printf("wrote %s (cache total %zu)\n", cache_path.c_str(), model.tuning().size());
       return 0;
     }
 

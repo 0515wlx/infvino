@@ -413,12 +413,16 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
   }
 
   if (s.op == "gemm") {
-    // R13/R14: compute-only 17.7，整核 13.7（大网格）；寄存器墙让 TM·TN ≈ 32 封顶。
-    const long grid = static_cast<long>((s.M + 127) / 128) * static_cast<long>((s.N + 63) / 64);
-    double e = 13.7;  // BK32 SG16 大网格的最优（R14）
-    e *= gridFactor(grid, eu);
-    if (s.K < 64) e *= 0.7;      // 小 K：k-tile 流水 prologue/epilogue 亏（R9）
-    if (s.M <= 64) e *= 0.8;     // BM=64 复用降低（R9）
+    // R32: 修正 GEMM 中间标准。旧式把 grid 按 BM=128 估（生产 kernel 用 BM=64），
+    // 且对「小网格」套 gridFactor(grid/160) —— 但 GEMM 每个 WG 有 K 长度的归约工作，
+    // 即便 grid 小，EU 流水仍能保持较高占用。旧期望系统性偏低 ~1.4–2.2×，导致
+    // tuning.json 里一批 conv1x1 的 ratio > 1（对「上限」模型自相矛盾），无法用于热点定位。
+    // 新式：grid 用实际 BM=64/BN=64；~64 WG 即可喂饱 80 EU；K 太短时 prologue/epilogue
+    // 摊薄不足。上界仍为整核 13.7（R14），与 conv3x3 的 §7 模型同思路。
+    const long grid = ((s.M + 63) / 64) * ((s.N + 63) / 64);
+    double e = 13.7;  // 整核 compute+staging 上限（R14）
+    e *= std::min(1.0, static_cast<double>(grid) / 64.0);   // 波量化：~64 WG 喂饱 80 EU
+    e *= static_cast<double>(s.K) / (static_cast<double>(s.K) + 64.0);  // 短 K 的 prologue 亏
     return std::max(0.5, e);
   }
 

@@ -53,6 +53,12 @@ PlanModel::PlanModel(
   plan_dir_(dirName(plan_path)),
   profiling_(profiling)
 {
+  // P2: 每节点 dispatch 缓存（默认开）；INFVINO_NO_LAUNCH_CACHE=1 强制走原逐帧路径
+  // （用于 A/B 与数值回归排查）。
+  {
+    const char * nc = std::getenv("INFVINO_NO_LAUNCH_CACHE");
+    if (nc && std::string(nc) != "0" && std::string(nc) != "") launch_cache_ = false;
+  }
   parse();
   buildKernels();
   tuning_ = TuningCache::loadDefault();
@@ -79,6 +85,8 @@ PlanModel::PlanModel(
 
 PlanModel::~PlanModel()
 {
+  for (cl_kernel k : clone_kernels_)
+    if (k) clReleaseKernel(k);
   releaseKernels();
   for (cl_mem m : owned_)
     if (m) clReleaseMemObject(m);
@@ -154,14 +162,14 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     owned_blk_.push_back(m);
   }
   cl_kernel k = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
-  clSetKernelArg(k, 0, sizeof(x.mem), &x.mem);
-  clSetKernelArg(k, 1, sizeof(m), &m);
-  clSetKernelArg(k, 2, sizeof(Cin), &Cin);
-  clSetKernelArg(k, 3, sizeof(H), &H);
-  clSetKernelArg(k, 4, sizeof(W), &W);
+  setArg(k, 0, sizeof(x.mem), &x.mem);
+  setArg(k, 1, sizeof(m), &m);
+  setArg(k, 2, sizeof(Cin), &Cin);
+  setArg(k, 3, sizeof(H), &H);
+  setArg(k, 4, sizeof(W), &W);
   const size_t gws[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
                          static_cast<size_t>(Cin)};
-  cl_event ev = ClRuntime::enqueueND(rt_.queue(), k, 3, gws, nullptr);
+  cl_event ev = enqueueCmd(k, 3, gws, nullptr, "reorder(blk)", false);
   if (profiling_ && ev)
   {
     clWaitForEvents(1, &ev);
@@ -676,6 +684,94 @@ cl_kernel PlanModel::getKernel(
   return k;
 }
 
+// ---------------------------------------------------------------------------
+// P2: per-node dispatch cache (see PlanModel.hpp). 语义：首帧录制、之后重放，
+// 数值与首帧逐位一致；只消除 host 侧重复决策/参数设置。
+// ---------------------------------------------------------------------------
+cl_kernel PlanModel::cloneKernel(cl_kernel src)
+{
+  cl_program prog = nullptr;
+  clGetKernelInfo(src, CL_KERNEL_PROGRAM, sizeof(prog), &prog, nullptr);
+  size_t sz = 0;
+  clGetKernelInfo(src, CL_KERNEL_FUNCTION_NAME, 0, nullptr, &sz);
+  std::vector<char> name(sz + 1, '\0');
+  clGetKernelInfo(src, CL_KERNEL_FUNCTION_NAME, sz, name.data(), nullptr);
+  cl_int err = CL_SUCCESS;
+  cl_kernel k = clCreateKernel(prog, name.data(), &err);
+  if (err != CL_SUCCESS) throw std::runtime_error("PlanModel: cloneKernel failed");
+  clone_kernels_.push_back(k);
+  return k;
+}
+
+void PlanModel::setArg(cl_kernel k, cl_uint index, size_t size, const void * value)
+{
+  if (capturing_ && value != nullptr)
+  {
+    PlanArg a;
+    a.index = index;
+    a.size  = size;
+    const auto * p = static_cast<const unsigned char *>(value);
+    a.bytes.assign(p, p + size);
+    cap_args_[k].push_back(std::move(a));
+  }
+  clSetKernelArg(k, index, size, value);
+}
+
+cl_event PlanModel::enqueueCmd(cl_kernel k, cl_uint dim, const size_t * gws, const size_t * lws,
+                               const char * tag, bool useLws)
+{
+  if (capturing_)
+  {
+    PlanCmd c;
+    c.k   = cloneKernel(k);
+    c.dim = dim;
+    for (cl_uint i = 0; i < dim && i < 3; ++i) c.gws[i] = gws[i];
+    c.useLws = (lws != nullptr);
+    if (lws)
+      for (cl_uint i = 0; i < dim && i < 3; ++i) c.lws[i] = lws[i];
+    c.tag = tag ? tag : "";
+    // 把本节点为该 kernel 记录下的参数一次性设到克隆上；此后每帧不再 setArg。
+    auto it = cap_args_.find(k);
+    if (it != cap_args_.end())
+    {
+      for (const PlanArg & a : it->second)
+        setArg(c.k, a.index, a.size, a.bytes.data());
+      cap_args_.erase(it);
+    }
+    cap_cmds_.push_back(std::move(c));
+  }
+  return ClRuntime::enqueueND(rt_.queue(), k, dim, gws, lws);
+}
+
+void PlanModel::replayNode(size_t ni)
+{
+  for (const PlanCmd & c : node_cmds_[ni])
+  {
+    cl_event ev = nullptr;
+    if (profiling_)
+    {
+      const auto enq0 = std::chrono::steady_clock::now();
+      ev = ClRuntime::enqueueND(rt_.queue(), c.k, c.dim, c.gws, c.useLws ? c.lws : nullptr);
+      prof_enqueue_ms_ += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - enq0).count();
+      const auto w0 = std::chrono::steady_clock::now();
+      clWaitForEvents(1, &ev);
+      prof_wait_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - w0).count();
+      cl_ulong s = 0, e = 0;
+      clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr);
+      clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
+      tprof_[c.tag].first += static_cast<double>(e - s) * 1e-6;
+      tprof_[c.tag].second += 1;
+    }
+    else
+    {
+      ev = ClRuntime::enqueueND(rt_.queue(), c.k, c.dim, c.gws, c.useLws ? c.lws : nullptr);
+    }
+    if (ev) clReleaseEvent(ev);
+  }
+}
+
 cl_mem PlanModel::bcastDims(const std::string & spec)
 {
   auto it = small_buf_.find(spec);
@@ -803,13 +899,13 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
     cl_mem da = inMem(0), db = inMem(1);
-    clSetKernelArg(k, 0, sizeof(da), &da);
-    clSetKernelArg(k, 1, sizeof(db), &db);
-    clSetKernelArg(k, 2, sizeof(dy), &dy);
-    clSetKernelArg(k, 3, sizeof(nn), &nn);
-    clSetKernelArg(k, 4, sizeof(op), &op);
+    setArg(k, 0, sizeof(da), &da);
+    setArg(k, 1, sizeof(db), &db);
+    setArg(k, 2, sizeof(dy), &dy);
+    setArg(k, 3, sizeof(nn), &nn);
+    setArg(k, 4, sizeof(op), &op);
     const int bs = attrInt(n, "b_scalar", 0);
-    clSetKernelArg(k, 5, sizeof(bs), &bs);
+    setArg(k, 5, sizeof(bs), &bs);
     gws[0] = isVec ? vecN(nn) : static_cast<size_t>(nn);
     return;
   }
@@ -827,13 +923,13 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
       else if (tb.numel() != nout && ta.numel() == nout) { ts = &tb; a_ch = 0; }
       const int C  = (ts && ts->numel() > 0) ? static_cast<int>(ts->numel()) : 1;
       const int HW = C > 0 ? static_cast<int>(nout / C) : static_cast<int>(nout);
-      clSetKernelArg(k, 0, sizeof(da), &da);
-      clSetKernelArg(k, 1, sizeof(db), &db);
-      clSetKernelArg(k, 2, sizeof(dy), &dy);
-      clSetKernelArg(k, 3, sizeof(HW), &HW);
-      clSetKernelArg(k, 4, sizeof(C), &C);
-      clSetKernelArg(k, 5, sizeof(op), &op);
-      clSetKernelArg(k, 6, sizeof(a_ch), &a_ch);
+      setArg(k, 0, sizeof(da), &da);
+      setArg(k, 1, sizeof(db), &db);
+      setArg(k, 2, sizeof(dy), &dy);
+      setArg(k, 3, sizeof(HW), &HW);
+      setArg(k, 4, sizeof(C), &C);
+      setArg(k, 5, sizeof(op), &op);
+      setArg(k, 6, sizeof(a_ch), &a_ch);
       dim = 2;
       gws[0] = static_cast<size_t>(HW);
       gws[1] = static_cast<size_t>(C);
@@ -878,39 +974,39 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
         // 与 bcast4 的 19 个参数不同，必须重新 build 通用 kernel 句柄。
         k = getKernel("ops", "ew_binary_bcast", "");
         cl_mem dm = bcastDims(spec);
-        clSetKernelArg(k, 0, sizeof(da), &da);
-        clSetKernelArg(k, 1, sizeof(db), &db);
-        clSetKernelArg(k, 2, sizeof(dy), &dy);
-        clSetKernelArg(k, 3, sizeof(nn), &nn);
-        clSetKernelArg(k, 4, sizeof(op), &op);
+        setArg(k, 0, sizeof(da), &da);
+        setArg(k, 1, sizeof(db), &db);
+        setArg(k, 2, sizeof(dy), &dy);
+        setArg(k, 3, sizeof(nn), &nn);
+        setArg(k, 4, sizeof(op), &op);
         const int rr = rk;
-        clSetKernelArg(k, 5, sizeof(rr), &rr);
-        clSetKernelArg(k, 6, sizeof(dm), &dm);
+        setArg(k, 5, sizeof(rr), &rr);
+        setArg(k, 6, sizeof(dm), &dm);
         dim = 1;
         gws[0] = static_cast<size_t>(nn);
         return;
       }
       const int d0 = p[0], d1 = p[1], d2 = p[2], d3 = p[3];
       const int os1 = d0, os2 = d0 * d1, os3 = d0 * d1 * d2;
-      clSetKernelArg(k, 0, sizeof(da), &da);
-      clSetKernelArg(k, 1, sizeof(db), &db);
-      clSetKernelArg(k, 2, sizeof(dy), &dy);
-      clSetKernelArg(k, 3, sizeof(op), &op);
-      clSetKernelArg(k, 4, sizeof(d0), &d0);
-      clSetKernelArg(k, 5, sizeof(d1), &d1);
-      clSetKernelArg(k, 6, sizeof(d2), &d2);
-      clSetKernelArg(k, 7, sizeof(d3), &d3);
-      clSetKernelArg(k, 8, sizeof(os1), &os1);
-      clSetKernelArg(k, 9, sizeof(os2), &os2);
-      clSetKernelArg(k, 10, sizeof(os3), &os3);
-      clSetKernelArg(k, 11, sizeof(as[0]), &as[0]);
-      clSetKernelArg(k, 12, sizeof(as[1]), &as[1]);
-      clSetKernelArg(k, 13, sizeof(as[2]), &as[2]);
-      clSetKernelArg(k, 14, sizeof(as[3]), &as[3]);
-      clSetKernelArg(k, 15, sizeof(bs[0]), &bs[0]);
-      clSetKernelArg(k, 16, sizeof(bs[1]), &bs[1]);
-      clSetKernelArg(k, 17, sizeof(bs[2]), &bs[2]);
-      clSetKernelArg(k, 18, sizeof(bs[3]), &bs[3]);
+      setArg(k, 0, sizeof(da), &da);
+      setArg(k, 1, sizeof(db), &db);
+      setArg(k, 2, sizeof(dy), &dy);
+      setArg(k, 3, sizeof(op), &op);
+      setArg(k, 4, sizeof(d0), &d0);
+      setArg(k, 5, sizeof(d1), &d1);
+      setArg(k, 6, sizeof(d2), &d2);
+      setArg(k, 7, sizeof(d3), &d3);
+      setArg(k, 8, sizeof(os1), &os1);
+      setArg(k, 9, sizeof(os2), &os2);
+      setArg(k, 10, sizeof(os3), &os3);
+      setArg(k, 11, sizeof(as[0]), &as[0]);
+      setArg(k, 12, sizeof(as[1]), &as[1]);
+      setArg(k, 13, sizeof(as[2]), &as[2]);
+      setArg(k, 14, sizeof(as[3]), &as[3]);
+      setArg(k, 15, sizeof(bs[0]), &bs[0]);
+      setArg(k, 16, sizeof(bs[1]), &bs[1]);
+      setArg(k, 17, sizeof(bs[2]), &bs[2]);
+      setArg(k, 18, sizeof(bs[3]), &bs[3]);
       dim = 3;
       gws[0] = static_cast<size_t>(d0);
       gws[1] = static_cast<size_t>(d1);
@@ -918,13 +1014,13 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
       return;
     }
     cl_mem dm = bcastDims(spec);
-    clSetKernelArg(k, 0, sizeof(da), &da);
-    clSetKernelArg(k, 1, sizeof(db), &db);
-    clSetKernelArg(k, 2, sizeof(dy), &dy);
-    clSetKernelArg(k, 3, sizeof(nn), &nn);
-    clSetKernelArg(k, 4, sizeof(op), &op);
-    clSetKernelArg(k, 5, sizeof(rank), &rank);
-    clSetKernelArg(k, 6, sizeof(dm), &dm);
+    setArg(k, 0, sizeof(da), &da);
+    setArg(k, 1, sizeof(db), &db);
+    setArg(k, 2, sizeof(dy), &dy);
+    setArg(k, 3, sizeof(nn), &nn);
+    setArg(k, 4, sizeof(op), &op);
+    setArg(k, 5, sizeof(rank), &rank);
+    setArg(k, 6, sizeof(dm), &dm);
     gws[0] = static_cast<size_t>(nn);
     return;
   }
@@ -932,10 +1028,10 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
   {
     const int nn = static_cast<int>(nout), op = attrInt(n, "op", 0);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(nn), &nn);
-    clSetKernelArg(k, 3, sizeof(op), &op);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(nn), &nn);
+    setArg(k, 3, sizeof(op), &op);
     gws[0] = isVec ? vecN(nn) : static_cast<size_t>(nn);
     return;
   }
@@ -944,12 +1040,12 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int HW = attrInt(n, "HW", 1), c0 = attrInt(n, "c0", 0), cnt = attrInt(n, "cnt", 0),
         dst = attrInt(n, "dst_off", 0);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(HW), &HW);
-    clSetKernelArg(k, 3, sizeof(c0), &c0);
-    clSetKernelArg(k, 4, sizeof(cnt), &cnt);
-    clSetKernelArg(k, 5, sizeof(dst), &dst);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(HW), &HW);
+    setArg(k, 3, sizeof(c0), &c0);
+    setArg(k, 4, sizeof(cnt), &cnt);
+    setArg(k, 5, sizeof(dst), &dst);
     if (kernel == "copy_c2")
     {
       dim = 2;
@@ -968,13 +1064,13 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
         inner = attrInt(n, "inner", 1), start = attrInt(n, "start", 0),
         len = attrInt(n, "len", 0);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(outer), &outer);
-    clSetKernelArg(k, 3, sizeof(axdim), &axdim);
-    clSetKernelArg(k, 4, sizeof(inner), &inner);
-    clSetKernelArg(k, 5, sizeof(start), &start);
-    clSetKernelArg(k, 6, sizeof(len), &len);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(outer), &outer);
+    setArg(k, 3, sizeof(axdim), &axdim);
+    setArg(k, 4, sizeof(inner), &inner);
+    setArg(k, 5, sizeof(start), &start);
+    setArg(k, 6, sizeof(len), &len);
     if (kernel == "slice_axis3")
     {
       dim = 3;
@@ -996,17 +1092,17 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int outer = attrInt(n, "outer", 1), inner = attrInt(n, "inner", 1);
     cl_mem ia = ca ? inMem(0) : nullptr, ib = cb ? inMem(1) : nullptr,
            ic = cc ? inMem(2) : nullptr, id = cd ? inMem(3) : nullptr;
-    clSetKernelArg(k, 0, sizeof(ia), &ia);
-    clSetKernelArg(k, 1, sizeof(ca), &ca);
-    clSetKernelArg(k, 2, sizeof(ib), &ib);
-    clSetKernelArg(k, 3, sizeof(cb), &cb);
-    clSetKernelArg(k, 4, sizeof(ic), &ic);
-    clSetKernelArg(k, 5, sizeof(cc), &cc);
-    clSetKernelArg(k, 6, sizeof(id), &id);
-    clSetKernelArg(k, 7, sizeof(cd), &cd);
-    clSetKernelArg(k, 8, sizeof(dy), &dy);
-    clSetKernelArg(k, 9, sizeof(outer), &outer);
-    clSetKernelArg(k, 10, sizeof(inner), &inner);
+    setArg(k, 0, sizeof(ia), &ia);
+    setArg(k, 1, sizeof(ca), &ca);
+    setArg(k, 2, sizeof(ib), &ib);
+    setArg(k, 3, sizeof(cb), &cb);
+    setArg(k, 4, sizeof(ic), &ic);
+    setArg(k, 5, sizeof(cc), &cc);
+    setArg(k, 6, sizeof(id), &id);
+    setArg(k, 7, sizeof(cd), &cd);
+    setArg(k, 8, sizeof(dy), &dy);
+    setArg(k, 9, sizeof(outer), &outer);
+    setArg(k, 10, sizeof(inner), &inner);
     const int csum = ca + cb + cc + cd;
     dim = 3;
     gws[0] = isVec ? vecN(inner) : static_cast<size_t>(inner);
@@ -1020,16 +1116,16 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
         ho = attrInt(n, "Hout", 0), wo = attrInt(n, "Wout", 0), K = attrInt(n, "K", 5),
         S = attrInt(n, "S", 1), P = attrInt(n, "P", 2);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(C), &C);
-    clSetKernelArg(k, 3, sizeof(H), &H);
-    clSetKernelArg(k, 4, sizeof(W), &W);
-    clSetKernelArg(k, 5, sizeof(ho), &ho);
-    clSetKernelArg(k, 6, sizeof(wo), &wo);
-    clSetKernelArg(k, 7, sizeof(K), &K);
-    clSetKernelArg(k, 8, sizeof(S), &S);
-    clSetKernelArg(k, 9, sizeof(P), &P);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(C), &C);
+    setArg(k, 3, sizeof(H), &H);
+    setArg(k, 4, sizeof(W), &W);
+    setArg(k, 5, sizeof(ho), &ho);
+    setArg(k, 6, sizeof(wo), &wo);
+    setArg(k, 7, sizeof(K), &K);
+    setArg(k, 8, sizeof(S), &S);
+    setArg(k, 9, sizeof(P), &P);
     if (kernel == "maxpool3")
     {
       dim = 3;
@@ -1048,12 +1144,12 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int C = attrInt(n, "C", 0), H = attrInt(n, "H", 0), W = attrInt(n, "W", 0),
         S = attrInt(n, "S", 2);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(C), &C);
-    clSetKernelArg(k, 3, sizeof(H), &H);
-    clSetKernelArg(k, 4, sizeof(W), &W);
-    clSetKernelArg(k, 5, sizeof(S), &S);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(C), &C);
+    setArg(k, 3, sizeof(H), &H);
+    setArg(k, 4, sizeof(W), &W);
+    setArg(k, 5, sizeof(S), &S);
     if (kernel == "resize_nn3")
     {
       dim = 3;
@@ -1073,12 +1169,12 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int D1 = attrInt(n, "D1", 1), D2 = attrInt(n, "D2", 1), I = attrInt(n, "I", 1),
         mode = attrInt(n, "mode", 0);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(D1), &D1);
-    clSetKernelArg(k, 3, sizeof(D2), &D2);
-    clSetKernelArg(k, 4, sizeof(I), &I);
-    clSetKernelArg(k, 5, sizeof(mode), &mode);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(D1), &D1);
+    setArg(k, 3, sizeof(D2), &D2);
+    setArg(k, 4, sizeof(I), &I);
+    setArg(k, 5, sizeof(mode), &mode);
     if (kernel == "permute_0213_3d")
     {
       dim = 3;
@@ -1110,14 +1206,14 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     const int K  = static_cast<int>(A.dims[3]);
     const int N  = static_cast<int>(B2.dims[3]);
     cl_mem da = A.mem, db = B2.mem;
-    clSetKernelArg(k, 0, sizeof(da), &da);
-    clSetKernelArg(k, 1, sizeof(db), &db);
-    clSetKernelArg(k, 2, sizeof(dy), &dy);
-    clSetKernelArg(k, 3, sizeof(B0), &B0);
-    clSetKernelArg(k, 4, sizeof(B1), &B1);
-    clSetKernelArg(k, 5, sizeof(M), &M);
-    clSetKernelArg(k, 6, sizeof(K), &K);
-    clSetKernelArg(k, 7, sizeof(N), &N);
+    setArg(k, 0, sizeof(da), &da);
+    setArg(k, 1, sizeof(db), &db);
+    setArg(k, 2, sizeof(dy), &dy);
+    setArg(k, 3, sizeof(B0), &B0);
+    setArg(k, 4, sizeof(B1), &B1);
+    setArg(k, 5, sizeof(M), &M);
+    setArg(k, 6, sizeof(K), &K);
+    setArg(k, 7, sizeof(N), &N);
     if (kernel == "bmm2")
     {
       dim = 3;
@@ -1146,11 +1242,11 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int outer = attrInt(n, "outer", 1), axdim = attrInt(n, "axdim", 0),
         inner = attrInt(n, "inner", 1);
     cl_mem dx = inMem(0);
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(outer), &outer);
-    clSetKernelArg(k, 3, sizeof(axdim), &axdim);
-    clSetKernelArg(k, 4, sizeof(inner), &inner);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(outer), &outer);
+    setArg(k, 3, sizeof(axdim), &axdim);
+    setArg(k, 4, sizeof(inner), &inner);
     if (kernel == "softmax_axis_r")
     {
       const int wgs = std::max(1, optInt("-DSM_WGS=", 128));
@@ -1173,10 +1269,10 @@ void PlanModel::smallLaunch(const Node & n, cl_kernel k, const std::string & ker
     int C = attrInt(n, "C", 0), HW = attrInt(n, "HW", 1);
     cl_mem dx = inMem(0);
     const int wgs = std::max(1, optInt("-DGAP_WGS=", 128));
-    clSetKernelArg(k, 0, sizeof(dx), &dx);
-    clSetKernelArg(k, 1, sizeof(dy), &dy);
-    clSetKernelArg(k, 2, sizeof(C), &C);
-    clSetKernelArg(k, 3, sizeof(HW), &HW);
+    setArg(k, 0, sizeof(dx), &dx);
+    setArg(k, 1, sizeof(dy), &dy);
+    setArg(k, 2, sizeof(C), &C);
+    setArg(k, 3, sizeof(HW), &HW);
     useLws = true;
     dim = 1;
     lws[0] = static_cast<size_t>(wgs);
@@ -1196,6 +1292,7 @@ std::string sourceOfKernel(const std::string & kernel)
   if (kernel == "conv3x3_sg") return "conv_sg";
   if (kernel == "conv3x3_osv") return "conv_osv";
   if (kernel == "gemm_f16") return "gemm";
+  if (kernel == "gemm_sk_f16") return "gemm_sk";
   if (kernel == "conv1x1_gemv_f16" || kernel == "conv1x1_f16") return "conv1x1";
   if (kernel == "depthwise_f16" || kernel == "depthwise_v" || kernel == "depthwise_vp" ||
       kernel == "depthwise_pad" || kernel == "conv_general") return "conv_general";
@@ -1220,7 +1317,7 @@ void PlanModel::run()
     cl_event ev = nullptr;
     const auto enq0 = std::chrono::steady_clock::now();
     try {
-      ev = ClRuntime::enqueueND(rt_.queue(), k, dim, gws, lws);
+      ev = enqueueCmd(k, dim, gws, lws, tag.c_str(), lws != nullptr);
     } catch (const std::exception & e) {
       throw std::runtime_error("node " + tag + ": " + e.what());
     }
@@ -1243,6 +1340,9 @@ void PlanModel::run()
     clReleaseEvent(ev);
   };
 
+  if (!captured_)
+    node_cmds_.assign(nodes_.size(), {});
+
   for (size_t ni = 0; ni < nodes_.size(); ++ni)
   {
     const auto & n = nodes_[ni];
@@ -1253,6 +1353,16 @@ void PlanModel::run()
       out.mem = ref(n.ins[0]).mem;  // 视图别名，零拷贝
       continue;
     }
+    if (captured_ && launch_cache_)
+    {
+      replayNode(ni);  // P2: 首帧已录制，重放（零签名/字符串/setArg）
+      continue;
+    }
+
+    capturing_ = launch_cache_;
+    cap_node_  = ni;
+    cap_cmds_.clear();
+    cap_args_.clear();
 
     auto in = [&](size_t i) -> Tensor & { return ref(n.ins[i]); };
     auto out_numel = [&]() -> int64_t {
@@ -1316,24 +1426,24 @@ void PlanModel::run()
       };
       t.BM = optInt("-DBM=", t.BM); t.BN = optInt("-DBN=", t.BN);
       t.TM = optInt("-DTM=", t.TM); t.TN = optInt("-DTN=", t.TN);
-      clSetKernelArg(kg, 0, sizeof(dA), &dA);
-      clSetKernelArg(kg, 1, sizeof(dB0), &dB0);
-      clSetKernelArg(kg, 2, sizeof(dC), &dC);
-      clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
-      clSetKernelArg(kg, 4, sizeof(HW), &HW);
-      clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-      clSetKernelArg(kg, 6, sizeof(db), &db);
-      clSetKernelArg(kg, 7, sizeof(dres), &dres);
-      clSetKernelArg(kg, 8, sizeof(dB1), &dB1);
-      clSetKernelArg(kg, 9, sizeof(dB2), &dB2);
-      clSetKernelArg(kg, 10, sizeof(dB3), &dB3);
-      clSetKernelArg(kg, 11, sizeof(ca), &ca);
-      clSetKernelArg(kg, 12, sizeof(cb), &cb);
-      clSetKernelArg(kg, 13, sizeof(cc), &cc);
-      clSetKernelArg(kg, 14, sizeof(o0), &o0);
-      clSetKernelArg(kg, 15, sizeof(o1), &o1);
-      clSetKernelArg(kg, 16, sizeof(o2), &o2);
-      clSetKernelArg(kg, 17, sizeof(o3), &o3);
+      setArg(kg, 0, sizeof(dA), &dA);
+      setArg(kg, 1, sizeof(dB0), &dB0);
+      setArg(kg, 2, sizeof(dC), &dC);
+      setArg(kg, 3, sizeof(Cout), &Cout);
+      setArg(kg, 4, sizeof(HW), &HW);
+      setArg(kg, 5, sizeof(Cin), &Cin);
+      setArg(kg, 6, sizeof(db), &db);
+      setArg(kg, 7, sizeof(dres), &dres);
+      setArg(kg, 8, sizeof(dB1), &dB1);
+      setArg(kg, 9, sizeof(dB2), &dB2);
+      setArg(kg, 10, sizeof(dB3), &dB3);
+      setArg(kg, 11, sizeof(ca), &ca);
+      setArg(kg, 12, sizeof(cb), &cb);
+      setArg(kg, 13, sizeof(cc), &cc);
+      setArg(kg, 14, sizeof(o0), &o0);
+      setArg(kg, 15, sizeof(o1), &o1);
+      setArg(kg, 16, sizeof(o2), &o2);
+      setArg(kg, 17, sizeof(o3), &o3);
       const size_t lws[2] = {t.localX(), t.localY()};
       const size_t gws[2] = {
         static_cast<size_t>((HW + t.BN - 1) / t.BN) * lws[0],
@@ -1367,13 +1477,13 @@ void PlanModel::run()
         const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
         if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
         cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", gopts);
-        clSetKernelArg(kg, 0, sizeof(dw), &dw);
-        clSetKernelArg(kg, 1, sizeof(dx), &dx);
-        clSetKernelArg(kg, 2, sizeof(db), &db);
-        clSetKernelArg(kg, 3, sizeof(dres), &dres);
-        clSetKernelArg(kg, 4, sizeof(dy), &dy);
-        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kg, 6, sizeof(Cout), &Cout);
+        setArg(kg, 0, sizeof(dw), &dw);
+        setArg(kg, 1, sizeof(dx), &dx);
+        setArg(kg, 2, sizeof(db), &db);
+        setArg(kg, 3, sizeof(dres), &dres);
+        setArg(kg, 4, sizeof(dy), &dy);
+        setArg(kg, 5, sizeof(Cin), &Cin);
+        setArg(kg, 6, sizeof(Cout), &Cout);
         const size_t lws[1] = {16};
         const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
         timed("conv1x1g@" + std::to_string(Cout) + "x" + std::to_string(Cin), kg, 1, gws, lws);
@@ -1395,30 +1505,50 @@ void PlanModel::run()
         t.ACT = act;
         std::string gopts = t.options();
         const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+        std::string gkernel = "gemm_f16";
         if (const TuningEntry * e = tuning_.lookup(sig)) {
           gopts = e->options;
+          if (!e->kernel.empty()) gkernel = e->kernel;
+          if (gkernel == "gemm_f16") {
+            auto optInt = [&](const char * k, int def) {
+              const auto p = gopts.find(k);
+              return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
+            };
+            t.BM = optInt("-DBM=", t.BM);
+            t.BN = optInt("-DBN=", t.BN);
+            t.TM = optInt("-DTM=", t.TM);
+            t.TN = optInt("-DTN=", t.TN);
+          }
+        }
+        // R32: split-K（lane 沿 K）候选走 gemm_sk_f16，几何不同；两者参数表相同。
+        const bool sk = (gkernel == "gemm_sk_f16");
+        cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", gkernel, gopts);
+        setArg(kg, 0, sizeof(dw), &dw);
+        setArg(kg, 1, sizeof(dx), &dx);
+        setArg(kg, 2, sizeof(dy), &dy);
+        setArg(kg, 3, sizeof(Cout), &Cout);
+        setArg(kg, 4, sizeof(N), &N);
+        setArg(kg, 5, sizeof(Cin), &Cin);
+        setArg(kg, 6, sizeof(db), &db);
+        setArg(kg, 7, sizeof(dres), &dres);
+        size_t lws[2], gws[2];
+        if (sk) {
           auto optInt = [&](const char * k, int def) {
             const auto p = gopts.find(k);
             return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
           };
-          t.BM = optInt("-DBM=", t.BM);
-          t.BN = optInt("-DBN=", t.BN);
-          t.TM = optInt("-DTM=", t.TM);
-          t.TN = optInt("-DTN=", t.TN);
+          const int TM = optInt("-DSK_TM=", 8), TN = optInt("-DSK_TN=", 4),
+                    SG = optInt("-DSK_SG=", 16);
+          lws[0] = static_cast<size_t>(SG);
+          lws[1] = 1;
+          gws[0] = static_cast<size_t>((N + TN - 1) / TN) * lws[0];
+          gws[1] = static_cast<size_t>((Cout + TM - 1) / TM);
+        } else {
+          lws[0] = t.localX();
+          lws[1] = t.localY();
+          gws[0] = static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0];
+          gws[1] = static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1];
         }
-        cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
-        clSetKernelArg(kg, 0, sizeof(dw), &dw);
-        clSetKernelArg(kg, 1, sizeof(dx), &dx);
-        clSetKernelArg(kg, 2, sizeof(dy), &dy);
-        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
-        clSetKernelArg(kg, 4, sizeof(N), &N);
-        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kg, 6, sizeof(db), &db);
-        clSetKernelArg(kg, 7, sizeof(dres), &dres);
-        const size_t lws[2] = {t.localX(), t.localY()};
-        const size_t gws[2] = {
-          static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0],
-          static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1]};
         timed("conv1x1@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
                 std::to_string(Cin),
               kg, 2, gws, lws);
@@ -1454,29 +1584,29 @@ void PlanModel::run()
           int Hp = H + 2 * P, Wpad = 0;
           cl_mem xp = dwPadInput(n.ins[0], Cin, H, W, K, S, P, &Hp, &Wpad);
           cl_kernel kp = getKernel("conv_general", "depthwise_pad", "");
-          clSetKernelArg(kp, 0, sizeof(dx), &dx);
-          clSetKernelArg(kp, 1, sizeof(xp), &xp);
-          clSetKernelArg(kp, 2, sizeof(Cin), &Cin);
-          clSetKernelArg(kp, 3, sizeof(H), &H);
-          clSetKernelArg(kp, 4, sizeof(W), &W);
-          clSetKernelArg(kp, 5, sizeof(Hp), &Hp);
-          clSetKernelArg(kp, 6, sizeof(Wpad), &Wpad);
-          clSetKernelArg(kp, 7, sizeof(P), &P);
+          setArg(kp, 0, sizeof(dx), &dx);
+          setArg(kp, 1, sizeof(xp), &xp);
+          setArg(kp, 2, sizeof(Cin), &Cin);
+          setArg(kp, 3, sizeof(H), &H);
+          setArg(kp, 4, sizeof(W), &W);
+          setArg(kp, 5, sizeof(Hp), &Hp);
+          setArg(kp, 6, sizeof(Wpad), &Wpad);
+          setArg(kp, 7, sizeof(P), &P);
           const size_t gp[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
                                 static_cast<size_t>(Cin)};
           timed("depthwise_pad", kp, 3, gp, nullptr);
 
           cl_kernel kd = getKernel("conv_general", dkern, dwopts);
-          clSetKernelArg(kd, 0, sizeof(xp), &xp);
-          clSetKernelArg(kd, 1, sizeof(dw), &dw);
-          clSetKernelArg(kd, 2, sizeof(db), &db);
-          clSetKernelArg(kd, 3, sizeof(dy), &dy);
-          clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
-          clSetKernelArg(kd, 5, sizeof(Hp), &Hp);
-          clSetKernelArg(kd, 6, sizeof(Wpad), &Wpad);
+          setArg(kd, 0, sizeof(xp), &xp);
+          setArg(kd, 1, sizeof(dw), &dw);
+          setArg(kd, 2, sizeof(db), &db);
+          setArg(kd, 3, sizeof(dy), &dy);
+          setArg(kd, 4, sizeof(Cin), &Cin);
+          setArg(kd, 5, sizeof(Hp), &Hp);
+          setArg(kd, 6, sizeof(Wpad), &Wpad);
           int ho = Hout, wo = Wout;
-          clSetKernelArg(kd, 7, sizeof(ho), &ho);
-          clSetKernelArg(kd, 8, sizeof(wo), &wo);
+          setArg(kd, 7, sizeof(ho), &ho);
+          setArg(kd, 8, sizeof(wo), &wo);
           auto p = dwopts.find("-DDW_TW=");
           const int tw = p == std::string::npos ? 8 : std::atoi(dwopts.c_str() + p + 8);
           const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
@@ -1485,15 +1615,15 @@ void PlanModel::run()
         } else {
         cl_kernel kd = getKernel("conv_general", dkern, dwopts);
         int ho = Hout, wo = Wout;
-        clSetKernelArg(kd, 0, sizeof(dx), &dx);
-        clSetKernelArg(kd, 1, sizeof(dw), &dw);
-        clSetKernelArg(kd, 2, sizeof(db), &db);
-        clSetKernelArg(kd, 3, sizeof(dy), &dy);
-        clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kd, 5, sizeof(H), &H);
-        clSetKernelArg(kd, 6, sizeof(W), &W);
-        clSetKernelArg(kd, 7, sizeof(ho), &ho);
-        clSetKernelArg(kd, 8, sizeof(wo), &wo);
+        setArg(kd, 0, sizeof(dx), &dx);
+        setArg(kd, 1, sizeof(dw), &dw);
+        setArg(kd, 2, sizeof(db), &db);
+        setArg(kd, 3, sizeof(dy), &dy);
+        setArg(kd, 4, sizeof(Cin), &Cin);
+        setArg(kd, 5, sizeof(H), &H);
+        setArg(kd, 6, sizeof(W), &W);
+        setArg(kd, 7, sizeof(ho), &ho);
+        setArg(kd, 8, sizeof(wo), &wo);
         if (dkern == "depthwise_v") {
           auto p = dwopts.find("-DDW_TW=");
           const int tw = p == std::string::npos ? 4 : std::atoi(dwopts.c_str() + p + 8);
@@ -1506,23 +1636,23 @@ void PlanModel::run()
         }
         }
       } else {
-      clSetKernelArg(kConvG_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kConvG_, 1, sizeof(dw), &dw);
-      clSetKernelArg(kConvG_, 2, sizeof(db), &db);
-      clSetKernelArg(kConvG_, 3, sizeof(dy), &dy);
-      clSetKernelArg(kConvG_, 4, sizeof(Cin), &Cin);
-      clSetKernelArg(kConvG_, 5, sizeof(H), &H);
-      clSetKernelArg(kConvG_, 6, sizeof(W), &W);
-      clSetKernelArg(kConvG_, 7, sizeof(Cout), &Cout);
+      setArg(kConvG_, 0, sizeof(dx), &dx);
+      setArg(kConvG_, 1, sizeof(dw), &dw);
+      setArg(kConvG_, 2, sizeof(db), &db);
+      setArg(kConvG_, 3, sizeof(dy), &dy);
+      setArg(kConvG_, 4, sizeof(Cin), &Cin);
+      setArg(kConvG_, 5, sizeof(H), &H);
+      setArg(kConvG_, 6, sizeof(W), &W);
+      setArg(kConvG_, 7, sizeof(Cout), &Cout);
       int ho = Hout, wo = Wout;
-      clSetKernelArg(kConvG_, 8, sizeof(ho), &ho);
-      clSetKernelArg(kConvG_, 9, sizeof(wo), &wo);
+      setArg(kConvG_, 8, sizeof(ho), &ho);
+      setArg(kConvG_, 9, sizeof(wo), &wo);
       int KK = K, SS = S, PP = P, GG = G, aa = act;
-      clSetKernelArg(kConvG_, 10, sizeof(KK), &KK);
-      clSetKernelArg(kConvG_, 11, sizeof(SS), &SS);
-      clSetKernelArg(kConvG_, 12, sizeof(PP), &PP);
-      clSetKernelArg(kConvG_, 13, sizeof(GG), &GG);
-      clSetKernelArg(kConvG_, 14, sizeof(aa), &aa);
+      setArg(kConvG_, 10, sizeof(KK), &KK);
+      setArg(kConvG_, 11, sizeof(SS), &SS);
+      setArg(kConvG_, 12, sizeof(PP), &PP);
+      setArg(kConvG_, 13, sizeof(GG), &GG);
+      setArg(kConvG_, 14, sizeof(aa), &aa);
       const size_t g = static_cast<size_t>(Cout) * ho * wo;
       timed("conv_general", kConvG_, 1, &g, nullptr);
       }
@@ -1564,16 +1694,16 @@ void PlanModel::run()
         cfg.TM = optInt("-DTM=", 1);
         cfg.CB = optInt("-DCB=", 32);
         cfg.STRIDE = stride; cfg.PAD = pad; cfg.ACT = act; cfg.SG = 16; cfg.WC = 1;
-        clSetKernelArg(kk, 0, sizeof(dx), &dx);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dy), &dy);
-        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 5, sizeof(H), &H);
-        clSetKernelArg(kk, 6, sizeof(W), &W);
-        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dy), &dy);
+        setArg(kk, 4, sizeof(Cin), &Cin);
+        setArg(kk, 5, sizeof(H), &H);
+        setArg(kk, 6, sizeof(W), &W);
+        setArg(kk, 7, sizeof(Cout), &Cout);
+        setArg(kk, 8, sizeof(Hout), &Hout);
+        setArg(kk, 9, sizeof(Wout), &Wout);
         const size_t lws[3] = {
           static_cast<size_t>(cfg.TX / cfg.TM), static_cast<size_t>(cfg.TY), 1};
         const size_t gws[3] = {
@@ -1604,16 +1734,16 @@ void PlanModel::run()
         cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", oo);
         cl_mem dw = blkWeight(n.ins[1], in(1), Cout, Cin);
         cl_mem dxb = blkInput(n.ins[0], in(0), Cin, H, W);
-        clSetKernelArg(kk, 0, sizeof(dxb), &dxb);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dy), &dy);
-        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 5, sizeof(H), &H);
-        clSetKernelArg(kk, 6, sizeof(W), &W);
-        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dxb), &dxb);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dy), &dy);
+        setArg(kk, 4, sizeof(Cin), &Cin);
+        setArg(kk, 5, sizeof(H), &H);
+        setArg(kk, 6, sizeof(W), &W);
+        setArg(kk, 7, sizeof(Cout), &Cout);
+        setArg(kk, 8, sizeof(Hout), &Hout);
+        setArg(kk, 9, sizeof(Wout), &Wout);
         const size_t lws[3] = {1, 16, 1};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
@@ -1636,17 +1766,17 @@ void PlanModel::run()
         }
         cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, te->options);
         cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
-        clSetKernelArg(kk, 0, sizeof(dx), &dx);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dres), &dres);
-        clSetKernelArg(kk, 4, sizeof(dy), &dy);
-        clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 6, sizeof(H), &H);
-        clSetKernelArg(kk, 7, sizeof(W), &W);
-        clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dres), &dres);
+        setArg(kk, 4, sizeof(dy), &dy);
+        setArg(kk, 5, sizeof(Cin), &Cin);
+        setArg(kk, 6, sizeof(H), &H);
+        setArg(kk, 7, sizeof(W), &W);
+        setArg(kk, 8, sizeof(Cout), &Cout);
+        setArg(kk, 9, sizeof(Hout), &Hout);
+        setArg(kk, 10, sizeof(Wout), &Wout);
         const size_t lws[3] = {1, 1, 16};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw),
@@ -1671,17 +1801,17 @@ void PlanModel::run()
                       obw, obh, stride, pad, act, dres ? 1 : 0);
         cl_kernel kk = getKernel("conv_ov", "conv3x3_ov", oo);
         cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
-        clSetKernelArg(kk, 0, sizeof(dx), &dx);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dres), &dres);
-        clSetKernelArg(kk, 4, sizeof(dy), &dy);
-        clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 6, sizeof(H), &H);
-        clSetKernelArg(kk, 7, sizeof(W), &W);
-        clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dres), &dres);
+        setArg(kk, 4, sizeof(dy), &dy);
+        setArg(kk, 5, sizeof(Cin), &Cin);
+        setArg(kk, 6, sizeof(H), &H);
+        setArg(kk, 7, sizeof(W), &W);
+        setArg(kk, 8, sizeof(Cout), &Cout);
+        setArg(kk, 9, sizeof(Hout), &Hout);
+        setArg(kk, 10, sizeof(Wout), &Wout);
         const size_t lws[3] = {1, 1, 16};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw),
@@ -1711,16 +1841,16 @@ void PlanModel::run()
         if (Cout <= 16 || wgs32 < 16) cfg.CB = 16;
         cl_kernel kk = getKernel("conv", "conv3x3_f16", cfg.options());
         cl_mem dw = in(1).mem;
-        clSetKernelArg(kk, 0, sizeof(dx), &dx);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dy), &dy);
-        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 5, sizeof(H), &H);
-        clSetKernelArg(kk, 6, sizeof(W), &W);
-        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dy), &dy);
+        setArg(kk, 4, sizeof(Cin), &Cin);
+        setArg(kk, 5, sizeof(H), &H);
+        setArg(kk, 6, sizeof(W), &W);
+        setArg(kk, 7, sizeof(Cout), &Cout);
+        setArg(kk, 8, sizeof(Hout), &Hout);
+        setArg(kk, 9, sizeof(Wout), &Wout);
         const size_t lws[3] = {
           static_cast<size_t>(cfg.TX / cfg.TM), static_cast<size_t>(cfg.TY), 1};
         const size_t gws[3] = {
@@ -1776,12 +1906,12 @@ void PlanModel::run()
         t.TN = optInt("-DTN=", t.TN);
       }
       cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
-      clSetKernelArg(kg, 0, sizeof(da), &da);
-      clSetKernelArg(kg, 1, sizeof(db), &db);
-      clSetKernelArg(kg, 2, sizeof(dc), &dc);
-      clSetKernelArg(kg, 3, sizeof(M), &M);
-      clSetKernelArg(kg, 4, sizeof(N), &N);
-      clSetKernelArg(kg, 5, sizeof(K), &K);
+      setArg(kg, 0, sizeof(da), &da);
+      setArg(kg, 1, sizeof(db), &db);
+      setArg(kg, 2, sizeof(dc), &dc);
+      setArg(kg, 3, sizeof(M), &M);
+      setArg(kg, 4, sizeof(N), &N);
+      setArg(kg, 5, sizeof(K), &K);
       const size_t lws[2] = {t.localX(), t.localY()};
       const size_t gws[2] = {
         static_cast<size_t>((N + t.BN - 1) / t.BN) * lws[0],
@@ -1931,17 +2061,22 @@ void PlanModel::run()
     {
       int HW = attrInt(n, "HW", 1);
       cl_mem dx = in(0).mem, db = in(1).mem, dy = out.mem;
-      clSetKernelArg(kBias_, 0, sizeof(dx), &dx);
-      clSetKernelArg(kBias_, 1, sizeof(db), &db);
-      clSetKernelArg(kBias_, 2, sizeof(dy), &dy);
-      clSetKernelArg(kBias_, 3, sizeof(HW), &HW);
+      setArg(kBias_, 0, sizeof(dx), &dx);
+      setArg(kBias_, 1, sizeof(db), &db);
+      setArg(kBias_, 2, sizeof(dy), &dy);
+      setArg(kBias_, 3, sizeof(HW), &HW);
       timed("bias_add", kBias_, 1, &g1, nullptr);
     }
     else
     {
       throw std::runtime_error("PlanModel: unknown op: " + n.op);
     }
+
+    capturing_ = false;
+    if (launch_cache_) node_cmds_[ni] = std::move(cap_cmds_);
   }
+
+  captured_ = true;
 
   rt_.finish();
   last_run_ms_ =
@@ -1982,13 +2117,13 @@ bool opInList(const std::vector<std::string> & ops, const std::string & op)
 }
 }  // namespace
 
-std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string> & ops) const
+std::vector<OpSignature> PlanModel::tuningSignatures(const std::vector<std::string> & ops) const
 {
-  std::vector<std::string> out;
+  std::vector<OpSignature> out;
   std::map<std::string, int> seen;
   auto add = [&](const OpSignature & s) {
     const std::string k = s.str();
-    if (!seen.count(k)) { seen[k] = 1; out.push_back(k); }
+    if (!seen.count(k)) { seen[k] = 1; out.push_back(s); }
   };
   auto want = [&](const std::string & op) {
     return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
@@ -2048,6 +2183,59 @@ std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string>
   return out;
 }
 
+std::vector<std::string> PlanModel::tuningTargets(const std::vector<std::string> & ops) const
+{
+  std::vector<std::string> out;
+  for (const auto & s : tuningSignatures(ops)) out.push_back(s.str());
+  return out;
+}
+
+int PlanModel::refreshExpected(const std::vector<std::string> & ops)
+{
+  auto want = [&](const std::string & op) {
+    return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
+  };
+  int n = 0;
+  auto & es = tuning_.entries();
+  for (auto & kv : es)
+  {
+    TuningEntry & e = kv.second;
+    const std::string & key = kv.first;
+    const size_t bar = key.find('|');
+    if (bar == std::string::npos) continue;
+    const std::string op = key.substr(0, bar);
+    const std::string body = key.substr(bar + 1);
+    OpSignature sig;
+    bool have = false;
+    // 从缓存 key 反解签名（覆盖「当前 plan 里已不存在」的历史条目，否则它们的
+    // ratio 会永远停在旧标准上）。只处理 GEMM 族——本轮修正的范围。
+    if (op == "gemm" && want("gemm")) {
+      int M = 0, N = 0, K = 0, act = 0;
+      if (std::sscanf(body.c_str(), "M%dN%dK%d_act%d", &M, &N, &K, &act) >= 3) {
+        sig = OpSignature::gemm(M, N, K, act);
+        have = true;
+      }
+    } else if (op == "conv1x1" && want("conv1x1")) {
+      int C = 0, N = 0, K = 0;
+      if (std::sscanf(body.c_str(), "Cout%d_N%d_Cin%d", &C, &N, &K) == 3) {
+        sig = OpSignature::conv1x1(C, N, K, 0, 0);
+        have = true;
+      }
+    } else if (op == "conv1x1_cat4" && want("conv1x1_cat4")) {
+      int C = 0, N = 0, K = 0;
+      if (std::sscanf(body.c_str(), "Cout%d_N%d_Cin%d", &C, &N, &K) == 3) {
+        sig = OpSignature::conv1x1Cat4(C, N, K, 0, 0, 0, 0, nullptr, 0, 0);
+        have = true;
+      }
+    }
+    if (!have) continue;
+    e.expected = expectedOps(sig, rt_.info());
+    if (e.expected > 0.0) e.ratio = e.ops / e.expected;
+    ++n;
+  }
+  return n;
+}
+
 std::map<std::string, TuningEntry> PlanModel::autotune(
   const std::vector<std::string> & ops, const std::string & onlySubstr, int limit, int iters,
   bool merge, bool verbose, bool retune)
@@ -2104,17 +2292,17 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           if (p != std::string::npos) obw = std::atoi(c.options.c_str() + p + 6);
           p = c.options.find("-DOBH=");
           if (p != std::string::npos) obh = std::atoi(c.options.c_str() + p + 6);
-          clSetKernelArg(kk, 0, sizeof(dx), &dx);
-          clSetKernelArg(kk, 1, sizeof(dw), &dw);
-          clSetKernelArg(kk, 2, sizeof(db), &db);
-          clSetKernelArg(kk, 3, sizeof(dres), &dres);
-          clSetKernelArg(kk, 4, sizeof(dy), &dy);
-          clSetKernelArg(kk, 5, sizeof(Cin), &Cin);
-          clSetKernelArg(kk, 6, sizeof(H), &H);
-          clSetKernelArg(kk, 7, sizeof(W), &W);
-          clSetKernelArg(kk, 8, sizeof(Cout), &Cout);
-          clSetKernelArg(kk, 9, sizeof(Hout), &Hout);
-          clSetKernelArg(kk, 10, sizeof(Wout), &Wout);
+          setArg(kk, 0, sizeof(dx), &dx);
+          setArg(kk, 1, sizeof(dw), &dw);
+          setArg(kk, 2, sizeof(db), &db);
+          setArg(kk, 3, sizeof(dres), &dres);
+          setArg(kk, 4, sizeof(dy), &dy);
+          setArg(kk, 5, sizeof(Cin), &Cin);
+          setArg(kk, 6, sizeof(H), &H);
+          setArg(kk, 7, sizeof(W), &W);
+          setArg(kk, 8, sizeof(Cout), &Cout);
+          setArg(kk, 9, sizeof(Hout), &Hout);
+          setArg(kk, 10, sizeof(Wout), &Wout);
           const size_t lws[3] = {1, 1, 16};
           const size_t gws[3] = {
             static_cast<size_t>((Wout + obw - 1) / obw),
@@ -2131,16 +2319,16 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", c.options);
           cl_mem dw = blkWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
           cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
-          clSetKernelArg(kk, 0, sizeof(dxb), &dxb);
-          clSetKernelArg(kk, 1, sizeof(dw), &dw);
-          clSetKernelArg(kk, 2, sizeof(db), &db);
-          clSetKernelArg(kk, 3, sizeof(dy), &dy);
-          clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-          clSetKernelArg(kk, 5, sizeof(H), &H);
-          clSetKernelArg(kk, 6, sizeof(W), &W);
-          clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-          clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
-          clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+          setArg(kk, 0, sizeof(dxb), &dxb);
+          setArg(kk, 1, sizeof(dw), &dw);
+          setArg(kk, 2, sizeof(db), &db);
+          setArg(kk, 3, sizeof(dy), &dy);
+          setArg(kk, 4, sizeof(Cin), &Cin);
+          setArg(kk, 5, sizeof(H), &H);
+          setArg(kk, 6, sizeof(W), &W);
+          setArg(kk, 7, sizeof(Cout), &Cout);
+          setArg(kk, 8, sizeof(Hout), &Hout);
+          setArg(kk, 9, sizeof(Wout), &Wout);
           const size_t lws[3] = {1, 16, 1};
           const size_t gws[3] = {
             static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
@@ -2158,16 +2346,16 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         };
         const int TX = optInt("-DTX=", 40), TY = optInt("-DTY=", 8), TM = optInt("-DTM=", 1),
                   CB = optInt("-DCB=", 32);
-        clSetKernelArg(kk, 0, sizeof(dx), &dx);
-        clSetKernelArg(kk, 1, sizeof(dw), &dw);
-        clSetKernelArg(kk, 2, sizeof(db), &db);
-        clSetKernelArg(kk, 3, sizeof(dy), &dy);
-        clSetKernelArg(kk, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kk, 5, sizeof(H), &H);
-        clSetKernelArg(kk, 6, sizeof(W), &W);
-        clSetKernelArg(kk, 7, sizeof(Cout), &Cout);
-        clSetKernelArg(kk, 8, sizeof(Hout), &Hout);
-        clSetKernelArg(kk, 9, sizeof(Wout), &Wout);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dy), &dy);
+        setArg(kk, 4, sizeof(Cin), &Cin);
+        setArg(kk, 5, sizeof(H), &H);
+        setArg(kk, 6, sizeof(W), &W);
+        setArg(kk, 7, sizeof(Cout), &Cout);
+        setArg(kk, 8, sizeof(Hout), &Hout);
+        setArg(kk, 9, sizeof(Wout), &Wout);
         const size_t lws[3] = {
           static_cast<size_t>(TX / TM), static_cast<size_t>(TY), 1};
         const size_t gws[3] = {
@@ -2211,12 +2399,12 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         };
         const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
                   TN = optInt("-DTN=", 4);
-        clSetKernelArg(kg, 0, sizeof(da), &da);
-        clSetKernelArg(kg, 1, sizeof(db), &db);
-        clSetKernelArg(kg, 2, sizeof(dc), &dc);
-        clSetKernelArg(kg, 3, sizeof(M), &M);
-        clSetKernelArg(kg, 4, sizeof(N), &N);
-        clSetKernelArg(kg, 5, sizeof(K), &K);
+        setArg(kg, 0, sizeof(da), &da);
+        setArg(kg, 1, sizeof(db), &db);
+        setArg(kg, 2, sizeof(dc), &dc);
+        setArg(kg, 3, sizeof(M), &M);
+        setArg(kg, 4, sizeof(N), &N);
+        setArg(kg, 5, sizeof(K), &K);
         const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
         const size_t gws[2] = {
           static_cast<size_t>((N + BN - 1) / BN) * lws[0],
@@ -2274,24 +2462,24 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         };
         const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
                   TN = optInt("-DTN=", 4);
-        clSetKernelArg(kg, 0, sizeof(dA), &dA);
-        clSetKernelArg(kg, 1, sizeof(dB0), &dB0);
-        clSetKernelArg(kg, 2, sizeof(dC), &dC);
-        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
-        clSetKernelArg(kg, 4, sizeof(HW), &HW);
-        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kg, 6, sizeof(db), &db);
-        clSetKernelArg(kg, 7, sizeof(dres), &dres);
-        clSetKernelArg(kg, 8, sizeof(dB1), &dB1);
-        clSetKernelArg(kg, 9, sizeof(dB2), &dB2);
-        clSetKernelArg(kg, 10, sizeof(dB3), &dB3);
-        clSetKernelArg(kg, 11, sizeof(ca), &ca);
-        clSetKernelArg(kg, 12, sizeof(cb), &cb);
-        clSetKernelArg(kg, 13, sizeof(cc), &cc);
-        clSetKernelArg(kg, 14, sizeof(o0), &o0);
-        clSetKernelArg(kg, 15, sizeof(o1), &o1);
-        clSetKernelArg(kg, 16, sizeof(o2), &o2);
-        clSetKernelArg(kg, 17, sizeof(o3), &o3);
+        setArg(kg, 0, sizeof(dA), &dA);
+        setArg(kg, 1, sizeof(dB0), &dB0);
+        setArg(kg, 2, sizeof(dC), &dC);
+        setArg(kg, 3, sizeof(Cout), &Cout);
+        setArg(kg, 4, sizeof(HW), &HW);
+        setArg(kg, 5, sizeof(Cin), &Cin);
+        setArg(kg, 6, sizeof(db), &db);
+        setArg(kg, 7, sizeof(dres), &dres);
+        setArg(kg, 8, sizeof(dB1), &dB1);
+        setArg(kg, 9, sizeof(dB2), &dB2);
+        setArg(kg, 10, sizeof(dB3), &dB3);
+        setArg(kg, 11, sizeof(ca), &ca);
+        setArg(kg, 12, sizeof(cb), &cb);
+        setArg(kg, 13, sizeof(cc), &cc);
+        setArg(kg, 14, sizeof(o0), &o0);
+        setArg(kg, 15, sizeof(o1), &o1);
+        setArg(kg, 16, sizeof(o2), &o2);
+        setArg(kg, 17, sizeof(o3), &o3);
         const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
         const size_t gws[2] = {
           static_cast<size_t>((HW + BN - 1) / BN) * lws[0],
@@ -2331,38 +2519,48 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
         if (N == 1) {
           cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", c.options);
-          clSetKernelArg(kg, 0, sizeof(dw), &dw);
-          clSetKernelArg(kg, 1, sizeof(dx), &dx);
-          clSetKernelArg(kg, 2, sizeof(db), &db);
-          clSetKernelArg(kg, 3, sizeof(dres), &dres);
-          clSetKernelArg(kg, 4, sizeof(dy), &dy);
-          clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-          clSetKernelArg(kg, 6, sizeof(Cout), &Cout);
+          setArg(kg, 0, sizeof(dw), &dw);
+          setArg(kg, 1, sizeof(dx), &dx);
+          setArg(kg, 2, sizeof(db), &db);
+          setArg(kg, 3, sizeof(dres), &dres);
+          setArg(kg, 4, sizeof(dy), &dy);
+          setArg(kg, 5, sizeof(Cin), &Cin);
+          setArg(kg, 6, sizeof(Cout), &Cout);
           const size_t lws[1] = {16};
           const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
           return [this, kg, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kg, 1, gws, lws);
           };
         }
-        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
+        const bool sk = (c.kernel == "gemm_sk_f16");
+        cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", c.kernel, c.options);
         auto optInt = [&](const char * k, int def) {
           const auto p = c.options.find(k);
           return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
         };
-        const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
-                  TN = optInt("-DTN=", 4);
-        clSetKernelArg(kg, 0, sizeof(dw), &dw);
-        clSetKernelArg(kg, 1, sizeof(dx), &dx);
-        clSetKernelArg(kg, 2, sizeof(dy), &dy);
-        clSetKernelArg(kg, 3, sizeof(Cout), &Cout);
-        clSetKernelArg(kg, 4, sizeof(N), &N);
-        clSetKernelArg(kg, 5, sizeof(Cin), &Cin);
-        clSetKernelArg(kg, 6, sizeof(db), &db);
-        clSetKernelArg(kg, 7, sizeof(dres), &dres);
-        const size_t lws[2] = {static_cast<size_t>(BN / TN), static_cast<size_t>(BM / TM)};
-        const size_t gws[2] = {
-          static_cast<size_t>((N + BN - 1) / BN) * lws[0],
-          static_cast<size_t>((Cout + BM - 1) / BM) * lws[1]};
+        setArg(kg, 0, sizeof(dw), &dw);
+        setArg(kg, 1, sizeof(dx), &dx);
+        setArg(kg, 2, sizeof(dy), &dy);
+        setArg(kg, 3, sizeof(Cout), &Cout);
+        setArg(kg, 4, sizeof(N), &N);
+        setArg(kg, 5, sizeof(Cin), &Cin);
+        setArg(kg, 6, sizeof(db), &db);
+        setArg(kg, 7, sizeof(dres), &dres);
+        size_t lws[2], gws[2];
+        if (sk) {
+          const int TM = optInt("-DSK_TM=", 8), TN = optInt("-DSK_TN=", 4),
+                    SG = optInt("-DSK_SG=", 16);
+          lws[0] = static_cast<size_t>(SG); lws[1] = 1;
+          gws[0] = static_cast<size_t>((N + TN - 1) / TN) * lws[0];
+          gws[1] = static_cast<size_t>((Cout + TM - 1) / TM);
+        } else {
+          const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
+                    TN = optInt("-DTN=", 4);
+          lws[0] = static_cast<size_t>(BN / TN);
+          lws[1] = static_cast<size_t>(BM / TM);
+          gws[0] = static_cast<size_t>((N + BN - 1) / BN) * lws[0];
+          gws[1] = static_cast<size_t>((Cout + BM - 1) / BM) * lws[1];
+        }
         return [this, kg, gws, lws]() {
           return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
         };
@@ -2411,14 +2609,14 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         // 为零边输入一次性写零（尺寸按最大 TW），并单独量一趟 pad。
         xp = dwPadInput(n.ins[0], Cin, H, W, K, S, P, &Hp, &Wpad);
         cl_kernel kp = getKernel("conv_general", "depthwise_pad", "");
-        clSetKernelArg(kp, 0, sizeof(dx), &dx);
-        clSetKernelArg(kp, 1, sizeof(xp), &xp);
-        clSetKernelArg(kp, 2, sizeof(Cin), &Cin);
-        clSetKernelArg(kp, 3, sizeof(H), &H);
-        clSetKernelArg(kp, 4, sizeof(W), &W);
-        clSetKernelArg(kp, 5, sizeof(Hp), &Hp);
-        clSetKernelArg(kp, 6, sizeof(Wpad), &Wpad);
-        clSetKernelArg(kp, 7, sizeof(P), &P);
+        setArg(kp, 0, sizeof(dx), &dx);
+        setArg(kp, 1, sizeof(xp), &xp);
+        setArg(kp, 2, sizeof(Cin), &Cin);
+        setArg(kp, 3, sizeof(H), &H);
+        setArg(kp, 4, sizeof(W), &W);
+        setArg(kp, 5, sizeof(Hp), &Hp);
+        setArg(kp, 6, sizeof(Wpad), &Wpad);
+        setArg(kp, 7, sizeof(P), &P);
         const size_t gpad[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
                                 static_cast<size_t>(Cin)};
         std::function<cl_event()> padEnq = [this, kp, gpad]() {
@@ -2430,15 +2628,15 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         cl_kernel kd = getKernel("conv_general", c.kernel, c.options);
         int ho = Hout, wo = Wout;
         if (c.kernel == "depthwise_vp") {
-          clSetKernelArg(kd, 0, sizeof(xp), &xp);
-          clSetKernelArg(kd, 1, sizeof(dw), &dw);
-          clSetKernelArg(kd, 2, sizeof(db), &db);
-          clSetKernelArg(kd, 3, sizeof(dy), &dy);
-          clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
-          clSetKernelArg(kd, 5, sizeof(Hp), &Hp);
-          clSetKernelArg(kd, 6, sizeof(Wpad), &Wpad);
-          clSetKernelArg(kd, 7, sizeof(ho), &ho);
-          clSetKernelArg(kd, 8, sizeof(wo), &wo);
+          setArg(kd, 0, sizeof(xp), &xp);
+          setArg(kd, 1, sizeof(dw), &dw);
+          setArg(kd, 2, sizeof(db), &db);
+          setArg(kd, 3, sizeof(dy), &dy);
+          setArg(kd, 4, sizeof(Cin), &Cin);
+          setArg(kd, 5, sizeof(Hp), &Hp);
+          setArg(kd, 6, sizeof(Wpad), &Wpad);
+          setArg(kd, 7, sizeof(ho), &ho);
+          setArg(kd, 8, sizeof(wo), &wo);
           auto p = c.options.find("-DDW_TW=");
           const int tw = p == std::string::npos ? 8 : std::atoi(c.options.c_str() + p + 8);
           const size_t g[3] = {static_cast<size_t>((Wout + tw - 1) / tw),
@@ -2447,15 +2645,15 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             return ClRuntime::enqueueND(rt_.queue(), kd, 3, g, nullptr);
           };
         }
-        clSetKernelArg(kd, 0, sizeof(dx), &dx);
-        clSetKernelArg(kd, 1, sizeof(dw), &dw);
-        clSetKernelArg(kd, 2, sizeof(db), &db);
-        clSetKernelArg(kd, 3, sizeof(dy), &dy);
-        clSetKernelArg(kd, 4, sizeof(Cin), &Cin);
-        clSetKernelArg(kd, 5, sizeof(H), &H);
-        clSetKernelArg(kd, 6, sizeof(W), &W);
-        clSetKernelArg(kd, 7, sizeof(ho), &ho);
-        clSetKernelArg(kd, 8, sizeof(wo), &wo);
+        setArg(kd, 0, sizeof(dx), &dx);
+        setArg(kd, 1, sizeof(dw), &dw);
+        setArg(kd, 2, sizeof(db), &db);
+        setArg(kd, 3, sizeof(dy), &dy);
+        setArg(kd, 4, sizeof(Cin), &Cin);
+        setArg(kd, 5, sizeof(H), &H);
+        setArg(kd, 6, sizeof(W), &W);
+        setArg(kd, 7, sizeof(ho), &ho);
+        setArg(kd, 8, sizeof(wo), &wo);
         if (c.kernel == "depthwise_v") {
           auto p = c.options.find("-DDW_TW=");
           const int tw = p == std::string::npos ? 4 : std::atoi(c.options.c_str() + p + 8);
@@ -2536,6 +2734,9 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       }
     }
   }
+
+  // P2: 调优改变了 kernel/options ⇒ 已录制的 dispatch 失效，下一次 run() 重新录制。
+  if (merge && !done.empty()) { captured_ = false; node_cmds_.clear(); }
 
   return done;
 }

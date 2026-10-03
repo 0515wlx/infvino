@@ -166,6 +166,24 @@ std::vector<Candidate> candidatesConv1x1(const OpSignature & sig)
     c.config += " epi=1 act=" + std::to_string(sig.act);
     out.push_back(std::move(c));
   }
+  // R32: split-K（lane 沿 K + sub_group_reduce_add）专用通路。gemm_f16 在这些
+  // 「输出小、K 大」的层上只有 1–4 个 work-group（网格饥饿）；split-K 用
+  // ceil(N/TN)×ceil(M/TM) 个 sub-group 换占用，K 越大越划算。作为候选按 shape 选，
+  // 只在实测更快时被选中（不改变默认行为）。
+  struct SkOpt { int TM, TN, UK; };
+  const SkOpt skopts[] = {{8, 4, 4}, {4, 4, 4}, {16, 4, 4}, {8, 8, 4}, {8, 4, 8}};
+  for (const auto & o : skopts) {
+    Candidate c;
+    c.kernel = "gemm_sk_f16";
+    c.source = "gemm_sk";
+    c.options = "-DSK_TM=" + std::to_string(o.TM) + " -DSK_TN=" + std::to_string(o.TN) +
+                " -DSK_SG=16 -DSK_UK=" + std::to_string(o.UK) + " -DACT=" +
+                std::to_string(sig.act) + " -DRES=" + ((sig.groups == 2) ? "1" : "0") +
+                " -cl-mad-enable -cl-fast-relaxed-math";
+    c.config = "sk TM" + std::to_string(o.TM) + " TN" + std::to_string(o.TN) + " u" +
+               std::to_string(o.UK) + " act" + std::to_string(sig.act);
+    out.push_back(std::move(c));
+  }
   return out;
 }
 

@@ -113,6 +113,11 @@ public:
 
   /** @brief 列出计划里可调优的唯一签名（不触碰 GPU，用于分批/审计）。 */
   std::vector<std::string> tuningTargets(const std::vector<std::string> & ops = {}) const;
+  /** @brief 计划里可调优节点的唯一签名对象（与 tuningTargets 同源，便于重算中间标准）。 */
+  std::vector<OpSignature> tuningSignatures(const std::vector<std::string> & ops = {}) const;
+  /** @brief 用当前 `expectedOps` 重算缓存命中项的 expected/ratio（**零 GPU**）。
+   *  用于中间标准公式更新后，让既有实测数据立即按新标尺排序。返回更新的条数。 */
+  int refreshExpected(const std::vector<std::string> & ops = {});
   /** @brief 把 current tuning_ 写回文件。 */
   bool saveTuning(const std::string & path) const { return tuning_.save(path); }
 
@@ -184,6 +189,42 @@ private:
                      int * HpOut, int * WpadOut);
   /** @brief Build (once) and cache a kernel keyed by source|name|options. */
   cl_kernel getKernel(const std::string & src, const std::string & name, const std::string & opts);
+
+  // ---------------------------------------------------------------------------
+  // P2: per-node dispatch cache.
+  //
+  // run() 的每个节点每帧都要做一遍「签名/查表/拼 kernel key/attrInt/拼 tag/setArg」
+  // 的 host 工作（P2 实测 host ≈ 26 µs/node，~4× OpenVINO）。计划是静态的、内存池
+  // 在 parse 期一次性分配，所以每个节点的 kernel、参数、网格在帧间**不变**。
+  //
+  // 策略：首帧按原逻辑执行并**录制**「克隆 kernel + 已设参数 + 网格 + tag」；之后
+  // 每帧直接重放（replay），零签名/零字符串/零 setArg。克隆 kernel（clCreateKernel）
+  // 让每个 cmd 拥有独立的参数状态，参数只在录制时设一次——数值语义与首帧完全一致。
+  // ---------------------------------------------------------------------------
+  struct PlanArg
+  {
+    cl_uint                index{0};
+    size_t                 size{0};
+    std::vector<unsigned char> bytes;
+  };
+  struct PlanCmd
+  {
+    cl_kernel   k{nullptr};
+    cl_uint     dim{0};
+    size_t      gws[3]{1, 1, 1};
+    size_t      lws[3]{1, 1, 1};
+    bool        useLws{false};
+    std::string tag;
+  };
+  /** @brief P2: 记录参数（capture 期）或直接下传 OpenCL。 */
+  void    setArg(cl_kernel k, cl_uint index, size_t size, const void * value);
+  /** @brief P2: 入队一个 P2 受管的 dispatch（capture 期顺带克隆+录制）。 */
+  cl_event enqueueCmd(cl_kernel k, cl_uint dim, const size_t * gws, const size_t * lws,
+                      const char * tag, bool useLws);
+  /** @brief P2: 重放第 ni 个节点录制好的 dispatch 列表。 */
+  void    replayNode(size_t ni);
+  /** @brief P2: 克隆一个 kernel（独立参数状态，用于跨帧跳过 setArg）。 */
+  cl_kernel cloneKernel(cl_kernel src);
   /**
    * @brief Round 28: set up a small-op kernel — args + launch geometry.
    *
@@ -238,6 +279,16 @@ private:
   // once and reused across run() calls — avoids clCreateKernel on every node of
   // every inference. Pure caching; numerics are unchanged.
   std::unordered_map<std::string, cl_kernel> kcache_;
+
+  // P2: per-node dispatch cache (see cloneKernel / enqueueCmd above).
+  std::vector<std::vector<PlanCmd>> node_cmds_;       // 每个节点录制好的 dispatch 列表
+  std::vector<cl_kernel>            clone_kernels_;   // 克隆 kernel 的所有权（析构释放）
+  std::vector<PlanCmd>              cap_cmds_;         // capture 期当前节点的临时列表
+  std::unordered_map<cl_kernel, std::vector<PlanArg>> cap_args_;  // capture 期 kernel->参数
+  bool                              captured_{false};  // 首帧录制完成
+  bool                              capturing_{false}; // 正在录制
+  bool                              launch_cache_{true};  // INFVINO_NO_LAUNCH_CACHE 可关
+  size_t                            cap_node_{0};      // 正在录制的节点序号
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
   double                                        last_run_ms_{0.0};
