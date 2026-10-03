@@ -51,8 +51,17 @@ docs/                                          # 架构、基准、kernel 优化
 | yaml-cpp | 系统版 | 模型配置 |
 | Intel Compute Runtime / IGC | 见 `docs/dependencies.md` | iGPU 驱动栈 |
 
-> 开发/测试使用的容器镜像：`infvino-dev`（含 OpenCV / OpenCL dev / yaml-cpp / cmake）。
-> 不需要 OpenVINO。
+> 开发/测试使用的容器镜像 `infvino-dev:latest` 由本仓库的
+> [`docker/Dockerfile`](docker/Dockerfile) 构建；Python 工具依赖见
+> [`requirements-dev.txt`](requirements-dev.txt)。**不需要 OpenVINO。**
+> 与 OpenVINO 的对照一律经 `scripts/openvino_baseline.py` 路由到其**最新稳定版**（不硬编码）。
+
+> 开发环境一键准备：
+>
+> ```bash
+> docker build -f docker/Dockerfile -t infvino-dev:latest .
+> python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
+> ```
 
 ## 构建
 
@@ -158,7 +167,9 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 >
 > **R23 更新**：`concat4` 改 3-D 网格（纯索引简化）+ 主机侧 kernel 缓存 →
 > yolov8n busy **19.9→17.2 ms**、yolo11n **23.0→20.1 ms**（数值精确，三模型 PASS）。
-> 与 OpenVINO 2025.2 对照，整网仍差 ~1.5–1.9×，差距集中在 conv3×3 网格饥饿
+> 与 OpenVINO 最新稳定版对照（该次测量时为 2025.2；新对照经
+> [`scripts/openvino_baseline.py`](scripts/openvino_baseline.py) 动态解析，不硬编码），
+> 整网仍差 ~1.5–1.9×，差距集中在 conv3×3 网格饥饿
 > （`os_iyx_osv32` 已到 ~8–13 ops）；阻塞式 conv 移植未打赢 osv32（负结果）。
 > 详见 [`docs/kernel.md`](docs/kernel.md) Round 23 与
 > [`docs/round22-status.md`](docs/round22-status.md)。

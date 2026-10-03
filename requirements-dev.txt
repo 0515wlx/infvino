@@ -1,0 +1,14 @@
+# infvino 开发/工具链 Python 依赖（宿主 venv；不进入 C++ 运行时）
+#
+# 用法：
+#   python3 -m venv .venv
+#   . .venv/bin/activate
+#   pip install -r requirements-dev.txt
+#
+# 版本固定为当前已验证组合；升级请整组更新并在 PR 说明。
+numpy==2.2.6
+onnx==1.23.0
+onnxruntime==1.23.2
+opencv-python==5.0.0.93
+PyYAML==6.0.3
+packaging==26.3

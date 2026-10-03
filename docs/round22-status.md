@@ -231,7 +231,10 @@ python3 scripts/model_check.py --model mobilenetv3-small --repo $PWD
 
 > 详见 `docs/kernel.md` Round 23；数值判据同上。
 
-## A. 与 OpenVINO 2025.2 的整网对照（同一 iGPU）
+## A. 与 OpenVINO 最新稳定版的整网对照（同一 iGPU）
+
+> 下表 OV 数值为历史测量（当时为 2025.2）。重新对照请用
+> `scripts/openvino_baseline.py run`，它会**动态解析最新稳定版**（不硬编码）。
 
 | 模型 | OV GPU 合计 | OV infer | OV e2e | infvino busy (R23) | 差距 |
 |---|---|---|---|---|---|

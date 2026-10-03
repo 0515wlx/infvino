@@ -1,6 +1,8 @@
 # infvino vs OpenVINO GPU：差距分析、优势盘点与可借鉴的设计
 
-> 对照对象：本机 `/home/pc03/openvino` = **OpenVINO 2026.5.0**（master，`89adf0d746`），
+> 对照基线：**OpenVINO 最新稳定版**，由 [`scripts/openvino_baseline.py`](../scripts/openvino_baseline.py)
+> 在运行时解析（查 PyPI、排除预发布，目前解析为 2026.4.x），**不硬编码版本号**；
+> 复现历史数据时用 `--version` 显式指定。本文中的历史数值标注了当时测量所用的版本。
 > `src/plugins/intel_gpu`（cldnn）。
 > infvino：当前 `main`（R30c，合入 Route A concat→conv1x1）。
 > 硬件：Intel Iris Xe（TGL, 80 EU / 1.3 GHz, LPDDR 单通道）。
@@ -29,7 +31,8 @@
 
 ## 1. 账本：差距到底在哪一段
 
-同一 iGPU，infvino R30c vs OpenVINO 2025.2 的公开对照（README / benchmark.md）：
+同一 iGPU，infvino R30c 与 **OpenVINO 最新稳定版**（下表为历史测量值，当时为 2025.2；
+新测请用 `scripts/openvino_baseline.py run` 动态解析的版本）的公开对照（README / benchmark.md）：
 
 | 模型 | OV GPU 合计 | OV infer | OV e2e | infvino busy | infvino 墙钟 | busy 比 | 墙钟比 |
 |---|---|---|---|---|---|---|---|

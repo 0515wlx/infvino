@@ -1,0 +1,9 @@
+# 仅 `scripts/export_models.py`（ultralytics → ONNX）需要的重型依赖。
+# 依赖安装体积大，按需安装：
+#   pip install -r requirements-export.txt
+#
+# 版本固定为当前已验证组合。
+-r requirements-dev.txt
+ultralytics==8.4.166
+torch==2.14.0
+torchvision==0.29.0

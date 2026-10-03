@@ -18,7 +18,7 @@
 | 频率 | 1300 MHz（`gt_RP0_freq_mhz`；i5-1135G7 官方 Graphics Max Dynamic Frequency = 1.30 GHz） |
 | FP32 峰值 | `80 × 1.3e9 × 16` = **1.664 TFLOP/s**（8 FMA/EU/cyc） |
 | FP16 峰值 | `80 × 1.3e9 × 32` = **3.328 TFLOP/s**（16 packed FMA/EU/cyc，需 half2/half8） |
-| 运行环境 | `infvino-dev`（在 develop 镜像上补 `ocl-icd-opencl-dev` + `opencl-headers`） |
+| 运行环境 | `infvino-dev:latest`（由本仓库 `docker/Dockerfile` 构建） |
 
 > ⚠️ **口径修正**：早期文档把 “16” 当作 **FP16** 理论上限，实为 **FP32** 上限。
 > Xe-LP 的 EU 是 8 条 FP32 通道；FP16 通过 **packed half2** 提供 **2×** 速率
@@ -2045,7 +2045,8 @@ autotune 在 15 条 depthwise 签名中选中了 **5 条** vp（单层最多 −
 ## 复现
 
 ```bash
-# 1) 使用含 OpenCL dev 头的镜像（infvino-dev；infvino 不维护 Dockerfile）
+# 1) 构建并进入含 OpenCL dev 头的镜像（本仓库 docker/Dockerfile）
+docker build -f docker/Dockerfile -t infvino-dev:latest .
 
 # 2) 数值检验（宿主 venv: numpy）
 python3 scripts/kernel_check.py --repo $PWD --image infvino-dev:latest

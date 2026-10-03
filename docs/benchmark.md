@@ -92,7 +92,11 @@ conv3x3 的 **WCOAL 合并权重 staging**（+5–12%，Round 18）与**自适�
 （小空间/低通道层 CB=32→16，+20–56%，Round 18）——conv3x3 分项 yolov8 15.0→12.5 ms。
 三模型数值检验仍全部 PASS。详见 `docs/kernel.md` Round 18。
 
-#### 与 OpenVINO 2025.2 的整网对照（同一 iGPU）
+#### 与 OpenVINO 最新稳定版的整网对照（同一 iGPU）
+
+> 下表的 OV 数值为历史测量（测量时为 2025.2）。重新对照请运行
+> `python3 scripts/openvino_baseline.py run --device GPU`，脚本会**动态解析最新稳定版**
+> 并写入 `build-ct/openvino-baseline.json`，不硬编码版本。
 
 OV per-node GPU 时间（`enable_profiling`）与端到端（含预处理）：
 

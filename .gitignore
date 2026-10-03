@@ -12,3 +12,6 @@ models/*
 # Python
 __pycache__/
 *.pyc
+.venv/
+.venv-ov/
+.pytest_cache/

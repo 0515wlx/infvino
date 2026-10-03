@@ -1,0 +1,9 @@
+# 构建镜像时排除的内容（镜像只需要源码 + kernels/ + config/）
+.git
+build/
+build-*/
+models/
+.venv/
+.venv-ov/
+__pycache__/
+*.pyc

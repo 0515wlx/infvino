@@ -1,0 +1,9 @@
+# OpenVINO 对照基线依赖。
+#
+# 不要在此硬编码版本：`scripts/openvino_baseline.py` 会在运行时解析
+# OpenVINO 的**最新稳定版**（默认查 PyPI，排除预发布），也可用 --version 覆盖，
+# 然后把它安装进隔离 venv（默认 .venv-ov/）。
+#
+# 如需手工安装最新稳定版：
+#   python3 -m venv .venv-ov && . .venv-ov/bin/activate && pip install openvino
+openvino
