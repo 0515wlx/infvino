@@ -34,7 +34,7 @@ bool readFile(const std::string & path, std::vector<uint16_t> & buf)
 
 int main(int argc, char ** argv)
 {
-  std::string plan_path, kernel_dir, input_path, output_path, out_dir, dump_tensor;
+  std::string plan_path, kernel_dir, input_path, output_path, out_dir, dump_tensor, input2_path;
   int         iters  = 1;
   bool        report = false;
 
@@ -45,6 +45,7 @@ int main(int argc, char ** argv)
     if (a == "--plan") plan_path = next();
     else if (a == "--kernel-dir") kernel_dir = next();
     else if (a == "--input") input_path = next();
+    else if (a == "--input2") input2_path = next();
     else if (a == "--output") output_path = next();
     else if (a == "--out-dir") out_dir = next();
     else if (a == "--iters") iters = std::atoi(next().c_str());
@@ -79,6 +80,23 @@ int main(int argc, char ** argv)
     model.run();  // warmup（构建/预热 cache，不计入统计）
     model.clearProfile();
     for (int it = 0; it < iters; ++it) model.run();
+
+    // --input2：再喂一份**不同**的输入并前向一次，输出/*dump 都取这一帧。
+    // 这样任何「把每帧激活错误缓存成只算一次」的 bug 都会在输出里暴露
+    // （单输入重复跑永远发现不了；见 scripts/reuse_check.py）。
+    if (!input2_path.empty())
+    {
+      std::vector<uint16_t> in2(static_cast<size_t>(model.inputNumel()));
+      if (!readFile(input2_path, in2) ||
+          in2.size() != static_cast<size_t>(model.inputNumel()))
+      {
+        std::fprintf(stderr, "[kernel_run] cannot read/!size --input2 %s\n", input2_path.c_str());
+        return 1;
+      }
+      model.setInput(in2.data());
+      model.run();   // frame 2（不计入统计；输出取该帧）
+      std::fprintf(stderr, "[kernel_run] frame2 input=%s\n", input2_path.c_str());
+    }
 
     for (size_t i = 0; i < model.outputCount(); ++i)
     {

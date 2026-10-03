@@ -117,6 +117,10 @@ python3 scripts/engine_check.py   --repo $PWD --image infvino-dev:latest
 python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvino-dev:latest
 ```
 
+> **测试约定（P0 起）**：整网数值检验都跑**两份不同输入**（`--input/--input2`、`--image/--image2`），
+> 输出取**第二帧**。这样「把每帧都会变的激活错误地缓存成只算一次」这类 bug 会被立刻抓到——
+> 单输入重复跑的测试发现不了（曾漏掉 `blkInput` 跨推理陈旧 bug，见 `docs/kernel.md`）。
+
 ## 文档
 
 | 文档 | 内容 |

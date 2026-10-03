@@ -74,7 +74,11 @@ def main():
     x16 = rng.random(shape).astype(np.float16)
     xin = os.path.join(wd, "input.bin")
     x16.tofile(xin)
-    ref = sess.run(None, {in_meta.name: x16.astype(np.float32)})[0]
+    # 第二份**不同**输入：kernel_run 先喂 A 再喂 B、输出取 B 帧，暴露跨推理缓存陈旧。
+    x16b = rng.random(shape).astype(np.float16)
+    xin2 = os.path.join(wd, "input2.bin")
+    x16b.tofile(xin2)
+    ref = sess.run(None, {in_meta.name: x16b.astype(np.float32)})[0]
     np.save(os.path.join(wd, "ref.npy"), ref)
     print(f"[ref] {args.model} input{shape} -> output{ref.shape}")
 
@@ -91,7 +95,8 @@ def main():
         "cmake -S /workspace/infvino -B /tmp/build -DCMAKE_BUILD_TYPE=Release >/tmp/cfg.log 2>&1",
         "cmake --build /tmp/build -j2 >/tmp/build.log 2>&1",
         f"timeout 60 /tmp/build/kernel_run --plan /work/{args.model}/model.plan "
-        f"--input /work/input.bin --output /work/out.bin --iters {args.iters} --report "
+        f"--input /work/input.bin --input2 /work/input2.bin --output /work/out.bin "
+        f"--iters {args.iters} --report "
         "| tee /work/krun.log",
         "if dmesg 2>/dev/null | grep -q 'GPU HANG'; then echo '[model_check] GPU HANG detected'; exit 3; fi",
     ]

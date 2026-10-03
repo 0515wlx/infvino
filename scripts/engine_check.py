@@ -90,6 +90,10 @@ def main() -> int:
     img = rng.integers(0, 256, size=(args.height, args.width, 3), dtype=np.uint8)
     img_path = os.path.join(args.workdir, "engine_input.png")
     cv2.imwrite(img_path, img)
+    # 第二张**不同**图片：先喂 img1 再喂 img2、输出取第二帧（跨推理缓存陈旧护栏）。
+    img2 = rng.integers(0, 256, size=(args.height, args.width, 3), dtype=np.uint8)
+    img2_path = os.path.join(args.workdir, "engine_input2.png")
+    cv2.imwrite(img2_path, img2)
 
     jobs = []
     for key in args.keys:
@@ -103,7 +107,7 @@ def main() -> int:
             subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "onnx2plan.py"),
                             "--onnx", onnx_path, "--out-dir", os.path.dirname(plan_path)], check=True)
 
-        blob = preprocess(img, mcfg)
+        blob = preprocess(img2, mcfg)
         sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         ref = sess.run(None, {sess.get_inputs()[0].name: blob})[0]
         np.save(os.path.join(args.workdir, f"eng_ref_{key}.npy"), ref)
@@ -118,7 +122,7 @@ def main() -> int:
     for key, _ in jobs:
         inner.append(
             f"timeout 60 /tmp/build/infvino_numtest --config /workspace/infvino/config/models.yaml --key {key} "
-            f"--image /work/engine_input.png --dump /work/eng_{key} "
+            f"--image /work/engine_input.png --image2 /work/engine_input2.png --dump /work/eng_{key} "
             f"> /work/eng_log_{key}.txt 2>&1 || echo 'RUNFAIL {key}'")
     inner.append("if dmesg 2>/dev/null | grep -q 'GPU HANG'; then "
                  "echo '[engine_check] GPU HANG detected'; exit 3; fi")

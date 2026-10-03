@@ -26,6 +26,7 @@
 int main(int argc, char ** argv)
 {
   std::string config, key, plan, device, input_path, image_path, dump_prefix;
+  std::string input2_path, image2_path;
   for (int i = 1; i < argc; ++i)
   {
     const std::string a = argv[i];
@@ -35,7 +36,9 @@ int main(int argc, char ** argv)
     else if (a == "--plan") plan = next();
     else if (a == "--device") device = next();
     else if (a == "--input") input_path = next();
+    else if (a == "--input2") input2_path = next();
     else if (a == "--image") image_path = next();
+    else if (a == "--image2") image2_path = next();
     else if (a == "--dump") dump_prefix = next();
     else { std::cerr << "unknown arg " << a << "\n"; return 2; }
   }
@@ -55,26 +58,28 @@ int main(int argc, char ** argv)
   }
 
   // 构造输入：优先图片（走 Preprocessor），否则读 f32 NCHW 二进制。
-  std::vector<float> buf;
-  if (!image_path.empty())
-  {
-    const cv::Mat bgr = cv::imread(image_path, cv::IMREAD_COLOR);
-    if (bgr.empty()) { std::cerr << "cannot read image " << image_path << "\n"; return 1; }
+  auto load_image = [&](const std::string & path) -> std::vector<float> {
+    const cv::Mat bgr = cv::imread(path, cv::IMREAD_COLOR);
+    if (bgr.empty()) throw std::runtime_error("cannot read image " + path);
     infvino::Preprocessor pre(infvino::PreprocessConfig{
       info.input_size, info.letterbox, info.to_rgb, info.normalize, info.mean, info.std});
     const cv::Mat blob = pre(bgr);
-    buf.assign(reinterpret_cast<const float *>(blob.data),
-               reinterpret_cast<const float *>(blob.data) + blob.total() * blob.channels());
-  }
-  else if (!input_path.empty())
-  {
-    std::ifstream fin(input_path, std::ios::binary | std::ios::ate);
-    if (!fin) { std::cerr << "cannot open input " << input_path << "\n"; return 1; }
+    return std::vector<float>(reinterpret_cast<const float *>(blob.data),
+                              reinterpret_cast<const float *>(blob.data) + blob.total() * blob.channels());
+  };
+  auto load_bin = [&](const std::string & path) -> std::vector<float> {
+    std::ifstream fin(path, std::ios::binary | std::ios::ate);
+    if (!fin) throw std::runtime_error("cannot open input " + path);
     const std::streamsize bytes = fin.tellg();
     fin.seekg(0);
-    buf.resize(static_cast<size_t>(bytes) / sizeof(float));
-    fin.read(reinterpret_cast<char *>(buf.data()), bytes);
-  }
+    std::vector<float> v(static_cast<size_t>(bytes) / sizeof(float));
+    fin.read(reinterpret_cast<char *>(v.data()), bytes);
+    return v;
+  };
+
+  std::vector<float> buf;
+  if (!image_path.empty())      buf = load_image(image_path);
+  else if (!input_path.empty()) buf = load_bin(input_path);
 
   infvino::ClBackend backend(info);
   const auto & dev = backend.device();
@@ -82,6 +87,16 @@ int main(int argc, char ** argv)
             << (dev.fell_back_to_cpu ? " [NON-GPU]" : "") << "\n";
 
   std::vector<infvino::Tensor> outputs = backend.infer(buf.data(), buf.size());
+
+  // --input2/--image2：再喂一份**不同**输入，输出/dump 取第二帧——暴露「跨推理缓存陈旧」。
+  if (!input2_path.empty() || !image2_path.empty())
+  {
+    std::vector<float> buf2 =
+      !image2_path.empty() ? load_image(image2_path) : load_bin(input2_path);
+    std::cout << "[frame2] second input -> output taken from frame 2\n";
+    outputs = backend.infer(buf2.data(), buf2.size());
+  }
+
   for (size_t i = 0; i < outputs.size(); ++i)
   {
     const auto & t = outputs[i];

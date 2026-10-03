@@ -1937,7 +1937,19 @@ copy(read+write) 带宽-足迹：1 MB **89.7 GB/s**（L3 峰）、2 MB 62.4、4 
    `tuning_test` 新增 6 条断言。
 3. 新增 `scripts/analyze_smallops.py`（逐节点流量 vs 内存上限，不需要 GPU）。
 
-## 稳定性事故记录（重要）- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
+## 稳定性事故记录（重要）
+
+- **跨推理缓存陈旧（R-P0b，2026-10 修复）**：`PlanModel::blkInput`（`conv_blk` 的输入重排）
+  按**张量名**缓存重排结果且**只执行一次**。生产里每帧图像不同，走 `conv_blk` 的图层
+  （y8 有 13 层）在第 2 帧起会用到**上一帧**的输入。数值表现为 y8 第 2 帧
+  `mean_rel=1.382e-02`（正常 ~5e-4）。
+  **为什么长期漏掉**：所有测试都是**同一输入重复跑**，第 2 帧的陈旧数据恰好等于正确数据。
+  **修复**：`blkInput` 每次调用都重跑 reorder（只缓存设备 buffer，不缓存结果）。
+  **护栏**：新增 `scripts/reuse_check.py` + `src/tools/reuse_check.cpp`，并把
+  `model_check/numerical_check/engine_check` 全部改成**同一进程喂两份不同输入、输出取第二帧**
+  （`--input2/--image2`）。教训：**任何「按名字缓存、跨 run 复用」的激活态都必须用多输入测试覆盖**。
+
+- **`softmax` 负 axis 未归一化**：`[1,2,400,400]` 的 `Softmax(axis=-1)` 被算成
   `outer=800, axdim=400, inner=320000` → **2.56 亿工作项 → 假死**（表现为开发板卡死）。
   已修（axis 归一化为非负），并在 `kernel_run` 加 **gws 安全阀**（>3e8 直接报错退出）。
 - **带宽测试 OOM**：`kernel_bench --op bandwidth --mb 1024` 分配 2×1 GB buffer + host 1 GB，

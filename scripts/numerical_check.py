@@ -69,9 +69,12 @@ def main() -> int:
         rng = np.random.default_rng(0)
         inp = rng.random(shape).astype(np.float32)
         inp.tofile(os.path.join(args.workdir, f"in_{name}.bin"))
+        # 第二份不同输入：infvino_numtest 先喂 A 再喂 B、输出取 B 帧（跨推理缓存陈旧护栏）。
+        inp2 = rng.random(shape).astype(np.float32)
+        inp2.tofile(os.path.join(args.workdir, f"in2_{name}.bin"))
 
         sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        refs = sess.run(None, {sess.get_inputs()[0].name: inp})
+        refs = sess.run(None, {sess.get_inputs()[0].name: inp2})
         for i, r in enumerate(refs):
             np.save(os.path.join(args.workdir, f"ref_{name}_out{i}.npy"), r)
 
@@ -93,7 +96,7 @@ def main() -> int:
     for name, _ in jobs:
         inner.append(
             f"timeout 60 /tmp/build/infvino_numtest --config /workspace/infvino/config/models.yaml --key {name} "
-            f"--input /work/in_{name}.bin --dump /work/lib_{name} "
+            f"--input /work/in_{name}.bin --input2 /work/in2_{name}.bin --dump /work/lib_{name} "
             f"> /work/log_{name}.txt 2>&1 || echo 'RUNFAIL {name}'")
     inner.append("if dmesg 2>/dev/null | grep -q 'GPU HANG'; then "
                  "echo '[numerical_check] GPU HANG detected'; exit 3; fi")
