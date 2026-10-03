@@ -168,6 +168,9 @@ private:
   void    allocateActivations();
   /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
   void    fuseConcatConv1x1();
+  /** @brief R33: fuse `conv -> ew_binary(add)` into the conv epilogue (RES), removing the
+   *  standalone elementwise add launch. Only for producers whose kernel supports RES. */
+  void    fuseResidualAdd();
   void    buildKernels();
   void    releaseKernels();
   void    dispatch(const Node & n);

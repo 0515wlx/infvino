@@ -343,6 +343,11 @@ void PlanModel::parse()
   // 省掉 concat 的物化（写+再读），同时保留 gemm_f16 的 tile/流水。
   fuseConcatConv1x1();
 
+  // R33：把「conv1x1/conv3x3 + ew_binary(add)」的残差加折进卷积 epilogue（RES），
+  // 省掉一次 elementwise launch（数值顺序不变：act(conv+bias)+res）。
+  // INFVINO_NO_FUSE_RES=1 可关闭以做 A/B。
+  if (!std::getenv("INFVINO_NO_FUSE_RES")) fuseResidualAdd();
+
   // P0：把激活张量改分配到按生存期复用的缓冲池（须在 fusion 之后，节点列表已定稿）。
   allocateActivations();
 
@@ -423,6 +428,84 @@ void PlanModel::fuseConcatConv1x1()
     remove[pit->second] = 1;
   }
 
+  std::vector<Node> kept;
+  kept.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    if (!remove[i]) kept.push_back(std::move(nodes_[i]));
+  nodes_ = std::move(kept);
+}
+
+// R33: `conv -> ew_binary(add)` 折进卷积 RES epilogue。
+//
+// 只处理算术上安全的形态：ew_binary op=0（add）、无广播（无 bdims）、且卷积输出只有
+// 这一个消费者。折进后卷积输出名改写为 ew 的输出名，ew 节点删除——数值顺序保持
+// `act(conv+bias) + res`（gemm/conv_ov 的 RES 就是在激活之后加），与原来
+// `conv -> act` 再 `ew_binary(+res)` 一致。
+//
+// RES 能力：gemm_f16 / gemm_sk / conv1x1_gemv（gemm 族）、conv3x3_ov 支持。
+// native conv3x3 / conv3x3_blk 不支持 → run() 里对带 res 的 conv3x3 会绕过这两条
+// 调优通路、回退到 ov（见 dispatch），保证正确性。
+void PlanModel::fuseResidualAdd()
+{
+  std::map<std::string, size_t> producer;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producer[o] = i;
+  std::map<std::string, int> useCount;
+  for (const auto & n : nodes_)
+    for (const auto & in : n.ins)
+      if (in != "-") ++useCount[in];
+
+  auto resCapableConv = [&](const std::string & op) {
+    // R33 实测：conv3x3 带 res 需绕开 blk/native 调优（它们不支持 RES）→ 强制 ov，
+    // 对 20×20/40×40 这类本该走 blk 的层得不偿失（整网 +4%）。因此只融合 gemm 族
+    // （conv1x1/conv1x1_cat4）：RES 与原来「act 后单独 add」是同一 fp16 累加路径。
+    return op == "conv1x1" || op == "conv1x1_cat4";
+  };
+  auto resSlotOf = [](const std::string & op) -> size_t {
+    if (op == "conv1x1_cat4") return 6;   // [w,b0..b3,bias,res]
+    return 3;                             // conv1x1 / conv3x3: [w,x,bias,res]
+  };
+
+  std::vector<char> remove(nodes_.size(), 0);
+  std::map<std::string, int> isOutput;
+  for (const auto & o : outputs_) isOutput[o] = 1;
+  int nfused = 0;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    Node & e = nodes_[i];
+    if (e.op != "ew_binary") continue;
+    if (attrInt(e, "op", 0) != 0) continue;                    // add only
+    if (e.attr.count("bdims") && attrInt(e, "b_scalar", 0) != 1) continue;  // no broadcast
+    if (e.ins.size() < 2) continue;
+    for (int k = 0; k < 2; ++k)
+    {
+      const std::string & pname = e.ins[k];
+      const std::string & rname = e.ins[1 - k];
+      auto pit = producer.find(pname);
+      if (pit == producer.end()) continue;
+      Node & c = nodes_[pit->second];
+      if (!resCapableConv(c.op)) continue;
+      if (useCount[pname] != 1) continue;                      // 卷积输出只喂这个 add
+      if (isOutput.count(pname)) continue;                      // 卷积输出是模型输出
+      if (c.outs.size() != 1 || c.outs[0] != pname) continue;
+      if (rname == "-" || !T_.count(rname) || !T_.count(pname)) continue;
+      const size_t rs = resSlotOf(c.op);
+      if (c.ins.size() > rs && c.ins[rs] != "-") continue;     // 已有残差
+      // 残差必须在卷积之前产出（拓扑序），否则折入会读到未写入的缓冲。
+      auto rit = producer.find(rname);
+      if (rit == producer.end() || rit->second >= pit->second) continue;
+      if (c.ins.size() <= rs) c.ins.resize(rs + 1, "-");
+      c.ins[rs]          = rname;
+      c.outs[0]          = e.outs[0];   // 卷积改写到 ew 的输出张量
+      remove[i]          = 1;
+      producer.erase(pname);
+      producer[e.outs[0]] = pit->second;
+      ++nfused;
+      break;
+    }
+  }
+  if (nfused == 0) return;
   std::vector<Node> kept;
   kept.reserve(nodes_.size());
   for (size_t i = 0; i < nodes_.size(); ++i)
@@ -1370,6 +1453,21 @@ std::string sourceOfKernel(const std::string & kernel)
       kernel == "depthwise_pad" || kernel == "conv_general") return "conv_general";
   return "ops";
 }
+
+// R33: 把 options 里的 -DRES=<d> 改成期望值；没有则追加。融合残差后调用。
+void setResOpt(std::string & opts, bool on)
+{
+  const std::string key = "-DRES=";
+  const auto        p   = opts.find(key);
+  const char *      val = on ? "1" : "0";
+  if (p == std::string::npos) {
+    opts += " -DRES=";
+    opts += val;
+    return;
+  }
+  const size_t v = p + key.size();
+  if (v < opts.size() && opts[v] >= '0' && opts[v] <= '9') opts[v] = val[0];
+}
 }  // namespace
 
 void PlanModel::run()
@@ -1523,6 +1621,7 @@ void PlanModel::run()
       const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
                                                        act, dres ? 1 : 0);
       if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+      if (dres) setResOpt(gopts, true);  // R33 融合残差
       cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
       auto optInt = [&](const char * key, int def) {
         const auto p = gopts.find(key);
@@ -1580,6 +1679,7 @@ void PlanModel::run()
         std::string gopts = cfg.options();
         const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
         if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+        if (dres) setResOpt(gopts, true);  // R33 融合残差
         cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", gopts);
         setArg(kg, 0, sizeof(dw), &dw);
         setArg(kg, 1, sizeof(dx), &dx);
@@ -1626,6 +1726,7 @@ void PlanModel::run()
         }
         // R32: split-K（lane 沿 K）候选走 gemm_sk_f16，几何不同；两者参数表相同。
         const bool sk = (gkernel == "gemm_sk_f16");
+        if (dres) setResOpt(gopts, true);  // R33 融合残差（gemm_f16/gemm_sk 都支持 RES）
         cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", gkernel, gopts);
         setArg(kg, 0, sizeof(dw), &dw);
         setArg(kg, 1, sizeof(dx), &dx);
@@ -1781,6 +1882,8 @@ void PlanModel::run()
       const OpSignature tsig =
         OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
       const TuningEntry * te = tuning_.lookup(tsig);
+      // R33: 带残差的 conv3x3 只有 conv3x3_ov 支持 RES；native/blk 不支持 → 绕回调优走 ov。
+      if (dres && te && te->kernel != "conv3x3_ov") te = nullptr;
 
       if (te && te->kernel == "conv3x3_f16")
       {
@@ -1861,14 +1964,16 @@ void PlanModel::run()
       {
         // 调优命中的 OV osv32：options 里已含 OBW/OBH/STRIDE/PAD/ACT/RES/SG。
         // 从 options 解析 OBW/OBH 以重建 grid（避免再解析 config 串）。
+        std::string ovopts = te->options;
+        if (dres) setResOpt(ovopts, true);  // R33 融合残差
         int obw = 8, obh = 2;
         {
-          auto p = te->options.find("-DOBW=");
-          if (p != std::string::npos) obw = std::atoi(te->options.c_str() + p + 6);
-          p = te->options.find("-DOBH=");
-          if (p != std::string::npos) obh = std::atoi(te->options.c_str() + p + 6);
+          auto p = ovopts.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(ovopts.c_str() + p + 6);
+          p = ovopts.find("-DOBH=");
+          if (p != std::string::npos) obh = std::atoi(ovopts.c_str() + p + 6);
         }
-        cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, te->options);
+        cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, ovopts);
         cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
         setArg(kk, 0, sizeof(dx), &dx);
         setArg(kk, 1, sizeof(dw), &dw);
