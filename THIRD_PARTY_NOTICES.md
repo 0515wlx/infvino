@@ -35,6 +35,24 @@ library is linked or required at build or run time — only source code was adap
   - The host-side blocked weight repack (`PlanModel::blkWeight`) and input reorder
     (`PlanModel::blkInput`) reproduce OpenVINO's `os_is_yx_isv16_osv16` /
     `b_fs_yx_fsv16` layouts.
+  - `kernels/conv1x1_blk.cl` — a self-contained adaptation of the data path of the
+    upstream `src/plugins/intel_gpu/src/kernel_selector/cl_kernels/convolution_gpu_bfyx_f16_1x1.cl`
+    (kernel `convolution_gpu_bfyx_f16_1x1`, selector
+    `ConvolutionKernel_b_fs_yx_fsv16_1x1`): sub-group lanes = 16 output channels,
+    blocked `b_fs_yx_fsv16` input/output, `os_is_yx_isv16_osv16` (1x1) weights via
+    `intel_sub_group_block_read_us8`, per-input vector `mad` over `X_BLOCK`
+    columns, optional `SLM_DIV_FACTOR` split-K. Upstream `#include` helper headers
+    and JIT macro layer replaced by local definitions; the `OUT_FSV16`
+    persistent-layout output, the `RES` residual epilogue and the infvino
+    activation codes are original. Host-side weight repack/verify in
+    `src/tools/kernel_bench.cpp` (`benchConv1x1Blk`).
+  - `kernels/depthwise_blk.cl` — a self-contained adaptation of the data path of the
+    upstream `src/plugins/intel_gpu/src/kernel_selector/cl_kernels/convolution_gpu_bfyx_f16_depthwise.cl`
+    (kernel `convolution_gpu_bfyx_f16_depthwise`): sub-group lanes = 16 output
+    channels, blocked `b_fs_yx_fsv16` input/output, `[C/16][K][K][16]` weights via
+    `intel_sub_group_block_read_us8`, per-row register line reused across the K
+    taps, optional split-K. Host-side weight repack in `PlanModel::blkDwWeight`,
+    bench in `benchDepthwiseBlk`.
 - **Copyright notice retained**: `Copyright (C) 2018-2026 Intel Corporation`.
 - **Modifications**: reduced to a single self-contained `.cl` file; added an
   infvino-specific fused activation/residual epilogue and a `RES` toggle; the

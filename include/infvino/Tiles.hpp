@@ -221,6 +221,100 @@ inline Conv1x1Cfg parseConv1x1(const std::string & s)
   return c;
 }
 
+/**
+ * @brief blocked (fsv16) 1x1 conv 配置（见 kernels/conv1x1_blk.cl）。
+ *
+ * 移植 OV `convolution_gpu_bfyx_f16_1x1`：lane=输出通道（16/块）、输入
+ * `b_fs_yx_fsv16`、权重 `os_is_yx_isv16_osv16`、每 lane 连续 XB 个输出列、
+ * 可选 SLM split-K。用于「pointwise 也走 blocked 布局」的算子族接入。
+ */
+struct Conv1x1BlkCfg
+{
+  int XB = 4;        // X_BLOCK：每 lane 连续输出列数（2/4/8）
+  int SLM_DIV = 1;   // split-K 拆分子组数（1=不拆）
+  int ACT = 0;       // 0=none 1=SiLU 2=ReLU 3=HardSwish 4=HardSigmoid 5=Sigmoid
+  int OUT_FSV16 = 0; // 1=输出 b_fs_yx_fsv16（接 blocked 链），0=bfyx
+  int RES = 0;       // 1=在激活后加残差（NCHW [Cout][H][W]）
+  int SG = 16;
+
+  std::string options() const
+  {
+    std::ostringstream o;
+    o << "-DX_BLOCK=" << XB << " -DSLM_DIV=" << SLM_DIV << " -DACT=" << ACT
+      << " -DOUT_FSV16=" << OUT_FSV16 << " -DRES=" << RES << " -DSG=" << SG
+      << " -cl-mad-enable -cl-fast-relaxed-math";
+    return o.str();
+  }
+  std::string label() const
+  {
+    std::ostringstream o;
+    o << "XB" << XB << " slm" << SLM_DIV << " act" << ACT
+      << (OUT_FSV16 ? " fsv16" : " bfyx") << (RES ? " res" : "");
+    return o.str();
+  }
+};
+
+/** @brief 解析 "XB,SLM_DIV[,ACT,OUT_FSV16[,RES]]"。 */
+inline Conv1x1BlkCfg parseConv1x1Blk(const std::string & s)
+{
+  Conv1x1BlkCfg c;
+  std::vector<int> v;
+  std::stringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) v.push_back(std::atoi(tok.c_str()));
+  if (v.size() > 0) c.XB = v[0];
+  if (v.size() > 1) c.SLM_DIV = v[1];
+  if (v.size() > 2) c.ACT = v[2];
+  if (v.size() > 3) c.OUT_FSV16 = v[3];
+  if (v.size() > 4) c.RES = v[4];
+  return c;
+}
+
+/**
+ * @brief blocked (fsv16) depthwise 配置（见 kernels/depthwise_blk.cl，移植 OV
+ *  `convolution_gpu_bfyx_f16_depthwise`）。
+ */
+struct DepthwiseBlkCfg
+{
+  int XB = 8;        // X_BLOCK：每 lane 连续输出列数（2/4/8）
+  int K = 3, S = 1, P = 1;
+  int ACT = 0;       // 1=SiLU 2=HardSwish 3=ReLU 4=HardSigmoid
+  int OUT_FSV16 = 0;
+  int SG = 16;
+
+  std::string options() const
+  {
+    std::ostringstream o;
+    o << "-DX_BLOCK=" << XB << " -DDWK=" << K << " -DSTRIDE=" << S << " -DPAD=" << P
+      << " -DACT=" << ACT << " -DOUT_FSV16=" << OUT_FSV16 << " -DSG=" << SG
+      << " -cl-mad-enable -cl-fast-relaxed-math";
+    return o.str();
+  }
+  std::string label() const
+  {
+    std::ostringstream o;
+    o << "XB" << XB << " K" << K << " s" << S << " p" << P << " act" << ACT
+      << (OUT_FSV16 ? " fsv16" : " bfyx");
+    return o.str();
+  }
+};
+
+inline DepthwiseBlkCfg parseDepthwiseBlk(const std::string & s)
+{
+  DepthwiseBlkCfg c;
+  std::vector<int> v;
+  std::stringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) v.push_back(std::atoi(tok.c_str()));
+  if (v.size() > 0) c.XB = v[0];
+  if (v.size() > 1) c.K = v[1];
+  if (v.size() > 2) c.S = v[2];
+  if (v.size() > 3) c.P = v[3];
+  if (v.size() > 4) c.ACT = v[4];
+  if (v.size() > 5) c.OUT_FSV16 = v[5];
+  return c;
+}
+
 /** @brief 解析 "TX,TY,TM,CB,CINC[,STRIDE,PAD,ACT,UNROLL_CI,VECC]"。 */
 inline Conv3x3Cfg parseConv(const std::string & s)
 {

@@ -678,6 +678,225 @@ int benchConv1x1Gemv(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, con
   return 0;
 }
 
+// Blocked (b_fs_yx_fsv16) 1x1 conv — port of OV `convolution_gpu_bfyx_f16_1x1`.
+// Lane=output channel, os_is_yx_isv16_osv16 weights, X_BLOCK output columns/lane.
+int benchConv1x1Blk(infvino::ClRuntime & rt, const infvino::Conv1x1BlkCfg & c,
+                    const ConvShape & s, int iters, bool verify)
+{
+  const int Cin = s.Cin, Cout = s.Cout, H = s.H, W = s.W, HW = H * W;
+  const std::string oo = c.options();
+  cl_kernel k;
+  try { k = rt.buildKernel("conv1x1_blk", "conv1x1_blk", oo); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+
+  const int ocb = (Cout + 15) / 16, icb = (Cin + 15) / 16;
+  std::vector<uint16_t> hW((size_t)Cout * Cin), hX((size_t)Cin * HW), hB((size_t)Cout),
+      hY((size_t)Cout * HW), hRes((size_t)Cout * HW);
+  std::mt19937 rngW(11), rngX(22), rngB(33);
+  std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
+  for (auto & v : hW) v = infvino::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = infvino::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = infvino::f32_to_f16(disB(rngB));
+  for (auto & v : hRes) v = infvino::f32_to_f16(disX(rngX));
+
+  // weights -> os_is_yx_isv16_osv16 [Cout/16][Cin/16][isv16][osv16]
+  std::vector<uint16_t> hWb((size_t)ocb * icb * 16 * 16, 0);
+  for (int oc = 0; oc < Cout; ++oc)
+    for (int ic = 0; ic < Cin; ++ic)
+      hWb[(((size_t)(oc / 16) * icb + (ic / 16)) * 16 + (ic % 16)) * 16 + (oc % 16)] =
+          hW[(size_t)oc * Cin + ic];
+  // input -> b_fs_yx_fsv16 [Cin/16][H][W][16]
+  std::vector<uint16_t> hXb((size_t)icb * HW * 16, 0);
+  for (int ch = 0; ch < Cin; ++ch)
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        hXb[(((size_t)(ch / 16) * H + y) * W + x) * 16 + (ch % 16)] =
+            hX[(size_t)ch * HW + y * W + x];
+
+  cl_mem dW = rt.alloc(hWb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dX = rt.alloc(hXb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
+  const size_t ybytes = c.OUT_FSV16 ? (size_t)ocb * HW * 16 * 2 : (size_t)Cout * HW * 2;
+  cl_mem dY = rt.alloc(ybytes, CL_MEM_READ_WRITE);
+  rt.write(dW, hWb.size() * 2, hWb.data());
+  rt.write(dX, hXb.size() * 2, hXb.data());
+  rt.write(dB, (size_t)Cout * 2, hB.data());
+
+  cl_mem dRes = nullptr;
+  if (c.RES) {
+    dRes = rt.alloc((size_t)Cout * HW * 2, CL_MEM_READ_ONLY);
+    rt.write(dRes, (size_t)Cout * HW * 2, hRes.data());
+  }
+
+  clSetKernelArg(k, 0, sizeof(dX), &dX);
+  clSetKernelArg(k, 1, sizeof(dW), &dW);
+  clSetKernelArg(k, 2, sizeof(dB), &dB);
+  clSetKernelArg(k, 3, sizeof(dY), &dY);
+  clSetKernelArg(k, 4, sizeof(dRes), &dRes);
+  int CinA = Cin, HA = H, WA = W, CoutA = Cout;
+  clSetKernelArg(k, 5, sizeof(CinA), &CinA);
+  clSetKernelArg(k, 6, sizeof(HA), &HA);
+  clSetKernelArg(k, 7, sizeof(WA), &WA);
+  clSetKernelArg(k, 8, sizeof(CoutA), &CoutA);
+
+  const size_t lws[3] = {1, static_cast<size_t>(16 * c.SLM_DIV), 1};
+  const size_t gws[3] = {
+    static_cast<size_t>(((W + c.XB - 1) / c.XB) * H),
+    static_cast<size_t>(((Cout + 15) / 16) * lws[1]), 1};
+  const double med = rt.timeMs(
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+  const double flops = 2.0 * Cout * Cin * (double)HW;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  conv1x1blk %-16s Cin=%-4d Cout=%-4d %dx%d XB%d slm%d  %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), Cin, Cout, H, W, c.XB, c.SLM_DIV, med,
+    flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+
+  if (verify) {
+    std::vector<uint16_t> raw((size_t)ocb * HW * 16);
+    rt.read(dY, std::min<size_t>(raw.size() * 2, ybytes), raw.data());
+    auto act = [&](double f) -> double {
+      switch (c.ACT) {
+        case 1: return f / (1.0 + std::exp(-f));
+        case 2: return std::max(f, 0.0);
+        case 3: return f * std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
+        case 4: return std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
+        case 5: return 1.0 / (1.0 + std::exp(-f));
+        default: return f;
+      }
+    };
+    double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    for (int oc = 0; oc < Cout; ++oc)
+      for (int n = 0; n < HW; ++n) {
+        float acc = infvino::f16_to_f32(hB[oc]);
+        for (int ic = 0; ic < Cin; ++ic)
+          acc += infvino::f16_to_f32(hW[(size_t)oc * Cin + ic]) * infvino::f16_to_f32(hX[(size_t)ic * HW + n]);
+        const size_t oidx = c.OUT_FSV16
+          ? ((((size_t)(oc / 16) * H + n / W) * W + n % W) * 16 + (oc % 16))
+          : ((size_t)oc * HW + n);
+        const double got = infvino::f16_to_f32(
+            raw[oidx]);  // raw is fsv16-sized; bfyx index still within it
+        const double r = act(acc) + (c.RES ? infvino::f16_to_f32(hRes[(size_t)oc * HW + n]) : 0.0);
+        const double d = std::fabs(got - r);
+        sumabs += d; sumref += std::fabs(r);
+        maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs(r));
+      }
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e",
+      sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dW); clReleaseMemObject(dX); clReleaseMemObject(dB);
+  clReleaseMemObject(dY); if (dRes) clReleaseMemObject(dRes); clReleaseKernel(k);
+  return 0;
+}
+
+// Blocked (b_fs_yx_fsv16) depthwise — port of OV `convolution_gpu_bfyx_f16_depthwise`.
+int benchDepthwiseBlk(infvino::ClRuntime & rt, const infvino::DepthwiseBlkCfg & c,
+                      const ConvShape & s, int iters, bool verify)
+{
+  const int C = s.Cin, H = s.H, W = s.W, K = c.K, S = c.S, P = c.P;
+  const int Ho = (H + 2 * P - K) / S + 1, Wo = (W + 2 * P - K) / S + 1;
+  cl_kernel k;
+  try { k = rt.buildKernel("depthwise_blk", "depthwise_blk", c.options()); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+
+  const int cb = (C + 15) / 16;
+  std::vector<uint16_t> hW((size_t)C * K * K), hX((size_t)C * H * W), hB((size_t)C),
+      hY((size_t)C * Ho * Wo);
+  std::mt19937 rngW(11), rngX(22), rngB(33);
+  std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
+  for (auto & v : hW) v = infvino::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = infvino::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = infvino::f32_to_f16(disB(rngB));
+
+  // weights -> [C/16][K][K][16]
+  std::vector<uint16_t> hWb((size_t)cb * K * K * 16, 0);
+  for (int ch = 0; ch < C; ++ch)
+    for (int kk = 0; kk < K * K; ++kk)
+      hWb[((size_t)(ch / 16) * K * K + kk) * 16 + (ch % 16)] = hW[(size_t)ch * K * K + kk];
+  // input -> [C/16][H][W][16]
+  std::vector<uint16_t> hXb((size_t)cb * H * W * 16, 0);
+  for (int ch = 0; ch < C; ++ch)
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        hXb[(((size_t)(ch / 16) * H + y) * W + x) * 16 + (ch % 16)] =
+            hX[((size_t)ch * H + y) * W + x];
+
+  const size_t ybytes = c.OUT_FSV16 ? (size_t)cb * Ho * Wo * 16 * 2 : (size_t)C * Ho * Wo * 2;
+  cl_mem dW = rt.alloc(hWb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dX = rt.alloc(hXb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dB = rt.alloc((size_t)C * 2, CL_MEM_READ_ONLY);
+  cl_mem dY = rt.alloc(ybytes, CL_MEM_READ_WRITE);
+  rt.write(dW, hWb.size() * 2, hWb.data());
+  rt.write(dX, hXb.size() * 2, hXb.data());
+  rt.write(dB, (size_t)C * 2, hB.data());
+
+  clSetKernelArg(k, 0, sizeof(dX), &dX);
+  clSetKernelArg(k, 1, sizeof(dW), &dW);
+  clSetKernelArg(k, 2, sizeof(dB), &dB);
+  clSetKernelArg(k, 3, sizeof(dY), &dY);
+  int CA = C, HA = H, WA = W, ho = Ho, wo = Wo;
+  clSetKernelArg(k, 4, sizeof(CA), &CA);
+  clSetKernelArg(k, 5, sizeof(HA), &HA);
+  clSetKernelArg(k, 6, sizeof(WA), &WA);
+  clSetKernelArg(k, 7, sizeof(ho), &ho);
+  clSetKernelArg(k, 8, sizeof(wo), &wo);
+
+  const size_t lws[3] = {1, 16, 1};
+  const size_t gws[3] = {static_cast<size_t>(((Wo + c.XB - 1) / c.XB) * Ho),
+                         static_cast<size_t>(((C + 15) / 16) * 16), 1};
+  const double med = rt.timeMs(
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+  const double flops = 2.0 * C * Ho * Wo * K * K;
+  const double ops = rt.opsPerEuCycle(flops, med);
+  std::printf(
+    "  depthwiseblk %-14s C=%-4d %dx%d K%d s%d  %8.3f ms  %7.1f GFLOP/s  "
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    s.label.c_str(), C, H, W, K, S, med, flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+
+  if (verify) {
+    std::vector<uint16_t> raw((size_t)cb * Ho * Wo * 16);
+    rt.read(dY, std::min<size_t>(raw.size() * 2, ybytes), raw.data());
+    auto act = [&](double f) -> double {
+      switch (c.ACT) {
+        case 1: return f / (1.0 + std::exp(-f));
+        case 2: return f * std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
+        case 3: return std::max(f, 0.0);
+        case 4: return std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
+        default: return f;
+      }
+    };
+    double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    for (int ch = 0; ch < C; ++ch)
+      for (int oy = 0; oy < Ho; ++oy)
+        for (int ox = 0; ox < Wo; ++ox) {
+          float acc = infvino::f16_to_f32(hB[ch]);
+          for (int kh = 0; kh < K; ++kh)
+            for (int kw = 0; kw < K; ++kw) {
+              const int yy = oy * S - P + kh, xx = ox * S - P + kw;
+              if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+                acc += infvino::f16_to_f32(hX[((size_t)ch * H + yy) * W + xx]) *
+                       infvino::f16_to_f32(hW[((size_t)ch * K + kh) * K + kw]);
+            }
+          const size_t oidx = c.OUT_FSV16
+            ? ((((size_t)(ch / 16) * Ho + oy) * Wo + ox) * 16 + (ch % 16))
+            : (((size_t)ch * Ho + oy) * Wo + ox);
+          const double got = infvino::f16_to_f32(raw[oidx]);
+          const double r = act(acc);
+          const double d = std::fabs(got - r);
+          sumabs += d; sumref += std::fabs(r);
+          maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs(r));
+        }
+    std::printf("  mean_rel=%.3e max_rel(amax)=%.3e max_abs=%.2e",
+      sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs);
+  }
+  std::printf("\n");
+  clReleaseMemObject(dW); clReleaseMemObject(dX); clReleaseMemObject(dB);
+  clReleaseMemObject(dY); clReleaseKernel(k);
+  return 0;
+}
+
 int benchBandwidth(infvino::ClRuntime & rt, size_t mb, int iters)
 {
   // 安全上限：iGPU 共享 host 内存，in+out=2x，再加 host 侧缓冲，过大直接 OOM/死机。
@@ -1016,6 +1235,8 @@ int main(int argc, char ** argv)
   infvino::Tiles tiles;
   infvino::Conv3x3Cfg conv;
   infvino::Conv1x1Cfg c1x1;
+  infvino::Conv1x1BlkCfg c1x1blk;
+  infvino::DepthwiseBlkCfg dwblk;
   std::vector<ConvShape> conv_shapes;
   std::vector<Shape> shapes;
   int iters = 100;
@@ -1048,6 +1269,10 @@ int main(int argc, char ** argv)
       conv = infvino::parseConv(next());
     } else if (a == "--conv1x1") {
       c1x1 = infvino::parseConv1x1(next());
+    } else if (a == "--conv1x1blk") {
+      c1x1blk = infvino::parseConv1x1Blk(next());
+    } else if (a == "--depthwiseblk") {
+      dwblk = infvino::parseDepthwiseBlk(next());
     } else if (a == "--conv-shape") {
       auto v = parseInts(next());
       if (v.size() != 4) { std::fprintf(stderr, "--conv-shape needs Cin,Cout,H,W\n"); return 2; }
@@ -1114,6 +1339,18 @@ int main(int argc, char ** argv)
   } else if (op == "conv1x1g") {    std::printf("[conv1x1g] gemv %s\n", c1x1.label().c_str());
     if (conv_shapes.empty()) conv_shapes = {{576, 1024, 1, 1, "fc"}, {1024, 1000, 1, 1, "cls"}};
     for (const auto & s : conv_shapes) rc |= benchConv1x1Gemv(rt, c1x1, s, iters, verify);
+  } else if (op == "conv1x1blk") {
+    std::printf("[conv1x1blk] fsv16 %s\n", c1x1blk.label().c_str());
+    if (conv_shapes.empty())
+      conv_shapes = {{576, 96, 7, 7, "mb-exp"}, {96, 576, 7, 7, "mb-proj"},
+                     {240, 40, 14, 14, "mb"}, {64, 64, 80, 80, "big"}};
+    for (const auto & s : conv_shapes) rc |= benchConv1x1Blk(rt, c1x1blk, s, iters, verify);
+  } else if (op == "depthwiseblk") {
+    std::printf("[depthwiseblk] fsv16 %s\n", dwblk.label().c_str());
+    if (conv_shapes.empty())
+      conv_shapes = {{16, 16, 112, 112, "mb-s2"}, {96, 96, 56, 56, "mb"},
+                     {240, 240, 28, 28, "mb"}, {576, 576, 14, 14, "mb"}};
+    for (const auto & s : conv_shapes) rc |= benchDepthwiseBlk(rt, dwblk, s, iters, verify);
   } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov" || op == "conv3x3blk") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;
