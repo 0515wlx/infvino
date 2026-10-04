@@ -218,6 +218,25 @@ private:
    *  把「生产者是 blocked conv 且所有消费者也是 blocked conv」的激活张量标记为
    *  fsv16，使 blocked 链内零 reorder。`INFVINO_NO_BLOCK_LAYOUT=1` 关闭。 */
   void    planBlockedLayout();
+  /**
+   * @brief R38: 联合 (族, 布局) 选择不动点。
+   *
+   * 单看 kernel ms 选 conv3x3_blk 会忽略「它强制给输入做 bfyx→fsv16 重排」的成本，
+   * 而重排是否发生又取决于布局（生产者是否同链、消费者是否全是 blocked）——是自指。
+   * autotune 会把每个 sig 的 **两个备选** 写进缓存：`sig#blk` / `sig#non`，以及该输入的
+   * 一次重排实测 `sig#reorder`。本函数在**计划期**迭代：
+   *   1) 按当前 per-node 选择跑 planBlockedLayout；
+   *   2) 每个 conv3x3 节点取 `cost(blk)=#blk.ms + (输入是否已 fsv16 ? 0 : #reorder.ms)`、
+   *      `cost(non)=#non.ms`，选小者；
+   *   直到稳定。结果写 `node_choice_`，dispatch/布局/`convWillUseBlk` 一致消费。
+   *
+   * 缓存里没有 `#blk/#non` 时退化为一次 `planBlockedLayout()`（与 R36 行为一致）。
+   * 因为不动点按**每个 plan 的图**跑，同一 sig 在 y8/y11 可得到不同选择——这解决了
+   * 「sig-cache 跨模型共享、无法区分布局」的问题。
+   */
+  void    resolveLayoutChoices();
+  /** @brief R38: per-node 覆盖（不动点结果），未命中则回退到签名缓存。 */
+  const TuningEntry * choiceEntry(size_t ni, const OpSignature & sig) const;
   /** @brief R36: 该 conv3x3 节点是否会被纳入 blocked 通路（与 dispatch 同判据）。 */
   bool    convWillUseBlk(const Node & n) const;
   /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
@@ -324,6 +343,9 @@ private:
   std::vector<std::string>               act_names_;   // P0: activation tensors in the pool
   std::vector<cl_mem>                    alias_subs_;  // P0: sub-buffers for sliced aliases
   std::vector<char>                      node_skipped_;  // P0: per-node "alias, don't launch"
+  // R38: per-node resolved (family, layout) choice from the joint fixpoint. Empty kernel
+  // = no override (fall back to the signature cache).
+  std::vector<TuningEntry>               node_choice_;
   // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;

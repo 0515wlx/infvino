@@ -69,9 +69,10 @@ PlanModel::PlanModel(
   tuning_ = TuningCache::loadDefault();
   tuning_.setDeviceId(TuningCache::deviceKey(rt_.info()));
 
-  // R36 (P1-layout): 布局规划必须在 tuning 载入之后（决策由 autotune 选出的 kernel
-  // 驱动）、首次 run() 之前（P2 dispatch 缓存会录制参数）。只在计划期跑一次。
-  planBlockedLayout();
+  // R36/R38: 布局与 (族,布局) 选择必须在 tuning 载入之后、首次 run() 之前（P2 dispatch
+  // 缓存会录制参数）。resolveLayoutChoices() 在缓存含 `#blk/#non` 时跑联合不动点，
+  // 否则退化为一次 planBlockedLayout()。
+  resolveLayoutChoices();
 
   // P3: 在线调优（opt-in）。默认关闭——开发板上跑长 GPU 任务有风险，部署端若要
   // 自适应再显式打开 `INFVINO_TUNING=online`（需要 profiling=true 才能计时）。
@@ -866,7 +867,9 @@ bool PlanModel::convWillUseBlk(const Node & n) const
   const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
   const bool dres = n.ins.size() > 3 && n.ins[3] != "-";
   const OpSignature tsig = OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
-  const TuningEntry * te = tuning_.lookup(tsig);
+  // R38: prefer the per-node joint-fixpoint choice; else the signature cache.
+  const size_t ni = static_cast<size_t>(&n - nodes_.data());
+  const TuningEntry * te = choiceEntry(ni, tsig);
   // R33: 带残差的 conv3x3 只有 conv3x3_ov 支持 RES；非 ov 命中会被绕回。
   if (dres && te && te->kernel != "conv3x3_ov") te = nullptr;
   if (te && te->kernel == "conv3x3_blk") return true;
@@ -959,6 +962,77 @@ void PlanModel::planBlockedLayout()
   if (std::getenv("INFVINO_LAYOUT_REPORT"))
     std::fprintf(stderr, "[layout] fsv16 tensors: %d (family-driven persistent block layout)\n",
                  marked);
+}
+
+const TuningEntry * PlanModel::choiceEntry(size_t ni, const OpSignature & sig) const
+{
+  if (ni < node_choice_.size() && !node_choice_[ni].kernel.empty()) return &node_choice_[ni];
+  return tuning_.lookup(sig);
+}
+
+void PlanModel::resolveLayoutChoices()
+{
+  node_choice_.assign(nodes_.size(), {});
+  // Only conv3x3 has the blk/non-blk reorder dichotomy today; other families keep the
+  // plain signature-cache choice (their conservative billing lives in Autotuner).
+  struct Alt { TuningEntry blk, non, reorder; bool has = false; };
+  std::vector<Alt> alt(nodes_.size());
+  bool any = false;
+  for (size_t ni = 0; ni < nodes_.size(); ++ni)
+  {
+    bool ok = false;
+    const OpSignature sig = nodeSignature(nodes_[ni], &ok);
+    if (!ok || sig.op != "conv3x3") continue;
+    const TuningEntry * b = tuning_.lookup(OpSignature::custom(sig.str() + "#blk", {}));
+    const TuningEntry * n = tuning_.lookup(OpSignature::custom(sig.str() + "#non", {}));
+    if (!b || !n) continue;
+    alt[ni].blk = *b;
+    alt[ni].non = *n;
+    if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(sig.str() + "#reorder", {})))
+      alt[ni].reorder = *r;
+    alt[ni].has = true;
+    any = true;
+  }
+  if (!any)
+  {
+    planBlockedLayout();  // R36 behavior
+    return;
+  }
+
+  const int kIters = 4;
+  for (int it = 0; it < kIters; ++it)
+  {
+    planBlockedLayout();
+    bool changed = false;
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      if (!alt[ni].has) continue;
+      const Node & n = nodes_[ni];
+      // Is this node's input already persisted fsv16 (reorder free)?
+      bool in_fsv16 = false;
+      if (!n.ins.empty())
+      {
+        auto xit = T_.find(n.ins[0]);
+        if (xit != T_.end()) in_fsv16 = xit->second.fsv16;
+      }
+      double blkCost = alt[ni].blk.ms + (in_fsv16 ? 0.0 : alt[ni].reorder.ms);
+      const TuningEntry & want = (blkCost <= alt[ni].non.ms) ? alt[ni].blk : alt[ni].non;
+      if (node_choice_[ni].kernel != want.kernel || node_choice_[ni].options != want.options)
+      {
+        node_choice_[ni] = want;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  planBlockedLayout();  // final layout consistent with node_choice_
+  if (std::getenv("INFVINO_LAYOUT_REPORT"))
+  {
+    int nblk = 0;
+    for (const auto & c : node_choice_) if (c.kernel == "conv3x3_blk") ++nblk;
+    std::fprintf(stderr, "[layout] joint fixpoint: %d conv3x3 nodes, %d -> blk\n",
+                 static_cast<int>(node_choice_.size()), nblk);
+  }
 }
 
 void PlanModel::buildKernels()
@@ -2253,7 +2327,9 @@ void PlanModel::run()
       // 数值与 kernel 语义不变，只改「选哪个 kernel/config」。
       const OpSignature tsig =
         OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
-      const TuningEntry * te = tuning_.lookup(tsig);
+      // R38: per-node joint-fixpoint choice (blk vs non-blk with layout-exact reorder),
+      // falling back to the signature cache.
+      const TuningEntry * te = choiceEntry(ni, tsig);
       // R33: 带残差的 conv3x3 只有 conv3x3_ov 支持 RES；native/blk 不支持 → 绕回调优走 ov。
       if (dres && te && te->kernel != "conv3x3_ov") te = nullptr;
 
@@ -3054,7 +3130,50 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         };
       };
 
-      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      // R38: bench the blk and non-blk groups separately so the plan-time joint fixpoint
+      // (resolveLayoutChoices) has both alternatives plus this input's reorder cost.
+      std::vector<Candidate> cBlk, cNon;
+      for (const auto & c : cands)
+        (c.kernel == "conv3x3_blk" ? cBlk : cNon).push_back(c);
+      TuningEntry en = autotuneOp(rt_, sig, cNon, makeEnqueue, flops, iters);
+      TuningEntry eb = cBlk.empty() ? TuningEntry()
+                                    : autotuneOp(rt_, sig, cBlk, makeEnqueue, flops, iters);
+      TuningEntry e = en;
+      if (!eb.kernel.empty() && (en.kernel.empty() || eb.ms < en.ms)) e = eb;
+      if (merge && !eb.kernel.empty())
+      {
+        // Measure one bfyx->fsv16 reorder for this node's input (the cost the blk
+        // alternative incurs when the input is NOT persisted fsv16).
+        double reorderMs = 0.0;
+        {
+          Tensor & xt = ref(n.ins[0]);
+          const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
+          cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+          cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+          cl_mem xm = xt.mem;
+          setArg(kr, 0, sizeof(xm), &xm);
+          setArg(kr, 1, sizeof(scratch), &scratch);
+          setArg(kr, 2, sizeof(Cin), &Cin);
+          setArg(kr, 3, sizeof(H), &H);
+          setArg(kr, 4, sizeof(W), &W);
+          const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                                static_cast<size_t>(Cin)};
+          std::function<cl_event()> renq = [this, kr, rg]() {
+            return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+          };
+          benchCandidate(rt_, renq, iters, &reorderMs);
+          clReleaseMemObject(scratch);
+        }
+        tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
+        TuningEntry er;
+        er.kernel = "reorder_bfyx_to_fsv16";
+        er.ms = reorderMs;
+        er.device_id = eb.device_id;
+        er.source = "tuned";
+        tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
+        if (!en.kernel.empty())
+          tuning_.put(OpSignature::custom(sig.str() + "#non", {}), en);
+      }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
         ++n_tuned;
@@ -3573,7 +3692,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
   }
 
   // tuning 改变后同步布局（联合选择的一步：布局契约随选中的族变化）。
-  if (n_tuned > 0) planBlockedLayout();
+  if (n_tuned > 0) resolveLayoutChoices();
   return done;
 }
 
