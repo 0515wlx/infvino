@@ -167,6 +167,11 @@ P0 发现「内存池对墙钟的收益 > GPU busy」，于是 P2 先量化墙�
   `MEMORY_CHANGED`）；③ out-of-order 队列 + event 依赖（需先确认 Intel 驱动行为）；
   ④ `createSession()` 多 Session 并行缓冲（后端当前用 mutex 串行）。
 
+> **R35 负结果**：想用 OpenCL command buffer 把整帧录成一次重放（CUDA-graph 类比）来
+> 一次性抹掉上面两块 host 开销，实测不可行——本机在新旧 Intel runtime 上都不暴露
+> `cl_khr_command_buffer`，且上游录制入口尚未实现。详见
+> [`command-buffer.md`](command-buffer.md)。
+
 ## 3. 复现
 
 ```bash

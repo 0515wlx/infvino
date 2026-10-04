@@ -140,6 +140,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/kernel.md`](docs/kernel.md) | 自研 kernel 优化日志与 ops/EU/cyc |
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
 | [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
+| [`docs/command-buffer.md`](docs/command-buffer.md) | **`cl_khr_command_buffer` 可行性实测**：最新 26.35 runtime 仍不可用（LEO 门控 + 录制入口未实现）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |
 | [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
@@ -256,6 +257,12 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > **R34**：CINC 泛化到小 `Cin`（精确 `CINC=Cin`），stem `320×320 s2 3→16` **2.97→3.56（+20%）**；
 > 同时复核主导层 `40×40/80×80 C64` 已触顶（`OBW=10/12`、`kd` unroll 均无收益）。
 > 详见 [`docs/round33-conv3x3-headroom.md`](docs/round33-conv3x3-headroom.md)。
+>
+> **R35（command buffer，负结果）**：CUDA-graph 类比（一次录制整帧、每帧重放）实测**不可行**——
+> dev 镜像的 23.17 与最新 **26.35.39758.10**（需 Ubuntu 24.04）在本机都不暴露
+> `cl_khr_command_buffer`；上游实现本身也**只完成一半**（无 `clCommandNDRangeKernelKHR`
+> 等录制入口，且仅在实验性 LEO 驱动、默认关闭）。见
+> [`docs/command-buffer.md`](docs/command-buffer.md)。
 
 ## 状态
 
