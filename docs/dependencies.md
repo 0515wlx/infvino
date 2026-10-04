@@ -43,13 +43,17 @@ apt 源解析，不在仓库里硬编码：
 docker build -f docker/Dockerfile -t infvino-dev:latest .
 ```
 
-镜像内含 OpenCV / OpenCL 头文件与 loader / yaml-cpp / cmake / g++ 以及 Intel GPU
-计算运行时（OpenCL + Level-Zero，版本由 Intel 官方 apt 源解析，不硬编码）。
-可用 `--image <your-image>` 指向自备镜像，只要满足第 1 节依赖即可。
+镜像内含 OpenCV / OpenCL 头文件与 loader / yaml-cpp / cmake / g++ / git 以及 Intel GPU
+计算运行时（OpenCL + Level-Zero，版本由 Intel 官方 apt 源解析，不硬编码），并额外把
+`requirements-dev.txt` 里的 Python 开发/测试工具（numpy / onnx / onnxruntime /
+opencv-python / PyYAML / packaging）装进镜像。因此**构建与测试可完全在容器内进行**，
+不依赖宿主工具链。可用 `--image <your-image>` 指向自备镜像，只要满足第 1 节依赖即可。
 
-## 4. Python 工具依赖（仅开发机，不入运行时）
+## 4. Python 工具依赖（仅开发/测试，不入运行时）
 
-依赖清单固定在仓库根目录的 requirements 文件中（版本已锁定）：
+依赖清单固定在仓库根目录的 requirements 文件中（版本已锁定）。
+`requirements-dev.txt` 已由 dev 镜像内置（见 §3），宿主 venv 仅在需要**直接在宿主**跑
+脚本时才用：
 
 | 文件 | 用途 |
 |---|---|
@@ -86,9 +90,10 @@ clinfo -l                       # 期望出现 Intel(R) OpenCL Graphics / Iris X
 ls /dev/dri                     # renderD128
 
 # 容器内
-cmake --version && g++ --version
+cmake --version && g++ --version && git --version
 ls /usr/include/CL/cl.h
 pkg-config --modversion opencv4 # 若装了 pkg-config
+python3 -c "import numpy, onnx, onnxruntime, cv2, yaml; print('py tools ok')"
 ```
 
 ## 6. 评审清单

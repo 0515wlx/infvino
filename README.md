@@ -60,8 +60,11 @@ docs/                                          # 架构、基准、kernel 优化
 >
 > ```bash
 > docker build -f docker/Dockerfile -t infvino-dev:latest .
-> python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
 > ```
+>
+> `infvino-dev` 镜像已自带完整工具链（cmake / g++ / git / OpenCV / OpenCL / yaml-cpp +
+> `requirements-dev.txt` 的 Python 测试工具），构建与测试可全在容器内完成。若要在**宿主**
+> 直接跑 Python 工具，再建 venv：`python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt`。
 
 ## 构建
 
