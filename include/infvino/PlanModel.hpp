@@ -157,12 +157,17 @@ public:
    * @param topK   每个签名参与回验的候选上限（按隔离 ms 取前 K，默认 3）。
    * @param rounds 坐标下降轮数上限（默认 3）。
    * @param limit  最多回验的签名数（0 = 不限；安全分批用）。
+   * @param margin 隔离 margin 剪枝：剪掉 `iso_ms > best_iso*(1+margin)` 的候选（默认 **0** =
+   *               不剪）。⚠️ 隔离名次并不预测整网名次（R43：隔离更慢的 blk 可能整网更快），
+   *               激进的 margin 会把「隔离慢、流水线快」的候选剪掉、重蹈局部最优。只有在
+   *               候选极多且明确接受此风险时才设 >0。
+   * @param budget 整网测量次数总预算（0 = 不限）；耗尽即停（抗组合爆炸 / GPU 风险）。
    * @return 实际改变选择的签名数。
    *
    * 需要 profiling=true（否则测不到逐 kernel event 时间）与可运行的整网输入。
    */
   int globalRetune(const std::vector<std::string> & ops = {}, int iters = 0, int topK = 3,
-                   int rounds = 3, int limit = 0);
+                   int rounds = 3, int limit = 0, double margin = 0.0, int budget = 0);
 
   /**
    * @brief P3 在线调优：对缓存里尚未命中的签名，按顺序在线 benchmark 至多 `budget`

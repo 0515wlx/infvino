@@ -68,13 +68,15 @@ TuningEntry autotuneOp(
   };
 
   const bool dbg = std::getenv("INFVINO_AUTOTUNE_DEBUG") != nullptr;
-  // R42 anti-noise: instability is dominated by the LLC->DRAM cliff (working set
-  // straddling the 3.75 MB L3). We (a) select on min, (b) flag candidates whose
-  // p90/min spread is high, (c) re-confirm the winner with more iterations and, if
-  // the two measurements disagree, take the smaller and warn.
+  // R45 P2#8: select on min, then **re-measure the top-K** at the end of the sweep.
+  // Sequential scanning suffers from thermal drift (earlier candidates measured in a
+  // cooler state); re-measuring the top-K in the then-current state and taking the min
+  // removes most of that systematic bias (R42 §3.3). We also warn on high spread.
   const double kSpreadWarn = 0.15;   // 15% (p90/min − 1)
-  const Candidate * bestCand = nullptr;
   int noisy = 0;
+  int skipped = 0;   // R45 P1#11: build/bench 失败的候选数（静默缩小候选集）
+  struct Measured { TuningEntry e; const Candidate * c; };
+  std::vector<Measured> all;
   if (dbg)
     std::fprintf(stderr, "[autotune] %s: %zu candidates\n", sig.str().c_str(), cands.size());
   for (const auto & c : cands) {
@@ -85,6 +87,7 @@ TuningEntry autotuneOp(
       if (dbg)
         std::fprintf(stderr, "  [skip] %-18s %-16s makeEnqueue: %s\n", c.kernel.c_str(),
                      c.config.c_str(), e.what());
+      ++skipped;
       continue;  // build 失败（资源/编译）→ 跳过
     }
     double ms = 0, sp = 0;
@@ -92,64 +95,85 @@ TuningEntry autotuneOp(
       if (dbg)
         std::fprintf(stderr, "  [skip] %-18s %-16s bench failed\n", c.kernel.c_str(),
                      c.config.c_str());
+      ++skipped;
       continue;
     }
     if (sp > kSpreadWarn) ++noisy;
-    const double ops = rt.opsPerEuCycle(flops, ms);
+    TuningEntry me;
+    me.kernel = c.kernel;
+    me.config = c.config;
+    me.options = c.options;
+    me.ms = ms;
+    me.ops = rt.opsPerEuCycle(flops, ms);
+    me.iters = iters;
+    me.device_id = best.device_id;
+    me.source = "candidate";
     if (dbg)
       std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f  spread=%+.0f%%\n",
-                   c.kernel.c_str(), c.options.c_str(), ms, ops, sp * 100.0);
-    if (measured)
+                   c.kernel.c_str(), c.options.c_str(), ms, me.ops, sp * 100.0);
+    all.push_back({std::move(me), &c});
+  }
+
+  // Re-measure top-K at the current thermal point (take min over both measurements).
+  {
+    std::stable_sort(all.begin(), all.end(),
+                     [](const Measured & a, const Measured & b) { return a.e.ms < b.e.ms; });
+    const int K = std::min<int>(3, static_cast<int>(all.size()));
+    const int iters2 = std::max(iters, 8);
+    double winnerSpread = 0.0;
+    for (int i = 0; i < K; ++i)
     {
-      TuningEntry me;
-      me.kernel = c.kernel;
-      me.config = c.config;
-      me.options = c.options;
-      me.ms = ms;
-      me.ops = ops;
-      me.iters = iters;
-      me.device_id = best.device_id;
-      me.source = "candidate";
-      measured->push_back(std::move(me));
-    }
-    if (best.kernel.empty() || ms < best.ms) {
-      best.kernel = c.kernel;
-      best.config = c.config;
-      best.options = c.options;
-      best.ms = ms;
-      best.ops = ops;
-      bestCand = &c;
-    }
-  }
-  // Confirmation pass: same-condition disagreement on the winner -> warn + keep min.
-  if (bestCand) {
-    try {
-      auto enq2 = makeEnqueue(*bestCand);
-      double ms2 = 0, sp2 = 0;
-      const int iters2 = (iters < 8 ? 8 : iters) * 3;
-      if (benchCandidate(rt, enq2, iters2, &ms2, &sp2)) {
-        if (ms2 < best.ms) {
-          best.ms = ms2;
-          best.ops = rt.opsPerEuCycle(flops, ms2);
+      try
+      {
+        auto enq2 = makeEnqueue(*all[i].c);
+        double ms2 = 0, sp2 = 0;
+        if (benchCandidate(rt, enq2, iters2, &ms2, &sp2))
+        {
+          if (ms2 < all[i].e.ms)
+          {
+            all[i].e.ms = ms2;
+            all[i].e.ops = rt.opsPerEuCycle(flops, ms2);
+          }
+          if (i == 0) winnerSpread = sp2;
         }
-        if (sp2 > kSpreadWarn)
-          std::fprintf(stderr,
-            "[autotune] WARN %s: winner %s unstable (spread %.0f%%); result may be "
-            "LLC/DRAM-noise limited — rerun (scripts/gpu_clocks.sh lock) or isolate.\n",
-            sig.str().c_str(), best.kernel.c_str(), sp2 * 100.0);
       }
-    } catch (const std::exception &) {}
+      catch (const std::exception &) {}
+    }
+    if (all.empty()) { /* nothing measured */ }
+    else
+    {
+      std::stable_sort(all.begin(), all.end(),
+                       [](const Measured & a, const Measured & b) { return a.e.ms < b.e.ms; });
+      best.kernel = all[0].e.kernel;
+      best.config = all[0].e.config;
+      best.options = all[0].e.options;
+      best.ms = all[0].e.ms;
+      best.ops = all[0].e.ops;
+    }
+    if (winnerSpread > kSpreadWarn && !best.kernel.empty())
+      std::fprintf(stderr,
+        "[autotune] WARN %s: winner %s unstable (spread %.0f%%); result may be "
+        "LLC/DRAM-noise limited — rerun (scripts/gpu_clocks.sh lock) or isolate.\n",
+        sig.str().c_str(), best.kernel.c_str(), winnerSpread * 100.0);
   }
+
   if (noisy > 0 &&
       noisy >= std::max<int>(2, static_cast<int>(cands.size() / 10)))
     std::fprintf(stderr,
       "[autotune] WARN %s: %d/%zu candidates unstable (spread>%.0f%%) — likely LLC "
       "spill/DRAM contention.\n",
       sig.str().c_str(), noisy, cands.size(), kSpreadWarn * 100.0);
+  // R45 P1#11: 候选静默跳过会缩小搜索空间（R37 曾因此丢掉 SLM 候选）。>20% 即可疑。
+  if (skipped > 0 && skipped * 5 >= static_cast<int>(cands.size()))
+    std::fprintf(stderr,
+      "[autotune] WARN %s: %d/%zu candidates skipped (build/enqueue failed) — candidate "
+      "set may be silently reduced; check geometry/parse.\n",
+      sig.str().c_str(), skipped, cands.size());
   if (!best.kernel.empty()) applyStandard(best);
-  if (measured && !measured->empty())
+  if (measured)
   {
-    for (auto & me : *measured) applyStandard(me);
+    measured->clear();
+    for (auto & m : all) { applyStandard(m.e); measured->push_back(m.e); }
     std::stable_sort(measured->begin(), measured->end(),
                      [](const TuningEntry & a, const TuningEntry & b) { return a.ms < b.ms; });
   }

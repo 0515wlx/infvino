@@ -327,6 +327,31 @@ cl_kernel ClRuntime::buildKernel(
   return k;
 }
 
+std::string ClRuntime::sourceHash(const std::string & source_name)
+{
+  auto sit = sources_.find(source_name);
+  if (sit == sources_.end())
+    sit = sources_.emplace(source_name, readFile(kernel_dir_ + "/" + source_name + ".cl")).first;
+  return hex64(fnv1a64(sit->second));
+}
+
+std::string ClRuntime::sourcesHash(const std::vector<std::string> & source_names)
+{
+  std::vector<std::string> ns = source_names;
+  std::sort(ns.begin(), ns.end());
+  ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
+  std::string all;
+  for (const auto & n : ns)
+  {
+    if (n.empty()) continue;
+    all += n;
+    all.push_back('\0');
+    all += sourceHash(n);
+    all.push_back('\n');
+  }
+  return hex64(fnv1a64(all));
+}
+
 cl_mem ClRuntime::alloc(size_t bytes, cl_mem_flags flags)
 {
   cl_int err;

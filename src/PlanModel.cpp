@@ -48,6 +48,8 @@ std::string dirName(const std::string & path)
 }
 }  // namespace
 
+namespace { std::string sourceOfKernel(const std::string & kernel); }  // fwd (defined below)
+
 PlanModel::PlanModel(
   const std::string & plan_path, const std::string & kernel_dir, int platform, int device_index,
   bool profiling)
@@ -83,6 +85,39 @@ PlanModel::PlanModel(
         std::fprintf(stderr, "[plan-tuning] %s: %zu override(s), device=%s%s\n", path.c_str(),
                      plan_overrides_.size(), plan_overrides_.deviceId().c_str(),
                      plan_overrides_.enabled() ? "" : " (disabled)");
+    }
+  }
+
+  // R45 P1#7: 数值/编译契约守卫。缓存记录生成时的 kernel 源组合指纹；当前源码与之不符时，
+  // 旧 options / 旧 cache_abi 可能语义失配（R39 的 SLM 数值 bug 就是「缓存不知道 kernel 已改」
+  // 这类）。默认告警；INFVINO_TUNING_STRICT=1 时整份作废（回退启发式，强制 retune）。
+  {
+    std::vector<std::string> srcs;
+    auto collectSrc = [&](const TuningCache & c) {
+      for (const auto & kv : c.entries())
+        if (!kv.second.kernel.empty()) srcs.push_back(sourceOfKernel(kv.second.kernel));
+    };
+    collectSrc(tuning_);
+    collectSrc(plan_overrides_);
+    if (!srcs.empty())
+    {
+      const std::string h = rt_.sourcesHash(srcs);
+      const bool strict = std::getenv("INFVINO_TUNING_STRICT") != nullptr;
+      auto guard = [&](TuningCache & c, const char * what) {
+        if (c.size() == 0) return;
+        const std::string old = c.sourceHash();
+        if (!old.empty() && old != h)
+        {
+          std::fprintf(stderr,
+                       "[tuning] %s kernel_src_hash changed (%s -> %s): %s\n", what, old.c_str(),
+                       h.c_str(), strict ? "invalidating (INFVINO_TUNING_STRICT)"
+                                         : "options may be stale; retune recommended");
+          if (strict) c.setEnabled(false);
+        }
+        c.setSourceHash(h);  // 保存时写入当前指纹
+      };
+      guard(tuning_, "config");
+      guard(plan_overrides_, "plan");
     }
   }
 
@@ -1854,9 +1889,11 @@ std::string sourceOfKernel(const std::string & kernel)
   if (kernel == "conv3x3_f16" || kernel == "conv3x3_rt" || kernel == "conv3x3_db") return "conv";
   if (kernel == "conv3x3_sg") return "conv_sg";
   if (kernel == "conv3x3_osv") return "conv_osv";
+  if (kernel == "conv3x3_blk" || kernel == "reorder_bfyx_to_fsv16") return "conv_blk";
   if (kernel == "gemm_f16") return "gemm";
   if (kernel == "gemm_sk_f16") return "gemm_sk";
   if (kernel == "conv1x1_gemv_f16" || kernel == "conv1x1_f16") return "conv1x1";
+  if (kernel == "conv1x1_blk") return "conv1x1_blk";
   if (kernel == "depthwise_f16" || kernel == "depthwise_v" || kernel == "depthwise_vp" ||
       kernel == "depthwise_pad" || kernel == "conv_general") return "conv_general";
   if (kernel == "depthwise_blk") return "depthwise_blk";
@@ -3819,7 +3856,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
 // R44: 整网 busy 坐标下降回验（修正「隔离 min ≠ 全局最优」）
 // ---------------------------------------------------------------------------
 int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int topK, int rounds,
-                            int limit)
+                            int limit, double margin, int budget)
 {
   if (!profiling_)
   {
@@ -3834,7 +3871,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   if (topK < 1) topK = 1;
   if (rounds < 1) rounds = 1;
   const int reps = (iters > 0) ? iters : 3;   // 每个 assignment 的整网测量次数（取 min busy）
-  const double kMinGain = 0.005;              // 至少 0.5% 整网 busy 改善才接受
+  const double kMinGain = 0.01;               // R45 P2#8: 噪声地板 1%（noise_check 典型 ~1.5%）
 
   auto opWanted = [&](const std::string & op) {
     // R45：所有 autotune 处理的族在 run() 里都已统一走 choiceEntry（per-node 覆盖），
@@ -3859,6 +3896,15 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     if (nodes.empty()) continue;
     std::stable_sort(cs.cands.begin(), cs.cands.end(),
                      [](const TuningEntry & a, const TuningEntry & b) { return a.ms < b.ms; });
+    // R45 P2#8: margin 剪枝 —— 隔离期就明显更慢的候选不可能在整网里翻盘（同一布局/耦合），
+    // 直接剔除，缩小「组合爆炸」的搜索空间。
+    if (margin > 0.0 && !cs.cands.empty())
+    {
+      const double cut = cs.cands[0].ms * (1.0 + margin);
+      size_t keep = 1;
+      while (keep < cs.cands.size() && cs.cands[keep].ms <= cut) ++keep;
+      cs.cands.resize(keep);
+    }
     if (static_cast<int>(cs.cands.size()) > topK) cs.cands.resize(static_cast<size_t>(topK));
     Target t;
     t.cs = cs;
@@ -3885,12 +3931,16 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       else if (const TuningEntry * b = tuning_.lookup(t.cs.sig)) assign[ni] = *b;
     }
 
-  auto busyFor = [&](const std::vector<size_t> & nodes, const TuningEntry & e) -> double {
+  int evals = 0;   // 整网测量次数（预算控制）
+  auto busyFor = [&](const std::vector<size_t> & nodes, const TuningEntry & e,
+                     double * spread) -> double {
+    if (spread) *spread = 0.0;
     for (size_t ni : nodes) assign[ni] = e;
     node_choice_ = assign;
     invalidateCapture();
     planBlockedLayout();   // 只重规划布局，不覆盖 assign
-    double best = 1e300;
+    ++evals;
+    double best = 1e300, worst = 0.0;
     try
     {
       for (int r = 0; r <= reps; ++r)
@@ -3899,7 +3949,11 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         run();
         if (r == 0) continue;  // 第 1 次是 capture/热身
         const double b = profile().busy_ms;
-        if (b > 0.0 && b < best) best = b;
+        if (b > 0.0)
+        {
+          if (b < best) best = b;
+          if (b > worst) worst = b;
+        }
       }
     }
     catch (const std::exception & ex)
@@ -3910,6 +3964,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
                      ex.what());
       return 1e300;
     }
+    if (spread && best > 0.0 && best < 1e299) *spread = (worst - best) / best;
     return best;
   };
 
@@ -3928,21 +3983,33 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   };
 
   std::vector<char> won(targets.size(), 0);
+  bool budgetHit = false;
   for (int round = 0; round < rounds; ++round)
   {
     int changed = 0;
     for (size_t ti = 0; ti < targets.size(); ++ti)
     {
+      if (budget > 0 && evals >= budget) { budgetHit = true; break; }
       auto & t = targets[ti];
       if (t.nodes.empty()) continue;
       const TuningEntry base = assign[t.nodes[0]];
       TuningEntry bestE = base;
-      double bestBusy = busyFor(t.nodes, base);
+      double baseSpread = 0.0;
+      double bestBusy = busyFor(t.nodes, base, &baseSpread);
       const double baseBusy = bestBusy;
+      if (baseSpread > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+        std::fprintf(stderr, "[global-retune] WARN %s base noisy (spread %.0f%%)\n",
+                     t.cs.sig.str().c_str(), baseSpread * 100.0);
       for (const auto & c : t.cs.cands)
       {
         if (c.kernel == bestE.kernel && c.options == bestE.options) continue;
-        const double b = busyFor(t.nodes, c);
+        double sc = 0.0;
+        const double b = busyFor(t.nodes, c, &sc);
+        // R45 P2#8: 噪声地板 —— 改善必须超过固定地板（默认 1%，来自 noise_check）。
+        // 采样极差只用于告警：reps 很小时「极差」会把真实改善也当成噪声拒掉。
+        if (sc > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+          std::fprintf(stderr, "[global-retune] WARN %s candidate %s noisy (spread %.0f%%)\n",
+                       t.cs.sig.str().c_str(), c.kernel.c_str(), sc * 100.0);
         if (b > 0.0 && b < bestBusy * (1.0 - kMinGain))
         {
           bestBusy = b;
@@ -3963,8 +4030,10 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
                        baseBusy > 0.0 ? (baseBusy - bestBusy) / baseBusy * 100.0 : 0.0);
       }
     }
-    if (changed == 0) break;
+    if (budgetHit || changed == 0) break;
   }
+  if (budgetHit && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+    std::fprintf(stderr, "[global-retune] budget hit (%d evals); stopped early\n", evals);
   int changed_total = 0;
   for (char w : won) if (w) ++changed_total;
 

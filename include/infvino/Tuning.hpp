@@ -108,6 +108,9 @@ public:
   const std::string & deviceId() const { return device_id_; }
   void setDeviceId(const std::string & id) { device_id_ = id; }
   int  abi() const { return abi_; }
+  /** @brief 生成该缓存时 kernel 源码的组合指纹（R45 P1#7 数值契约守卫；空=未标注）。*/
+  const std::string & sourceHash() const { return source_hash_; }
+  void setSourceHash(const std::string & h) { source_hash_ = h; }
 
   /** @brief 查表；未命中或设备不匹配返回 nullptr。*/
   const TuningEntry * lookup(const OpSignature & sig) const;
@@ -126,6 +129,7 @@ private:
   bool                              enabled_ = true;
   int                               abi_ = 0;   // 0 = 文件未标注（向后兼容，接受）
   std::string                       device_id_;
+  std::string                       source_hash_;  // R45: kernel 源码指纹（数值/编译契约）
   std::map<std::string, TuningEntry> entries_;
 };
 

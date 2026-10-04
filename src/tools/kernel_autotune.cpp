@@ -47,6 +47,8 @@ int main(int argc, char ** argv)
   bool refresh = false;
   bool global = false;
   int  gIters = 0, gTopK = 3, gRounds = 3, gLimit = 0;
+  double gMargin = 0.0;
+  int  gBudget = 0;
   std::string planTuning;
 
   for (int i = 1; i < argc; ++i)
@@ -70,6 +72,8 @@ int main(int argc, char ** argv)
     else if (a == "--global-topk") gTopK = std::atoi(next().c_str());
     else if (a == "--global-rounds") gRounds = std::atoi(next().c_str());
     else if (a == "--global-limit") gLimit = std::atoi(next().c_str());
+    else if (a == "--global-margin") gMargin = std::atof(next().c_str());
+    else if (a == "--global-budget") gBudget = std::atoi(next().c_str());
     else if (a == "--plan-tuning") planTuning = next();
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
@@ -89,6 +93,9 @@ int main(int argc, char ** argv)
         "  --global-topk K    每个签名参与回验的候选上限（隔离 top-K；默认 3）\n"
         "  --global-rounds R  坐标下降轮数上限（默认 3）\n"
         "  --global-limit N   最多回验 N 个签名（0=不限；安全分批用）\n"
+        "  --global-margin F  隔离 margin 剪枝：只回验 iso_ms<=best*(1+F) 的候选（默认 0=关；\n"
+        "                     ⚠️ 隔离名次不预测整网名次，>0 可能剪掉流水线更快的候选）\n"
+        "  --global-budget N  整网测量次数总预算（0=不限；抗组合爆炸/GPU 风险）\n"
         "  --plan-tuning <f>  per-plan 选择覆盖的输出路径（默认 <plan>.tuning.json）\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
@@ -148,7 +155,7 @@ int main(int argc, char ** argv)
     {
       // R44：把目标函数从「单节点隔离 min」换成「整网 busy」，对隔离 top-K 做坐标下降回验。
       // 必须在同一次进程里先跑完隔离扫描（本进程的 cand_short_ 才有内容）。
-      const int nchg = model.globalRetune(ops, gIters, gTopK, gRounds, gLimit);
+      const int nchg = model.globalRetune(ops, gIters, gTopK, gRounds, gLimit, gMargin, gBudget);
       std::printf("global-retune: %d signature(s) reselected by whole-net busy\n", nchg);
       // 回验后缓存里的选择已变；把本次调过的签名同步回 done，便于 --expected 打印。
       const auto & ents = model.tuning().entries();

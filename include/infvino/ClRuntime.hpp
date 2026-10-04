@@ -329,6 +329,12 @@ public:
     return flops / (static_cast<double>(info_.eu) * info_.clock_mhz * 1e6 * sec);
   }
 
+  /** @brief 单个 .cl 源码内容的稳定 hash（FNV-1a；用于磁盘程序缓存键 / 数值契约守卫）。 */
+  std::string sourceHash(const std::string & source_name);
+  /** @brief 一组 .cl 源码的组合 hash（排序去重后整体 FNV-1a）。调优缓存记录它，
+   *  在 kernel 源码变化时给出告警/作废，避免旧 options 被静默套用。 */
+  std::string sourcesHash(const std::vector<std::string> & source_names);
+
   static cl_event enqueueND(
     cl_command_queue q, cl_kernel k, cl_uint dim, const size_t * gws, const size_t * lws);
 

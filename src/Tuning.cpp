@@ -205,6 +205,12 @@ TuningCache TuningCache::load(const std::string & path)
   bool found = false;
   const std::string dev = findField(txt, "device_id", &found);
   if (found) c.device_id_ = dev;
+  // R45 P1#7: kernel 源码指纹（数值/编译契约守卫）。缺失=旧缓存，视为未标注。
+  {
+    bool sf = false;
+    const std::string sh = findField(txt, "kernel_src_hash", &sf);
+    if (sf) c.source_hash_ = sh;
+  }
   // kernel ABI 守卫：文件标注了 abi 且与当前不符 → 整份缓存作废（未命中），
   // 避免 kernel 宏语义变化后静默套用旧 options。未标注=0 视为兼容（接受）。
   {
@@ -294,6 +300,7 @@ bool TuningCache::save(const std::string & path) const
   f << "  \"version\": 1,\n";
   f << "  \"cache_abi\": " << kTuningCacheAbi << ",\n";
   f << "  \"device_id\": \"" << jsonEscape(device_id_) << "\",\n";
+  f << "  \"kernel_src_hash\": \"" << jsonEscape(source_hash_) << "\",\n";
   f << "  \"entries\": {\n";
   size_t n = 0;
   for (const auto & kv : entries_) {

@@ -50,6 +50,19 @@ def main() -> int:
     ap.add_argument("--list-only", action="store_true")
     ap.add_argument("--bake", action="store_true",
                     help="额外把 plan 复制一份到 <model>/model.plan.baked（审计用）")
+    ap.add_argument("--global", dest="global_", action="store_true",
+                    help="R44: 隔离扫描后做整网 busy 坐标下降回验（目标函数改为端到端）")
+    ap.add_argument("--global-topk", type=int, default=3)
+    ap.add_argument("--global-iters", type=int, default=2)
+    ap.add_argument("--global-rounds", type=int, default=2)
+    ap.add_argument("--global-limit", type=int, default=0,
+                    help="每批最多回验的签名数（0 = 用 --batch）")
+    ap.add_argument("--global-margin", type=float, default=0.0,
+                    help="隔离 margin 剪枝（默认 0=关；>0 有剪掉流水线更快候选的风险）")
+    ap.add_argument("--global-budget", type=int, default=0,
+                    help="整网测量总预算（0 = 不限）")
+    ap.add_argument("--lock", action="store_true",
+                    help="跑基准前 scripts/gpu_clocks.sh lock，结束后 unlock（推荐用于 --global）")
     args = ap.parse_args()
 
     repo = os.path.abspath(args.repo)
@@ -92,6 +105,13 @@ def main() -> int:
         "-DCMAKE_BUILD_TYPE=Release >/tmp/cfg.log 2>&1",
         "cmake --build /workspace/infvino/build-ct -j4 >/tmp/build.log 2>&1",
     ]
+    # R44: 整网回验参数（每个批进程内先隔离扫描、再整网坐标下降；--global-limit 与 batch 对齐）。
+    gargs = ""
+    if args.global_:
+        glimit = args.global_limit if args.global_limit > 0 else args.batch
+        gargs = (f"--global --global-topk {args.global_topk} --global-iters {args.global_iters} "
+                 f"--global-rounds {args.global_rounds} --global-limit {glimit} "
+                 f"--global-margin {args.global_margin} --global-budget {args.global_budget}")
     for op in ops:
         loop.append(f"echo '=== autotune {args.model} op={op} (batch={args.batch}) ==='")
         # 最多 64 批的安全上限（远超任何模型签名数）。
@@ -99,17 +119,24 @@ def main() -> int:
             f"for b in $(seq 1 64); do\n"
             f"  out=$(timeout 200 /workspace/infvino/build-ct/kernel_autotune "
             f"--plan {plan} --cache /workspace/infvino/{args.cache} "
-            f"--op {op} --limit {args.batch} --iters {args.iters} --expected 2>&1) || {{\n"
+            f"--op {op} --limit {args.batch} --iters {args.iters} {gargs} --expected 2>&1) || {{\n"
             f"    echo \"$out\"; echo '[autotune] batch failed; stop'; exit 1; }}\n"
-            f"  echo \"$out\" | grep -E 'expected vs|ratio|wrote' || true\n"
+            f"  echo \"$out\" | grep -E 'expected vs|ratio|wrote|global-retune|WARN' || true\n"
             f"  echo \"$out\" | grep -q '(0 entries this run' && {{ echo '[autotune] op done'; break; }}\n"
             f"  if tail -n 300 /var/log/kern.log /var/log/syslog 2>/dev/null | grep -qE 'GPU HANG|engine reset'; then echo '[autotune] GPU HANG'; exit 3; fi\n"
             f"done")
     loop.append("echo '[autotune] all batches complete'")
+    # R45 P1#10: --global 的整网回验命令流远多于隔离扫描；跑前锁频、跑后解锁（推荐加 --lock）。
+    locked = False
+    if args.lock:
+        subprocess.run([os.path.join(repo, "scripts", "gpu_clocks.sh"), "lock"], check=False)
+        locked = True
     rc = run(DOCKER_BASE + [
         "-v", f"{repo}:/workspace/infvino", "-w", "/workspace/infvino",
         args.image, "bash", "-lc", "\n".join(loop),
     ])
+    if locked:
+        subprocess.run([os.path.join(repo, "scripts", "gpu_clocks.sh"), "unlock"], check=False)
     if rc != 0:
         print(f"[autotune] run failed (rc={rc})", file=sys.stderr)
         subprocess.run([os.path.join(repo, "scripts", "gpu_guard.sh"), "after"])
