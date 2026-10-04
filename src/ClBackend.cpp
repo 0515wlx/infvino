@@ -39,7 +39,7 @@ std::vector<Tensor> ClBackend::infer(const float * input_f32, size_t numel)
       std::to_string(expect));
 
   in_f16_.resize(numel);
-  for (size_t i = 0; i < numel; ++i) in_f16_[i] = infvino::f32_to_f16(input_f32[i]);
+  infvino::f32_to_f16_bulk(input_f32, in_f16_.data(), numel);
 
   const auto t0 = std::chrono::steady_clock::now();
   model_->setInput(in_f16_.data());
@@ -58,7 +58,7 @@ std::vector<Tensor> ClBackend::infer(const float * input_f32, size_t numel)
     Tensor t;
     t.shape = model_->outputDims(i);
     t.data.resize(n);
-    for (size_t j = 0; j < n; ++j) t.data[j] = infvino::f16_to_f32(out_f16_[j]);
+    infvino::f16_to_f32_bulk(out_f16_.data(), t.data.data(), n);
     outputs.push_back(std::move(t));
   }
   return outputs;

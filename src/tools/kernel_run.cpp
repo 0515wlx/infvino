@@ -214,6 +214,9 @@ int main(int argc, char ** argv)
         "activation pool: requested %.1f MB -> allocated %.1f MB (%zu buffers, reuse %.0f%%)\n",
         req / 1e6, alc / 1e6, model.poolBufferCount(),
         req ? 100.0 * (1.0 - static_cast<double>(alc) / static_cast<double>(req)) : 0.0);
+      if (model.runtime().programCacheEnabled())
+        std::printf("program cache: hits=%zu misses=%zu (on-disk kernel binaries)\n",
+                    model.runtime().programCacheHits(), model.runtime().programCacheMisses());
       const double busy = total / iters;
       std::printf("total kernel time: %.3f ms (iters=%d)\n", busy, iters);
       // P2: wall - busy 的构成（仅 profiling 下有 host 分段）：入队提交 / 同步等待 /

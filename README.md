@@ -279,6 +279,22 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > `INFVINO_NO_BLOCK_LAYOUT=1` / `INFVINO_NO_REORDER_DEDUP=1`。
 > 详见 [`docs/block-layout.md`](docs/block-layout.md)。
 
+> **三模型预算分析 + Tier 0–2 落地（2026-10）**：基于 `busy/net/e2e` 框架完整分析了
+> yolov8n-pose / yolo11n-pose / mobilenetv3-small（逐 kernel + 总体 `ops/EU/cyc`、
+> 缓存管理短板、系统缺陷、优化路线），报告见
+> [`docs/budget-analysis-3models.md`](docs/budget-analysis-3models.md)。已落地：
+> **(1) 自动调优覆盖** 224→**239** 条、签名覆盖 100%；**(2) 激活池 byte-offset 子分配**
+> （默认开）y8 24.0→**20.6 MB**、y11 26.5→**23.1 MB**，busy −1.7%/−2.3%，逐位一致；
+> **(3) 磁盘 kernel 二进制缓存**（`INFVINO_PROGRAM_CACHE`）把每进程冷启动 JIT
+> **8.5–12 s → ~0.1 s**；**(4) 调优缓存 `cache_abi` 守卫** 防止 kernel 宏语义变化后
+> 静默套用旧 options；**(5) host f32↔f16 批量转换（AVX2，逐位一致）** 把每次推理的
+> 转换开销 1.59→**0.50 ms/帧**，net yolo **−5.9%~−6.7%**；**(6) 首层 Cin=3 专用 conv**
+> （`kernels/conv_cin3.cl`）y8/y11 stem **−40%/−50%**，三模型 `model_check` PASS。
+> 并在 `ops/EU/cyc` 分析框架前加入 **roofline 判断**提醒
+> （[`docs/profiling-budget.md`](docs/profiling-budget.md) §3.0）；残余空间分析（结论：
+> 大头是物理/结构受限，非候选缺失）与小算子缓存命中分析（`scripts/analyze_cache.py`）
+> 见 [`docs/budget-analysis-3models.md`](docs/budget-analysis-3models.md) §9/§10。
+
 ## 状态
 
 - [x] OpenCL 运行时 + 设备探测 + kernel 构建缓存
@@ -296,6 +312,14 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] P1-layout 调研收口：重排 launch floor 主导、可省边 <2% 墙钟（首轮暂缓）
 - [x] block layout（R36）：持久 `b_fs_yx_fsv16` 链 + 同帧去重 + **autotune 驱动的布局自动化**；y8 reorder 24→10、busy −2.2%、逐位一致（`docs/block-layout.md`）
 - [x] P2 host 分段实测：busy 占墙钟 52–74%，缺口 = 入队提交 + setArg/簿记（`docs/benchmark.md` §2.4）
+- [x] 磁盘 kernel 二进制缓存（`INFVINO_PROGRAM_CACHE`）：冷启动 JIT 8.5–12 s → ~0.1 s，逐位一致
+- [x] 激活池 byte-offset 子分配（默认开，`INFVINO_NO_POOL_OFFSET=1` 可关）：y8 24.0→20.6 MB、busy −1.7%
+- [x] 调优缓存 `cache_abi` 守卫（kernel 宏语义变化即整份作废）
+- [x] `ops/EU/cyc` 分析框架前置 roofline 判断提醒（`docs/profiling-budget.md` §3.0）
+- [x] host f32↔f16 批量转换 AVX2（逐位一致）：yolo net −5.9~6.7%（`INFVINO_NO_SIMD_HALF=1` 对照）
+- [x] 残余空间分析：conv3x3/depthwise/bmm 为物理/结构受限（`docs/budget-analysis-3models.md` §9）
+- [x] 首层 Cin=3 专用 conv（`kernels/conv_cin3.cl`）：y8/y11 stem −40%/−50%，三模型 `model_check` PASS
+- [x] 小算子缓存命中分析器 `scripts/analyze_cache.py`：多数已贴住「工作集+launch」上限，余额在 permute/resize（跨步）与 gap（网格）
 - [x] depthwise padded（A 方向）：指令 −41%、逐位一致，但 pad 带宽相抵 → 整网负结果，默认关闭（Round 31）
 - [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
 - [ ] seg / obb 解码；多 Session 并行缓冲

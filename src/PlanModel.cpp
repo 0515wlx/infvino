@@ -104,6 +104,8 @@ PlanModel::~PlanModel()
     if (m) clReleaseMemObject(m);
   for (cl_mem m : owned_blk_)
     if (m) clReleaseMemObject(m);
+  for (cl_mem m : owned_cin3_)
+    if (m) clReleaseMemObject(m);
   for (cl_mem m : owned_dwp_)
     if (m) clReleaseMemObject(m);
   for (cl_mem m : alias_subs_)
@@ -153,6 +155,24 @@ cl_mem PlanModel::blkWeight(const std::string & name, Tensor & w, int Cout, int 
   rt_.write(m, sw.size() * 2, sw.data());
   blk_w_[name] = m;
   owned_blk_.push_back(m);
+  return m;
+}
+
+cl_mem PlanModel::cin3Weight(const std::string & name, Tensor & w, int Cout, int Cin)
+{
+  auto it = cin3_w_.find(name);
+  if (it != cin3_w_.end()) return it->second;
+  const int KHW = Cin * 9;
+  std::vector<uint16_t> host(static_cast<size_t>(w.numel()));
+  rt_.read(w.mem, host.size() * 2, host.data());
+  std::vector<uint16_t> sw(static_cast<size_t>(KHW) * Cout);
+  for (int c = 0; c < Cout; ++c)
+    for (int k = 0; k < KHW; ++k)
+      sw[static_cast<size_t>(k) * Cout + c] = host[static_cast<size_t>(c) * KHW + k];
+  cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
+  rt_.write(m, sw.size() * 2, sw.data());
+  cin3_w_[name] = m;
+  owned_cin3_.push_back(m);
   return m;
 }
 
@@ -274,6 +294,8 @@ void PlanModel::parse()
     Tensor t;
     t.dims = d;
     t.mem  = rt_.alloc(static_cast<size_t>(t.numel()) * 2, CL_MEM_READ_WRITE);
+    t.base = t.mem;
+    t.base_off = 0;
     owned_.push_back(t.mem);
     return T_[name] = t;
   };
@@ -533,6 +555,19 @@ void PlanModel::allocateActivations()
   const size_t N = nodes_.size();
   if (std::getenv("INFVINO_NO_POOL")) return;   // 诊断开关：退回到每张量一块
 
+  // 0) P0-offset：byte-offset 子分配（**默认开**；见 ClRuntime.hpp ActPool 注释）。
+  //    实测（Iris Xe）：y8 24.0→20.6 MB / y11 26.5→23.1 MB，e2e −1.4%/−1.8%，
+  //    逐位一致。`INFVINO_NO_POOL_OFFSET=1` 退回整块复用（对照/排查用）。
+  {
+    const char * no = std::getenv("INFVINO_NO_POOL_OFFSET");
+    if (!(no && std::string(no) != "0" && std::string(no) != ""))
+    {
+      act_pool_.setOffsetEnabled(true);
+      act_pool_.setAlign(rt_.info().mem_base_align ? rt_.info().mem_base_align : 64);
+    }
+  }
+  std::unordered_set<std::string> alias_ok;   // 成功建立子 buffer 别名的输出张量
+
   // 1) 每个张量的 [birth, death]（拓扑序 = 执行序）。
   std::unordered_map<std::string, int> birth, death;
   auto touch = [&](const std::string & t, int i, bool write) {
@@ -680,7 +715,7 @@ void PlanModel::allocateActivations()
     auto & l = lives[k];
     if (alias_parent.count(l.name)) continue;   // 别名：不单独分配，稍后指向源
     if (static_cast<size_t>(l.id) >= pool_limit) continue;
-    cl_mem m = act_pool_.acquire(
+    ActPool::Ref pref = act_pool_.acquire(
       [&](size_t bytes) { return rt_.alloc(bytes, CL_MEM_READ_WRITE); }, l.bytes,
       conflict[l.id], l.id);
     // 旧 buffer 释放 + 从 owned_ 移除
@@ -691,7 +726,9 @@ void PlanModel::allocateActivations()
       if (oit != owned_.end()) owned_.erase(oit);
       if (old_ref.count(old) == 1) { clReleaseMemObject(old); old_ref.erase(old); }
     }
-    T_[l.name].mem = m;
+    T_[l.name].mem      = pref.mem;
+    T_[l.name].base     = pref.base;
+    T_[l.name].base_off = static_cast<int64_t>(pref.off);
   }
 
   // 4b) 视图/切片别名：reshape/flatten 直接指向源；连续 copy_c 建子 buffer（源内偏移）。
@@ -714,17 +751,40 @@ void PlanModel::allocateActivations()
     auto sub = alias_sub.find(out_name);
     if (sub == alias_sub.end())
     {
-      oit->second.mem = sit->second.mem;             // 整块视图（reshape/flatten）
+      oit->second.mem      = sit->second.mem;         // 整块视图（reshape/flatten）
+      oit->second.base     = sit->second.base;
+      oit->second.base_off = sit->second.base_off;
     }
     else
     {
-      cl_buffer_region region{static_cast<size_t>(sub->second.second), 0};
-      region.size = static_cast<size_t>(oit->second.numel() * 2);
+      // 连续 copy_c：在源张量底层 arena（base）上按「源内偏移 + 切片偏移」建子 buffer。
+      // 子 buffer 不能基于子 buffer 再切，所以必须用 base 而不是源自身的 mem。
+      const size_t origin = static_cast<size_t>(sit->second.base_off + sub->second.second);
+      const size_t nbytes  = static_cast<size_t>(oit->second.numel() * 2);
       cl_int err = CL_SUCCESS;
-      cl_mem sb = clCreateSubBuffer(sit->second.mem, CL_MEM_READ_WRITE,
-                                    CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
-      oit->second.mem = (err == CL_SUCCESS && sb) ? sb : sit->second.mem;
-      if (err == CL_SUCCESS && sb) alias_subs_.push_back(sb);
+      cl_mem sb = nullptr;
+      if (origin % (rt_.info().mem_base_align ? rt_.info().mem_base_align : 1) == 0)
+      {
+        cl_buffer_region region{origin, 0};
+        region.size = nbytes;
+        sb = clCreateSubBuffer(sit->second.base, CL_MEM_READ_WRITE,
+                               CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+      }
+      if (err == CL_SUCCESS && sb)
+      {
+        oit->second.mem      = sb;
+        oit->second.base     = sit->second.base;
+        oit->second.base_off = static_cast<int64_t>(origin);
+        alias_subs_.push_back(sb);
+        alias_ok.insert(out_name);
+      }
+      else
+      {
+        // 无法对齐/建子 buffer → 不别名，给输出单独分配，让 copy_c 正常执行（保数值）。
+        cl_mem fresh = rt_.alloc(nbytes, CL_MEM_READ_WRITE);
+        oit->second.mem = fresh; oit->second.base = fresh; oit->second.base_off = 0;
+        owned_.push_back(fresh);
+      }
     }
   }
 
@@ -732,7 +792,7 @@ void PlanModel::allocateActivations()
   node_skipped_.assign(N, 0);
   for (size_t i = 0; i < N; ++i)
     if (nodes_[i].op == "copy_c" && !nodes_[i].outs.empty() &&
-        alias_sub.count(nodes_[i].outs[0]))
+        alias_ok.count(nodes_[i].outs[0]))
       node_skipped_[i] = 1;
   verify();
   if (std::getenv("INFVINO_POOL_MAP"))
@@ -1591,6 +1651,7 @@ namespace
 std::string sourceOfKernel(const std::string & kernel)
 {
   if (kernel == "conv3x3_ov") return "conv_ov";
+  if (kernel == "conv3x3_cin3") return "conv_cin3";
   if (kernel == "conv3x3_f16" || kernel == "conv3x3_rt" || kernel == "conv3x3_db") return "conv";
   if (kernel == "conv3x3_sg") return "conv_sg";
   if (kernel == "conv3x3_osv") return "conv_osv";
@@ -2080,6 +2141,28 @@ void PlanModel::run()
                 std::to_string(cfg.STRIDE) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout) + "(tuned)",
               kk, 3, gws, lws);
+      }
+      else if (te && te->kernel == "conv3x3_cin3")
+      {
+        // Cin<=4 专用首层 conv（kernels/conv_cin3.cl）：lane=空间列、每 WI 算全部
+        // Cout、权重 SLM [k][c] 广播。无权重重排（直接读 [Cout][Cin][3][3]）。
+        cl_kernel kk = getKernel("conv_cin3", "conv3x3_cin3", te->options);
+        cl_mem dw = cin3Weight(n.ins[1], in(1), Cout, Cin);
+        setArg(kk, 0, sizeof(dx), &dx);
+        setArg(kk, 1, sizeof(dw), &dw);
+        setArg(kk, 2, sizeof(db), &db);
+        setArg(kk, 3, sizeof(dy), &dy);
+        setArg(kk, 4, sizeof(H), &H);
+        setArg(kk, 5, sizeof(W), &W);
+        setArg(kk, 6, sizeof(Hout), &Hout);
+        setArg(kk, 7, sizeof(Wout), &Wout);
+        const size_t lws[2] = {128, 1};
+        const size_t gws[2] = {
+          (static_cast<size_t>(Wout) + 127) / 128 * 128, static_cast<size_t>(Hout)};
+        timed("conv3x3cin3@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
+                std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
+                std::to_string(Cout) + "(tuned)",
+              kk, 2, gws, lws);
       }
       else if ((te && te->kernel == "conv3x3_blk") || (attrInt(n, "blk", 0) != 0 && !te))
       {
@@ -2756,6 +2839,24 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
           return [this, kk, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
+          };
+        }
+        if (c.kernel == "conv3x3_cin3") {
+          cl_kernel kk = getKernel("conv_cin3", "conv3x3_cin3", c.options);
+          cl_mem dw = cin3Weight(n.ins[1], ref(n.ins[1]), Cout, Cin);
+          setArg(kk, 0, sizeof(dx), &dx);
+          setArg(kk, 1, sizeof(dw), &dw);
+          setArg(kk, 2, sizeof(db), &db);
+          setArg(kk, 3, sizeof(dy), &dy);
+          setArg(kk, 4, sizeof(H), &H);
+          setArg(kk, 5, sizeof(W), &W);
+          setArg(kk, 6, sizeof(Hout), &Hout);
+          setArg(kk, 7, sizeof(Wout), &Wout);
+          const size_t lws[2] = {128, 1};
+          const size_t gws[2] = {
+            (static_cast<size_t>(Wout) + 127) / 128 * 128, static_cast<size_t>(Hout)};
+          return [this, kk, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kk, 2, gws, lws);
           };
         }
         // native

@@ -87,12 +87,41 @@ python3 scripts/profile_ablation.py --repo $PWD --image infvino-dev:latest \
 | `INFVINO_NO_REORDER_DEDUP=1` | R36 同帧重排去重 | 运行时 |
 | `INFVINO_NO_LAUNCH_CACHE=1` | P2 每节点 dispatch 缓存 | 运行时 |
 | `INFVINO_NO_POOL=1` | P0 激活内存池 | 运行时 |
+| `INFVINO_NO_POOL_OFFSET=1` | 激活池 byte-offset 子分配（本轮落地，默认开） | 运行时 |
+| `INFVINO_PROGRAM_CACHE=<dir>` / `none` | 磁盘 kernel 二进制缓存（本轮落地；观测用，非消融） | 运行时 |
 | `INFVINO_DW_PAD=1` | padded depthwise 候选 | 需 retune |
 | `INFVINO_NO_FUSE_GENERAL=1` | 通用激活融合 | **plan 期**：须重生成 plan |
 
 ---
 
 ## 3. 指标
+
+### 3.0 先做 roofline 判断，再读 ops/EU/cyc（重要前提）
+
+`ops/EU/cyc` 只在**算术强度足够高、且数据通路以 packed FMA 为主**时才是有效标尺。
+本机（Iris Xe / 单通道 LPDDR / 3.75 MB LLC）大量算子并不满足：
+
+- `depthwise` / 小空间或小通道 `conv`：受**地址/边界指令数**约束（指令配额远低于 32）；
+- `ew_*` / `copy_c` / `concat` / `slice` / `maxpool` / `softmax` / `resize` / `gap`：
+  算术强度仅 ~0.25–0.5 FLOP/byte，正确上限是**内存 roofline**，再叠加**每 dispatch 的
+  launch 地板**；
+- `M=1` 的 GEMV / `bmm`：受**归约延迟 / 网格占用**约束。
+
+因此，某个 kernel 的 `ops/EU/cyc` 很低，**不等于**「有同比例的可用时间可挖」，它可能是：
+
+1. 该算子的**物理上限本来就低**（内存/指令/延迟受限）；
+2. 它只是**更大模式的一部分**——可被生产者/消费者**融合**（激活/残差 epilogue、
+   concat→conv、`gap`+分类头、逐元素折进 conv），此时单看它没有意义。
+
+**纪律**：
+
+- **不要**用单 kernel 的低 `ratio` 直接推断 headroom，更**不要**把某几个数硬编码成
+  「硬件极限」（会导致系统性误判）；
+- **要**把**端到端 + 具体模型**放在一起看：该层是否值得优化、能否融合；
+- `ops/EU/cyc` 与 `ratio` 只用于**同一 family 内排序**；`headroom_ms` 是**相对量**，
+  会被中间标准（`expected_ops`，本身是模型而非实测）的误差放大；
+- 计算类（`conv`/`gemm`）的标尺是硬件极限；**非计算类**请改用 roofline / 指令配额 /
+  launch 地板，并优先考虑融合与 dispatch 数。
 
 - `measured_ops = FLOPs / (ms·1e-3) / (EU·clk)`：实测 `ops/EU/cyc`。
 - `expected`：`config/tuning.json` 的中间标准（`TuningEntry.expected`）。
@@ -154,6 +183,7 @@ N=1 的 GEMV 头层）。
 | `kernel_run --profile-json` | L0：逐节点 GPU 时间 + 结构计数 + 内存 + host 分段（机器可读） |
 | `scripts/analyze_budget.py` | L1/L2：预算瀑布 + busy 归因 + 中间标准记分卡（profile-json 或文本回退） |
 | `scripts/profile_ablation.py` | L2：优化消融矩阵（busy/net/e2e 三态的 Δ 归因） |
+| `scripts/analyze_cache.py` | L1/L2：非 compute-bound 小算子的**缓存命中/带宽**分析（工作集档位 + launch/内存拆分 + eff） |
 | `config/tuning.json` | 中间标准 `expected_ops` 与实测 `ratio` 的数据源 |
 | `docs/benchmark.md` | 数值/性能基准总览（与本文互补） |
 | `docs/openvino-gap-analysis.md` | （历史）与 OV 的差距分析，仅作研发参照，非本框架标尺 |

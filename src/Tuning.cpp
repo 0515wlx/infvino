@@ -205,6 +205,16 @@ TuningCache TuningCache::load(const std::string & path)
   bool found = false;
   const std::string dev = findField(txt, "device_id", &found);
   if (found) c.device_id_ = dev;
+  // kernel ABI 守卫：文件标注了 abi 且与当前不符 → 整份缓存作废（未命中），
+  // 避免 kernel 宏语义变化后静默套用旧 options。未标注=0 视为兼容（接受）。
+  {
+    bool af = false;
+    const std::string abi = findField(txt, "cache_abi", &af);
+    if (af && !abi.empty()) {
+      c.abi_ = std::atoi(abi.c_str());
+      if (c.abi_ != kTuningCacheAbi) return c;   // enabled_ 仍为 true → 全部 lookup 未命中
+    }
+  }
 
   // 遍历 "entries" 对象里的每个 "key": { ... }。用大括号配对切分（扁平结构）。
   size_t ep = txt.find("\"entries\"");
@@ -277,6 +287,7 @@ bool TuningCache::save(const std::string & path) const
   if (!f) return false;
   f << "{\n";
   f << "  \"version\": 1,\n";
+  f << "  \"cache_abi\": " << kTuningCacheAbi << ",\n";
   f << "  \"device_id\": \"" << jsonEscape(device_id_) << "\",\n";
   f << "  \"entries\": {\n";
   size_t n = 0;

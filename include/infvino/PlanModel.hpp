@@ -188,6 +188,10 @@ private:
   {
     std::vector<int64_t> dims;
     cl_mem               mem{nullptr};
+    // P0-offset 实验：mem 可能是 arena 的子 buffer；base/off 记录它在底层 arena 里的
+    // 位置，供 copy_c 的连续切片别名（clCreateSubBuffer 不能基于子 buffer 再切）。
+    cl_mem               base{nullptr};
+    int64_t              base_off{0};
     // R36 (P1-layout): 物理布局。false=普通 NCHW(bfyx)；true=阻塞式
     // b_fs_yx_fsv16 [C/16][H][W][16]。仅当生产者是 blocked conv、所有消费者也是
     // blocked conv、且 Cout%16==0 时才置位（见 planBlockedLayout）。同一 size 的
@@ -229,6 +233,9 @@ private:
   cl_mem  ovWeight(const std::string & name, Tensor & w, int Cout, int Cin);
   /** @brief R25: repack weights to OpenVINO os_is_yx_isv16_osv16 for conv3x3_blk. */
   cl_mem  blkWeight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief Cin<=4 首层 conv：把权重从 [Cout][Cin*9] 重排成 [Cin*9][Cout]（通道连续，
+   *  让 conv3x3_cin3 的跨通道 half2 读是连续/广播的）。 */
+  cl_mem  cin3Weight(const std::string & name, Tensor & w, int Cout, int Cin);
   /** @brief R25: reorder a conv input bfyx -> b_fs_yx_fsv16 (cached scratch). */
   cl_mem  blkInput(const std::string & name, Tensor & x, int Cin, int H, int W);
   /** @brief R31: zero-padded depthwise input Xp[C][Hp][Wpad] (cached by tensor name).
@@ -321,6 +328,9 @@ private:
   std::unordered_map<std::string, cl_mem> blk_w_;
   std::unordered_map<std::string, cl_mem> blk_in_;
   std::vector<cl_mem>                     owned_blk_;
+  // Cin<=4 首层 conv 的 [Cin*9][Cout] 权重重排（keyed by init name）。
+  std::unordered_map<std::string, cl_mem> cin3_w_;
+  std::vector<cl_mem>                     owned_cin3_;
   // R36: 同一帧内对同一张量只重排一次（多个 blocked 消费者共享 bfyx->fsv16 结果）。
   // capture 期填充；重放期 blkInput 不再被调用。每帧 run() 开头清空。
   std::unordered_set<std::string>         reordered_frame_;

@@ -60,6 +60,21 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
                (extra.empty() ? "" : " fit");
     out.push_back(std::move(c));
   }
+  // Cin<=4 专用首层 conv（kernels/conv_cin3.cl）：lane=空间列 + 权重 SLM [k][c] +
+  // half2 跨通道累加。避免 OV 把 Cin=3 补到 16 的 13/16 浪费，也避免 native 的
+  // staging/barrier 在一个 3 通道 chunk 上占主导。数值语义与 native/ov 一致。
+  if (sig.Cin > 0 && sig.Cin <= 4 && sig.Cout > 0 && sig.Cout % 2 == 0) {
+    std::ostringstream o;
+    o << "-DCIN=" << sig.Cin << " -DCOUT=" << sig.Cout << " -DSTRIDE=" << sig.stride
+      << " -DPAD=" << sig.pad << " -DACT=" << sig.act << " -DSG=16 "
+      << "-cl-mad-enable -cl-fast-relaxed-math";
+    Candidate c;
+    c.kernel = "conv3x3_cin3";
+    c.source = "conv_cin3";
+    c.options = o.str();
+    c.config = "CIN" + std::to_string(sig.Cin) + " COUT" + std::to_string(sig.Cout);
+    out.push_back(std::move(c));
+  }
   // R25: OpenVINO blocked conv port (kernels/conv_blk.cl).  Lane=output channel,
   // OBW consecutive output columns per lane, blocked input + vector mads; grid is
   // 16 channels x 1 row per WG (2-4x more WGs than osv32).  Wins on small-spatial

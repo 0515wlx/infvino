@@ -2,10 +2,14 @@
 #include "infvino/ClRuntime.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unistd.h>
 
 #ifndef INFVINO_KERNEL_DIR
 #define INFVINO_KERNEL_DIR "kernels"
@@ -28,6 +32,21 @@ namespace infvino
 
 namespace
 {
+// 稳定 64-bit FNV-1a（std::hash 不保证跨进程/跨版本一致，不能用于磁盘缓存键）。
+uint64_t fnv1a64(const std::string & s)
+{
+  uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+  return h;
+}
+
+std::string hex64(uint64_t v)
+{
+  char b[17];
+  std::snprintf(b, sizeof(b), "%016llx", static_cast<unsigned long long>(v));
+  return b;
+}
+
 std::string getStr(cl_device_id d, cl_device_info what)
 {
   size_t len = 0;
@@ -67,6 +86,11 @@ ClDeviceInfo queryDevice(cl_device_id d)
   clGetDeviceInfo(d, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(i.global_mem_bytes), &i.global_mem_bytes, nullptr);
   clGetDeviceInfo(d, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(i.local_mem_bytes), &i.local_mem_bytes, nullptr);
   clGetDeviceInfo(d, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(i.max_work_group), &i.max_work_group, nullptr);
+  {
+    cl_uint align_bits = 0;
+    if (clGetDeviceInfo(d, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(align_bits), &align_bits, nullptr) == CL_SUCCESS)
+      i.mem_base_align = align_bits / 8;  // 字段以 bit 计
+  }
   cl_device_type dtype = 0;
   if (clGetDeviceInfo(d, CL_DEVICE_TYPE, sizeof(dtype), &dtype, nullptr) == CL_SUCCESS)
     i.is_gpu = (dtype & CL_DEVICE_TYPE_GPU) != 0;
@@ -149,6 +173,25 @@ ClRuntime::ClRuntime(const std::string & kernel_dir, int platform, int device, b
   queue_ = clCreateCommandQueue(
     context_, device_, profiling ? CL_QUEUE_PROFILING_ENABLE : 0, &err);
   if (err != CL_SUCCESS) throw std::runtime_error("ClRuntime: clCreateCommandQueue failed");
+
+  // T2: on-disk program binary cache. INFVINO_PROGRAM_CACHE 覆盖目录；"none"/"" 关闭。
+  {
+    const char * env = std::getenv("INFVINO_PROGRAM_CACHE");
+    if (env && (std::string(env) == "none" || std::string(env) == "0"))
+      program_cache_dir_.clear();
+    else if (env && std::string(env).size() > 0)
+      program_cache_dir_ = env;
+    else if (const char * home = std::getenv("HOME"))
+      program_cache_dir_ = std::string(home) + "/.cache/infvino/programs";
+    else
+      program_cache_dir_ = "/tmp/infvino_programs";
+    if (!program_cache_dir_.empty())
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(program_cache_dir_, ec);
+      if (ec) program_cache_dir_.clear();   // 不可写 → 关闭
+    }
+  }
 }
 
 ClRuntime::~ClRuntime()
@@ -160,32 +203,103 @@ ClRuntime::~ClRuntime()
   if (context_) clReleaseContext(context_);
 }
 
+std::string ClRuntime::deviceCacheKey() const
+{
+  // 设备键：型号 + vendor + driver + OpenCL 版本 + EU/clk。二进制不可跨设备/驱动复用。
+  return info_.name + "|" + info_.vendor + "|" + info_.driver_version + "|" +
+         info_.opencl_version + "|eu" + std::to_string(info_.eu) + "clk" +
+         std::to_string(info_.clock_mhz);
+}
+
+cl_program ClRuntime::tryLoadBinary(const std::string & cache_key)
+{
+  if (program_cache_dir_.empty()) return nullptr;
+  const std::string path = program_cache_dir_ + "/" + cache_key + ".bin";
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return nullptr;
+  const std::streamsize n = f.tellg();
+  if (n <= 0) return nullptr;
+  f.seekg(0);
+  std::vector<unsigned char> data(static_cast<size_t>(n));
+  f.read(reinterpret_cast<char *>(data.data()), n);
+  if (!f) return nullptr;
+
+  cl_int err = CL_SUCCESS;
+  const unsigned char * p = data.data();
+  size_t sz = data.size();
+  cl_program prog = clCreateProgramWithBinary(context_, 1, &device_, &sz, &p, nullptr, &err);
+  if (err != CL_SUCCESS || !prog) return nullptr;
+  // 二进制已含编译选项；再 build 一次以完成链接（options 传 nullptr）。
+  err = clBuildProgram(prog, 1, &device_, nullptr, nullptr, nullptr);
+  if (err != CL_SUCCESS) { clReleaseProgram(prog); return nullptr; }
+  return prog;
+}
+
+void ClRuntime::storeBinary(const std::string & cache_key, cl_program prog)
+{
+  if (program_cache_dir_.empty() || !prog) return;
+  size_t sz = 0;
+  if (clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof(sz), &sz, nullptr) != CL_SUCCESS || !sz)
+    return;
+  std::vector<unsigned char> data(sz);
+  unsigned char * ptr = data.data();
+  if (clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof(ptr), &ptr, nullptr) != CL_SUCCESS)
+    return;
+  // 原子写：临时文件 + rename（避免并发进程读到半截文件）。
+  const std::string path = program_cache_dir_ + "/" + cache_key + ".bin";
+  const std::string tmp  = path + ".tmp." + std::to_string(static_cast<long>(::getpid()));
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (!f) { std::remove(tmp.c_str()); return; }
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) std::remove(tmp.c_str());
+}
+
+cl_program ClRuntime::buildProgramCached(
+  const std::string & source, const std::string & mem_key, const std::string & disk_key,
+  const std::string & options, const std::string & kernel_name)
+{
+  auto it = programs_.find(mem_key);
+  if (it != programs_.end()) return it->second;
+
+  cl_program prog = nullptr;
+  if (!program_cache_dir_.empty())
+  {
+    prog = tryLoadBinary(disk_key);
+    if (prog) { ++cache_hits_; programs_[mem_key] = prog; return prog; }
+    ++cache_misses_;
+  }
+
+  cl_int err;
+  const char * sp = source.c_str();
+  prog = clCreateProgramWithSource(context_, 1, &sp, nullptr, &err);
+  if (err != CL_SUCCESS) throw std::runtime_error("clCreateProgramWithSource failed");
+  err = clBuildProgram(prog, 1, &device_, options.c_str(), nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    size_t len = 0;
+    clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+    std::vector<char> log(len + 1, 0);
+    clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
+    clReleaseProgram(prog);
+    throw std::runtime_error(
+      "clBuildProgram failed for " + kernel_name + " (" + options + "):\n" + log.data());
+  }
+  storeBinary(disk_key, prog);
+  programs_[mem_key] = prog;
+  return prog;
+}
+
 cl_kernel ClRuntime::buildFromSource(
   const std::string & source, const std::string & kernel_name, const std::string & options)
 {
-  const std::string key = source.substr(0, 64) + "|" + options + "|" +
-    std::to_string(std::hash<std::string>{}(source));
-  cl_program prog = nullptr;
-  auto it = programs_.find(key);
-  if (it != programs_.end()) {
-    prog = it->second;
-  } else {
-    cl_int err;
-    const char * sp = source.c_str();
-    prog = clCreateProgramWithSource(context_, 1, &sp, nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("clCreateProgramWithSource failed");
-    err = clBuildProgram(prog, 1, &device_, options.c_str(), nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-      size_t len = 0;
-      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-      std::vector<char> log(len + 1, 0);
-      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
-      clReleaseProgram(prog);
-      throw std::runtime_error(
-        "clBuildProgram failed for " + kernel_name + " (" + options + "):\n" + log.data());
-    }
-    programs_[key] = prog;
-  }
+  const std::string mem_key = source.substr(0, 64) + "|" + options + "|" + hex64(fnv1a64(source));
+  const std::string disk_key = hex64(fnv1a64(deviceCacheKey() + "|inline|" + options + "|" +
+                                             hex64(fnv1a64(source))));
+  cl_program prog = buildProgramCached(source, mem_key, disk_key, options, kernel_name);
   cl_int err;
   cl_kernel k = clCreateKernel(prog, kernel_name.c_str(), &err);
   if (err != CL_SUCCESS) throw std::runtime_error("clCreateKernel failed: " + kernel_name);
@@ -202,28 +316,11 @@ cl_kernel ClRuntime::buildKernel(
   auto sit = sources_.find(source_name);
   if (sit == sources_.end())
     sit = sources_.emplace(source_name, readFile(kernel_dir_ + "/" + source_name + ".cl")).first;
-  const std::string key = "file|" + source_name + "|" + options;
-  cl_program prog = nullptr;
-  auto it = programs_.find(key);
-  if (it != programs_.end()) {
-    prog = it->second;
-  } else {
-    cl_int err;
-    const char * sp = sit->second.c_str();
-    prog = clCreateProgramWithSource(context_, 1, &sp, nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("clCreateProgramWithSource failed");
-    err = clBuildProgram(prog, 1, &device_, options.c_str(), nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-      size_t len = 0;
-      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-      std::vector<char> log(len + 1, 0);
-      clGetProgramBuildInfo(prog, device_, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
-      clReleaseProgram(prog);
-      throw std::runtime_error(
-        "clBuildProgram failed for " + kernel_name + " (" + options + "):\n" + log.data());
-    }
-    programs_[key] = prog;
-  }
+  const std::string mem_key  = "file|" + source_name + "|" + options;
+  const std::string src_hash = hex64(fnv1a64(sit->second));
+  const std::string disk_key = hex64(fnv1a64(deviceCacheKey() + "|" + source_name + "|" +
+                                              options + "|" + src_hash));
+  cl_program prog = buildProgramCached(sit->second, mem_key, disk_key, options, kernel_name);
   cl_int err;
   cl_kernel k = clCreateKernel(prog, kernel_name.c_str(), &err);
   if (err != CL_SUCCESS) throw std::runtime_error("clCreateKernel failed: " + kernel_name);

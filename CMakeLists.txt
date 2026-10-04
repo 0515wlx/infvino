@@ -40,6 +40,7 @@ add_library(infvino SHARED
   src/Preprocess.cpp
   src/Nms.cpp
   src/Decoders.cpp
+  src/Half.cpp
   src/ClRuntime.cpp
   src/Tuning.cpp
   src/Autotuner.cpp

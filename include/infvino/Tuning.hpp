@@ -57,6 +57,16 @@ struct OpSignature
   static OpSignature custom(const std::string & op, std::vector<int> params, int act = 0);
 };
 
+/**
+ * @brief 调优缓存的 **kernel ABI 版本**。
+ *
+ * 缓存的 key 只含 op/shape；`options` 是编译宏（kernel 源码的「接口」）。若 kernel
+ * 源码里某个 `-D` 宏的语义变化（重命名/行为改）而 key 不变，旧条目会被静默套用。
+ * 每次做这类**破坏性 kernel 改动**时把这个值 +1：load 时若文件里的 abi 与当前不符，
+ * 整份缓存视为未命中（回退启发式，可重新 retune），而不是错误地复用旧 options。
+ */
+constexpr int kTuningCacheAbi = 1;
+
 /** @brief 一个缓存条目：最优 kernel + config（+ 实测与期望指标，用于分析）。 */
 struct TuningEntry
 {
@@ -95,6 +105,7 @@ public:
   void setEnabled(bool e) { enabled_ = e; }
   const std::string & deviceId() const { return device_id_; }
   void setDeviceId(const std::string & id) { device_id_ = id; }
+  int  abi() const { return abi_; }
 
   /** @brief 查表；未命中或设备不匹配返回 nullptr。*/
   const TuningEntry * lookup(const OpSignature & sig) const;
@@ -111,6 +122,7 @@ public:
 
 private:
   bool                              enabled_ = true;
+  int                               abi_ = 0;   // 0 = 文件未标注（向后兼容，接受）
   std::string                       device_id_;
   std::map<std::string, TuningEntry> entries_;
 };

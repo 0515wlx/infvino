@@ -331,6 +331,9 @@ def render(r: dict) -> str:
     st, h, p, sc, so = r["states"], r["host"], r["pool"], r["scorecard"], r["structural"]
     L.append(f"# 预算报告 · {r['model']}")
     L.append(f"device: {r['device']}   iters={r['iters']}   dispatches/帧={r['dispatches_per_frame']:.0f}")
+    L.append("# 读 ops/EU/cyc 前先做 roofline 判断：内存/指令/launch 受限的层算子低 ratio≠可挖；")
+    L.append("#   很多 kernel 只是更大模式的一部分（可融合），只看单 kernel 不合理，须结合端到端。")
+    L.append("#   详见 docs/profiling-budget.md §3.0。")
     L.append("")
     L.append("## 1. 三层预算瀑布")
     if st:

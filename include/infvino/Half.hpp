@@ -4,6 +4,7 @@
 #ifndef INFVINO__HALF_HPP_
 #define INFVINO__HALF_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -46,6 +47,17 @@ inline float f16_to_f32(uint16_t h)
   std::memcpy(&out, &f, 4);
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// 批量转换（热路径：整网输入 f32->f16、输出 f16->f32）。
+// 实现与上面的标量版**逐位一致**（同样的截断/denormal flush 语义），但在支持的
+// x86 上用 AVX2 无分支实现；否则回退标量循环。
+// 动机（docs/budget-analysis-3models.md §9）：ClBackend 每次推理对 1.23M 输入 +
+// 0.47M 输出做转换，实测在项目编译选项下约 1.59 ms/帧（yolo），是净耗时里一块
+// 未被优化的固定开销。批量版 ~0.5 ms。
+// ---------------------------------------------------------------------------
+void f32_to_f16_bulk(const float * in, uint16_t * out, size_t n);
+void f16_to_f32_bulk(const uint16_t * in, float * out, size_t n);
 
 }  // namespace infvino
 
