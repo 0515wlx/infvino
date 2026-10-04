@@ -47,6 +47,7 @@ int main(int argc, char ** argv)
   bool refresh = false;
   bool global = false;
   int  gIters = 0, gTopK = 3, gRounds = 3, gLimit = 0;
+  std::string planTuning;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -69,6 +70,7 @@ int main(int argc, char ** argv)
     else if (a == "--global-topk") gTopK = std::atoi(next().c_str());
     else if (a == "--global-rounds") gRounds = std::atoi(next().c_str());
     else if (a == "--global-limit") gLimit = std::atoi(next().c_str());
+    else if (a == "--plan-tuning") planTuning = next();
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -87,6 +89,7 @@ int main(int argc, char ** argv)
         "  --global-topk K    每个签名参与回验的候选上限（隔离 top-K；默认 3）\n"
         "  --global-rounds R  坐标下降轮数上限（默认 3）\n"
         "  --global-limit N   最多回验 N 个签名（0=不限；安全分批用）\n"
+        "  --plan-tuning <f>  per-plan 选择覆盖的输出路径（默认 <plan>.tuning.json）\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
         "  --bake <out.plan>  额外复制一份 plan（审计；运行时以 cache 为准）\n"
@@ -153,6 +156,22 @@ int main(int argc, char ** argv)
       {
         auto it = ents.find(d.first);
         if (it != ents.end()) d.second = it->second;
+      }
+      // R45 P0#4: 把 per-plan 选择覆盖落盘（默认 <plan>.tuning.json）。
+      std::string pt = planTuning;
+      if (pt.empty())
+      {
+        const char * e = std::getenv("INFVINO_PLAN_TUNING");
+        if (e) pt = e;
+      }
+      if (pt.empty()) pt = plan_path + ".tuning.json";
+      if (pt != "none")
+      {
+        if (model.savePlanOverrides(pt))
+          std::printf("wrote plan overrides %s (%zu entries)\n", pt.c_str(),
+                      model.planOverrideCount());
+        else
+          std::fprintf(stderr, "failed to write plan overrides %s\n", pt.c_str());
       }
     }
 

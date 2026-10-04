@@ -69,6 +69,23 @@ PlanModel::PlanModel(
   tuning_ = TuningCache::loadDefault();
   tuning_.setDeviceId(TuningCache::deviceKey(rt_.info()));
 
+  // R45 P0#4: per-plan 选择覆盖（位置相关的全局最优）。默认 <plan>.tuning.json；
+  // INFVINO_PLAN_TUNING 可覆盖路径；INFVINO_TUNING=off 时随 tuning_ 一并禁用。
+  {
+    const char * pt = std::getenv("INFVINO_PLAN_TUNING");
+    std::string path = pt ? std::string(pt) : (plan_path_ + ".tuning.json");
+    if (path == "none") plan_overrides_.setEnabled(false);
+    else {
+      plan_overrides_ = TuningCache::load(path);
+      plan_overrides_.setDeviceId(tuning_.deviceId());
+      if (!tuning_.enabled()) plan_overrides_.setEnabled(false);
+      if (std::getenv("INFVINO_PLAN_TUNING_REPORT"))
+        std::fprintf(stderr, "[plan-tuning] %s: %zu override(s), device=%s%s\n", path.c_str(),
+                     plan_overrides_.size(), plan_overrides_.deviceId().c_str(),
+                     plan_overrides_.enabled() ? "" : " (disabled)");
+    }
+  }
+
   // R36/R38: 布局与 (族,布局) 选择必须在 tuning 载入之后、首次 run() 之前（P2 dispatch
   // 缓存会录制参数）。resolveLayoutChoices() 在缓存含 `#blk/#non` 时跑联合不动点，
   // 否则退化为一次 planBlockedLayout()。
@@ -964,8 +981,17 @@ void PlanModel::planBlockedLayout()
                  marked);
 }
 
+OpSignature PlanModel::planNodeKey(const std::string & out_name) const
+{
+  return OpSignature::custom("plan@" + out_name, {});
+}
+
 const TuningEntry * PlanModel::choiceEntry(size_t ni, const OpSignature & sig) const
 {
+  // R45 P0#4: per-plan 覆盖优先级最高（本图的位置相关全局最优）。
+  if (ni < nodes_.size() && !nodes_[ni].outs.empty())
+    if (const TuningEntry * e = plan_overrides_.lookup(planNodeKey(nodes_[ni].outs[0])))
+      if (!e->kernel.empty()) return e;
   if (ni < node_choice_.size() && !node_choice_[ni].kernel.empty()) return &node_choice_[ni];
   return tuning_.lookup(sig);
 }
@@ -3941,6 +3967,20 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   }
   int changed_total = 0;
   for (char w : won) if (w) ++changed_total;
+
+  // R45 P0#4: 把本图的位置相关选择写进 per-plan 覆盖（node 输出名为键），与跨模型共享的
+  // tuning_ 分离——避免「在 y8 上做的全局选择覆盖掉 y11 需要的那份」。
+  plan_overrides_.setEnabled(true);
+  plan_overrides_.setDeviceId(tuning_.deviceId());
+  for (auto & t : targets)
+    for (size_t ni : t.nodes)
+      if (ni < assign.size() && ni < nodes_.size() && !nodes_[ni].outs.empty() &&
+          !assign[ni].kernel.empty())
+      {
+        TuningEntry e = assign[ni];
+        if (e.device_id.empty()) e.device_id = tuning_.deviceId();
+        plan_overrides_.put(planNodeKey(nodes_[ni].outs[0]), e);
+      }
 
   invalidateCapture();
   resolveLayoutChoices();

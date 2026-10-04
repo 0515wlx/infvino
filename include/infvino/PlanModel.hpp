@@ -123,6 +123,20 @@ public:
   bool saveTuning(const std::string & path) const { return tuning_.save(path); }
 
   /**
+   * @brief R45 P0#4: **per-plan 选择覆盖**（解决共享签名缓存的跨模型稀释）。
+   *
+   * 全局最优常是**位置相关**的（同一 shape 在 y8/y11 的邻居/持久化不同），而 `tuning.json`
+   * 是签名级、跨模型共享的——一份「选谁」无法两全。本机制把**计划级**的 per-node 选择存成
+   * 独立工件：key = 节点输出张量名（唯一），运行时由 `choiceEntry` 最高优先消费。
+   * `config/tuning.json` 退化为「可移植的隔离默认」，per-plan 工件承载「本图的全局最优」。
+   *
+   * 加载：`INFVINO_PLAN_TUNING`，否则 `<plan>.tuning.json`；`INFVINO_TUNING=off` 一并禁用。
+   * 保存：`globalRetune()` 选出后由调用方 `savePlanOverrides(path)` 落盘。
+   */
+  bool   savePlanOverrides(const std::string & path) const { return plan_overrides_.save(path); }
+  size_t planOverrideCount() const { return plan_overrides_.size(); }
+
+  /**
    * @brief R44: **整网 busy 坐标下降回验** —— 修正 autotune 目标函数的根本缺陷。
    *
    * 隔离 bench 的 `min(ms)` 只是**局部代理**：候选在冷/空 cache 下的名次，不等于它在真实
@@ -265,6 +279,8 @@ private:
   void    resolveLayoutChoices();
   /** @brief R38: per-node 覆盖（不动点结果），未命中则回退到签名缓存。 */
   const TuningEntry * choiceEntry(size_t ni, const OpSignature & sig) const;
+  /** @brief R45 P0#4: per-plan 覆盖的节点键（用节点输出名，保证唯一且跨重生成稳定）。*/
+  OpSignature planNodeKey(const std::string & out_name) const;
   /** @brief R36: 该 conv3x3 节点是否会被纳入 blocked 通路（与 dispatch 同判据）。 */
   bool    convWillUseBlk(const Node & n) const;
   /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
@@ -384,6 +400,9 @@ private:
     std::vector<TuningEntry> cands;
   };
   std::map<std::string, CandidateSet>    cand_short_;
+  // R45 P0#4: per-plan 选择覆盖（node 输出名 -> TuningEntry）。最高优先级，承载本图的
+  // 位置相关全局最优；与跨模型共享的 tuning_ 分离。
+  TuningCache                            plan_overrides_;
   // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;
