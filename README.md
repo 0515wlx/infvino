@@ -153,6 +153,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round33-conv3x3-headroom.md`](docs/round33-conv3x3-headroom.md) | **R33 conv3×3 剩余空间**：三通路逐配额重算 / 「赢 OV」的两块区域 / CINC 候选（+45%，逐位一致） |
 | [`docs/block-layout.md`](docs/block-layout.md) | **R36 持久 blocked 布局 + 布局自动化**：`b_fs_yx_fsv16` 链 / `OUT_FSV16` / 同帧去重 / autotune 驱动的规划器 |
 | [`docs/openvino-gap-analysis.md`](docs/openvino-gap-analysis.md) | **infvino vs OpenVINO GPU 差距分析**：逐维对标 / 强项 / 学习清单（P0–P3） |
+| [`docs/kernel-families.md`](docs/kernel-families.md) | **算子族管理与接入框架**：声明式 `KernelFamily` 注册表 / 布局图 / per-family 上限模型 / scenario→族 判定；含 **blocked 1×1 移植样例**（`conv1x1_blk`，pointwise 5–6×）|
 | [`docs/memory-reuse-design.md`](docs/memory-reuse-design.md) | **P0 激活内存池设计 + R-P0 实测**：生存期复用 / 视图并集 / 墙钟收益 |
 | [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
@@ -311,6 +312,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] 融合通用化（P1）：通用/depthwise conv 折入激活 epilogue；mobilenet `ew_unary` 11→0、busy −2.4%、逐位一致
 - [x] P1-layout 调研收口：重排 launch floor 主导、可省边 <2% 墙钟（首轮暂缓）
 - [x] block layout（R36）：持久 `b_fs_yx_fsv16` 链 + 同帧去重 + **autotune 驱动的布局自动化**；y8 reorder 24→10、busy −2.2%、逐位一致（`docs/block-layout.md`）
+- [x] 算子族注册表（Phase 2）：`KernelFamily` 声明式管理（候选/布局/上限/激活契约）驱动选择；移植 **blocked 1×1（RES）+ blocked depthwise**，`1x1→depthwise→1x1` 持久 fsv16 链；canonical 激活码统一；mobilenet busy **2.62→1.72 ms（−34%）**、yolo11 −3%、三模型 `model_check` PASS（`docs/kernel-families.md`）
 - [x] P2 host 分段实测：busy 占墙钟 52–74%，缺口 = 入队提交 + setArg/簿记（`docs/benchmark.md` §2.4）
 - [x] 磁盘 kernel 二进制缓存（`INFVINO_PROGRAM_CACHE`）：冷启动 JIT 8.5–12 s → ~0.1 s，逐位一致
 - [x] 激活池 byte-offset 子分配（默认开，`INFVINO_NO_POOL_OFFSET=1` 可关）：y8 24.0→20.6 MB、busy −1.7%
