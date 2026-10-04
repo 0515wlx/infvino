@@ -45,6 +45,8 @@ int main(int argc, char ** argv)
   int  limit = 0, iters = 30;
   bool report = false, expected = false, bake = false, list = false, retune = false;
   bool refresh = false;
+  bool global = false;
+  int  gIters = 0, gTopK = 3, gRounds = 3, gLimit = 0;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -62,6 +64,11 @@ int main(int argc, char ** argv)
     else if (a == "--list") list = true;
     else if (a == "--retune") retune = true;
     else if (a == "--refresh-expected") refresh = true;
+    else if (a == "--global") global = true;
+    else if (a == "--global-iters") gIters = std::atoi(next().c_str());
+    else if (a == "--global-topk") gTopK = std::atoi(next().c_str());
+    else if (a == "--global-rounds") gRounds = std::atoi(next().c_str());
+    else if (a == "--global-limit") gLimit = std::atoi(next().c_str());
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -75,6 +82,11 @@ int main(int argc, char ** argv)
         "  --list             只列出唯一签名，不跑 GPU 计时\n"
         "  --retune           忽略缓存里已有的 tuned 条目，强制重新扫描（候选/标准更新后用）\n"
         "  --refresh-expected  仅用当前中间标准重算缓存命中项的 expected/ratio（**零 GPU**）\n"
+        "  --global           R44: 隔离扫描后做整网 busy 坐标下降回验（目标函数改为端到端）\n"
+        "  --global-iters N   每个候选的整网测量次数（取 min busy；默认 3）\n"
+        "  --global-topk K    每个签名参与回验的候选上限（隔离 top-K；默认 3）\n"
+        "  --global-rounds R  坐标下降轮数上限（默认 3）\n"
+        "  --global-limit N   最多回验 N 个签名（0=不限；安全分批用）\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
         "  --bake <out.plan>  额外复制一份 plan（审计；运行时以 cache 为准）\n"
@@ -128,6 +140,21 @@ int main(int argc, char ** argv)
 
     auto done = model.autotune(ops, only, limit, iters, /*merge=*/true, /*verbose=*/report,
                                /*retune=*/retune);
+
+    if (global)
+    {
+      // R44：把目标函数从「单节点隔离 min」换成「整网 busy」，对隔离 top-K 做坐标下降回验。
+      // 必须在同一次进程里先跑完隔离扫描（本进程的 cand_short_ 才有内容）。
+      const int nchg = model.globalRetune(ops, gIters, gTopK, gRounds, gLimit);
+      std::printf("global-retune: %d signature(s) reselected by whole-net busy\n", nchg);
+      // 回验后缓存里的选择已变；把本次调过的签名同步回 done，便于 --expected 打印。
+      const auto & ents = model.tuning().entries();
+      for (auto & d : done)
+      {
+        auto it = ents.find(d.first);
+        if (it != ents.end()) d.second = it->second;
+      }
+    }
 
     if (expected)
     {

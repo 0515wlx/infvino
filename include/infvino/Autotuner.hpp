@@ -71,12 +71,15 @@ bool benchCandidate(
  *                     允许抛异常（该候选被跳过）。
  * @param flops     用于 ops/EU/cyc 计算的 FLOPs。
  * @param iters     计时迭代数。
+ * @param measured  可选输出：**所有成功测到的候选**（含各自 min ms / kernel / options），
+ *                  按 ms 升序。R44 的整网 busy 坐标下降回验需要「隔离期的 top-K」作为
+ *                  短名单，因此保留全量测量结果，而不是只留胜者。
  * @return 最优 entry；所有候选都失败时返回空 kernel 的 entry。
  */
 TuningEntry autotuneOp(
   ClRuntime & rt, const OpSignature & sig, const std::vector<Candidate> & cands,
   const std::function<std::function<cl_event()>(const Candidate &)> & makeEnqueue,
-  double flops, int iters);
+  double flops, int iters, std::vector<TuningEntry> * measured = nullptr);
 
 }  // namespace infvino
 

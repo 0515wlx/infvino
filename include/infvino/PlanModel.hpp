@@ -123,6 +123,34 @@ public:
   bool saveTuning(const std::string & path) const { return tuning_.save(path); }
 
   /**
+   * @brief R44: **整网 busy 坐标下降回验** —— 修正 autotune 目标函数的根本缺陷。
+   *
+   * 隔离 bench 的 `min(ms)` 只是**局部代理**：候选在冷/空 cache 下的名次，不等于它在真实
+   * 流水线里的名次（R43 §5.1 实测 9 个 conv1x1 配置「隔离更快、整网更慢」，因为候选互相
+   * 争 L3/DRAM 与在飞占用）。本函数把目标函数从「单节点隔离 min」换成**整网 busy**
+   * （`profile().busy_ms`，逐 kernel event 时间之和）：
+   *
+   *   1. 取隔离扫描保留的每个签名短名单（top-K）；
+   *   2. 逐签名坐标下降：把候选赋给该签名的节点 → 重规划布局 → 重录 dispatch →
+   *      跑整网 reps 次取 busy 最小值，保留使整网 busy 最小者；若相对现状改善 >
+   *      `minGain`（0.5%）才接受；
+   *   3. 多轮直到无签名改变；最终结果写回 tuning_（由调用方落盘）。
+   *
+   * 这直接修复「局部最优 ≠ 全局最优」：只有真正降低端到端 busy 的候选才会被选中。
+   *
+   * @param ops    只回验这些 op（空 = 所有有短名单的 op）。
+   * @param iters  每个候选的整网测量重复次数（0 = 默认 3；取每次的最小 busy）。
+   * @param topK   每个签名参与回验的候选上限（按隔离 ms 取前 K，默认 3）。
+   * @param rounds 坐标下降轮数上限（默认 3）。
+   * @param limit  最多回验的签名数（0 = 不限；安全分批用）。
+   * @return 实际改变选择的签名数。
+   *
+   * 需要 profiling=true（否则测不到逐 kernel event 时间）与可运行的整网输入。
+   */
+  int globalRetune(const std::vector<std::string> & ops = {}, int iters = 0, int topK = 3,
+                   int rounds = 3, int limit = 0);
+
+  /**
    * @brief P3 在线调优：对缓存里尚未命中的签名，按顺序在线 benchmark 至多 `budget`
    *        个并 merge 进 tuning_（需要 profiling=true 的 runtime 才能计时）。
    *        与离线 `kernel_autotune` 共享同一套候选/中间标准；失败静默跳过。
@@ -312,6 +340,8 @@ private:
   OpSignature nodeSignature(const Node & n, bool * ok = nullptr) const;
   /** @brief P2: 克隆一个 kernel（独立参数状态，用于跨帧跳过 setArg）。 */
   cl_kernel cloneKernel(cl_kernel src);
+  /** @brief P2: 让已录制的 dispatch 失效（调优/布局改变后必须重录）。 */
+  void    invalidateCapture();
   /** @brief R32 原型：把整帧 dispatch 录制进 cl_khr_command_buffer（CUDA-graph 类比）。*/
   void buildCommandBuffer();
   /**
@@ -346,6 +376,14 @@ private:
   // R38: per-node resolved (family, layout) choice from the joint fixpoint. Empty kernel
   // = no override (fall back to the signature cache).
   std::vector<TuningEntry>               node_choice_;
+  // R44: 隔离扫描保留的每签名候选短名单（供整网 busy 坐标下降回验）。autotune() 每次
+  // 调用重建；globalRetune() 消费。值里带 OpSignature，便于精确写回 tuning_。
+  struct CandidateSet
+  {
+    OpSignature              sig;
+    std::vector<TuningEntry> cands;
+  };
+  std::map<std::string, CandidateSet>    cand_short_;
   // Round 22: cached OSV-swizzled conv3x3 weights for the OpenVINO kernel port
   // (keyed by the plan init name), plus their owning handles.
   std::unordered_map<std::string, cl_mem> ov_w_;

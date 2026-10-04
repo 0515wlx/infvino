@@ -583,4 +583,23 @@ R31 增加了 `depthwise_vp`（零边 `depthwise_pad` + 无边界卷积）候选
 「先测什么」：实测 busy 只占墙钟 52–74%，host 开销 = 入队 + setArg/其它两块。
 数据与结论见 `docs/benchmark.md` §2.4。
 
+---
+
+## 13. Round 44：目标函数修正（隔离 min → 整网 busy 坐标下降回验）
+
+> 修正 R28–R43 一直沿用的**选择目标函数**：`autotuneOp` 按单节点、隔离、空 cache 的
+> `min(ms)` 选候选——这是局部代理，不等于端到端最优（R43 §5.1 实测「隔离更快、流水线
+> 更慢」）。完整设计与体系缺陷倒查见
+> [`round44-global-objective.md`](round44-global-objective.md)。
+
+- **数据层**：`autotuneOp` 新增可选 `measured` 输出，保留**全部**成功测到的候选
+  （top-K 短名单）；`PlanModel::autotune()` 将其存入 `cand_short_`。
+- **目标层**：`PlanModel::globalRetune(ops, iters, topK, rounds, limit)` 在真实 plan 上做
+  坐标下降：候选 → 直接控制 per-node 选择 + `planBlockedLayout()` + 重录 dispatch →
+  跑整网、取 `min(busy_ms)`；只有改善 > 0.5% 才接受。**目标函数 = 端到端 busy。**
+- **CLI**：`kernel_autotune --global [--global-topk K] [--global-iters N]
+  [--global-rounds R] [--global-limit N]`；`INFVINO_GLOBAL_RETUNE_REPORT=1` 打印改写。
+- **边界**：默认关闭；目前覆盖 `conv3x3/conv1x1/depthwise`（`choiceEntry` 驱动）；
+  结果仍写回**签名级**共享缓存（跨 plan 稀释问题列为体系缺陷 #4）。
+
 

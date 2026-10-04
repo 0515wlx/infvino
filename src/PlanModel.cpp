@@ -1179,6 +1179,18 @@ void PlanModel::noteNode(size_t ni, const std::string & tag, double ms)
     node_tag_[ni] = tag;
 }
 
+void PlanModel::invalidateCapture()
+{
+  captured_ = false;
+  node_cmds_.clear();
+  if (cmdbuf_ && cmdbuf_release_)
+  {
+    reinterpret_cast<clReleaseCommandBufferKHR_fn>(cmdbuf_release_)(
+      static_cast<cl_command_buffer_khr>(cmdbuf_));
+    cmdbuf_ = nullptr;
+  }
+}
+
 PlanModel::PlanProfile PlanModel::profile() const
 {
   PlanProfile p;
@@ -3003,6 +3015,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
 {
   std::map<std::string, TuningEntry> done;
   int n_tuned = 0;
+  cand_short_.clear();  // R44: 每次隔离扫描重建短名单
   std::map<std::string, int> sig_seen;  // 同一签名只调一次（plan 里大量层共享签名）
   // 返回 true 表示该签名还未调过（并登记）；false 表示跳过。
   // 已在本进程调过、或缓存里已有 source=="tuned" 的条目 → 跳过（让分批调用自然推进）。
@@ -3158,9 +3171,17 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       std::vector<Candidate> cBlk, cNon;
       for (const auto & c : cands)
         (c.kernel == "conv3x3_blk" ? cBlk : cNon).push_back(c);
-      TuningEntry en = autotuneOp(rt_, sig, cNon, makeEnqueue, flops, iters);
+      std::vector<TuningEntry> shortNon, shortBlk;
+      TuningEntry en = autotuneOp(rt_, sig, cNon, makeEnqueue, flops, iters, &shortNon);
       TuningEntry eb = cBlk.empty() ? TuningEntry()
-                                    : autotuneOp(rt_, sig, cBlk, makeEnqueue, flops, iters);
+                                    : autotuneOp(rt_, sig, cBlk, makeEnqueue, flops, iters, &shortBlk);
+      // R44: 保留全部测到的候选（blk + 非 blk），供 globalRetune 的整网 busy 回验。
+      {
+        auto & cs = cand_short_[sig.str()];
+        cs.sig = sig;
+        cs.cands = shortNon;
+        cs.cands.insert(cs.cands.end(), shortBlk.begin(), shortBlk.end());
+      }
       TuningEntry e = en;
       if (!eb.kernel.empty() && (en.kernel.empty() || eb.ms < en.ms)) e = eb;
       if (merge && !eb.kernel.empty())
@@ -3242,7 +3263,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
         };
       };
-      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      std::vector<TuningEntry> shortAll;
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters, &shortAll);
+      if (auto & cs = cand_short_[sig.str()]; cs.cands.empty())
+      {
+        cs.sig = sig;
+        cs.cands = shortAll;
+      }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
         ++n_tuned;
@@ -3317,7 +3344,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
         };
       };
-      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      std::vector<TuningEntry> shortAll;
+      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters, &shortAll);
+      {
+        auto & cs = cand_short_[sig.str()];
+        cs.sig = sig;
+        cs.cands = shortAll;
+      }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
         ++n_tuned;
@@ -3434,10 +3467,11 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       std::vector<Candidate> xCandsBlk, xCandsNon;
       for (const auto & c : cands)
         (c.kernel == "conv1x1_blk" ? xCandsBlk : xCandsNon).push_back(c);
-      TuningEntry eNon = autotuneOp(rt_, sig, xCandsNon, makeEnqueue, flops, iters);
+      std::vector<TuningEntry> xShortNon, xShortBlk;
+      TuningEntry eNon = autotuneOp(rt_, sig, xCandsNon, makeEnqueue, flops, iters, &xShortNon);
       TuningEntry e = eNon;
       if (!xCandsBlk.empty()) {
-        TuningEntry eb = autotuneOp(rt_, sig, xCandsBlk, makeEnqueue, flops, iters);
+        TuningEntry eb = autotuneOp(rt_, sig, xCandsBlk, makeEnqueue, flops, iters, &xShortBlk);
         if (!eb.kernel.empty()) {
           // R43: no longer a one-way "conservative billing" baked into the entry.
           // Store the two alternatives + the reorder cost separately (like conv3x3)
@@ -3479,6 +3513,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           const double eff = eb.ms + reorderMs;
           if (eNon.kernel.empty() || eff < eNon.ms) e = eb;
         }
+      }
+      // R44: 保留 conv1x1 的全部候选（non + blk）供整网 busy 回验。
+      {
+        auto & cs = cand_short_[sig.str()];
+        cs.sig = sig;
+        cs.cands = xShortNon;
+        cs.cands.insert(cs.cands.end(), xShortBlk.begin(), xShortBlk.end());
       }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
@@ -3614,10 +3655,11 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       std::vector<Candidate> candsBlk, candsNonBlk;
       for (const auto & c : candsNoPad)
         (c.kernel == "depthwise_blk" ? candsBlk : candsNonBlk).push_back(c);
-      TuningEntry eNon = autotuneOp(rt_, sig, candsNonBlk, makeEnqueue, flops, iters);
+      std::vector<TuningEntry> dShortNon, dShortBlk;
+      TuningEntry eNon = autotuneOp(rt_, sig, candsNonBlk, makeEnqueue, flops, iters, &dShortNon);
       TuningEntry e = eNon;
       if (!candsBlk.empty()) {
-        TuningEntry eb = autotuneOp(rt_, sig, candsBlk, makeEnqueue, flops, iters);
+        TuningEntry eb = autotuneOp(rt_, sig, candsBlk, makeEnqueue, flops, iters, &dShortBlk);
         if (!eb.kernel.empty()) {
           // R43：不再只做单向「保守计费」；与 conv3x3/conv1x1 一样把 blk/non/reorder
           // 分开存，交给联合 (族,布局) 不动点按实际持久化精确判定。
@@ -3655,6 +3697,14 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           const double eff = eb.ms + reorderMs;   // billed selection cost
           if (eNon.kernel.empty() || eff < eNon.ms) e = eb;   // store kernel-only ms
         }
+      }
+      // R44: 保留 depthwise 全部候选（non + blk）供整网 busy 回验。pad 变体（opt-in）语义
+      // 上多一趟 pad dispatch，不直接放进短名单。
+      {
+        auto & cs = cand_short_[sig.str()];
+        cs.sig = sig;
+        cs.cands = dShortNon;
+        cs.cands.insert(cs.cands.end(), dShortBlk.begin(), dShortBlk.end());
       }
       if (!candsPad.empty()) {
         TuningEntry ev = autotuneOp(rt_, sig, candsPad, makeEnqueue, flops, iters);
@@ -3707,7 +3757,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             return ClRuntime::enqueueND(rt_.queue(), k, dim, gws, useLws ? lws : nullptr);
           };
         };
-        TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+        std::vector<TuningEntry> sShort;
+        TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters, &sShort);
+        {
+          auto & cs = cand_short_[sig.str()];
+          cs.sig = sig;
+          cs.cands = sShort;
+        }
         if (!e.kernel.empty()) {
           done[sig.str()] = e;
           ++n_tuned;
@@ -3723,19 +3779,170 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
   }
 
   // P2: 调优改变了 kernel/options ⇒ 已录制的 dispatch 失效，下一次 run() 重新录制。
-  if (merge && !done.empty()) {
-    captured_ = false;
-    node_cmds_.clear();
-    if (cmdbuf_ && cmdbuf_release_) {
-      reinterpret_cast<clReleaseCommandBufferKHR_fn>(cmdbuf_release_)(
-        static_cast<cl_command_buffer_khr>(cmdbuf_));
-      cmdbuf_ = nullptr;
-    }
-  }
+  if (merge && !done.empty()) invalidateCapture();
 
   // tuning 改变后同步布局（联合选择的一步：布局契约随选中的族变化）。
   if (n_tuned > 0) resolveLayoutChoices();
   return done;
+}
+
+// ---------------------------------------------------------------------------
+// R44: 整网 busy 坐标下降回验（修正「隔离 min ≠ 全局最优」）
+// ---------------------------------------------------------------------------
+int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int topK, int rounds,
+                            int limit)
+{
+  if (!profiling_)
+  {
+    std::fprintf(stderr, "[global-retune] needs profiling=true; skipped\n");
+    return 0;
+  }
+  if (cand_short_.empty())
+  {
+    std::fprintf(stderr, "[global-retune] no candidate shortlist; run isolated autotune first\n");
+    return 0;
+  }
+  if (topK < 1) topK = 1;
+  if (rounds < 1) rounds = 1;
+  const int reps = (iters > 0) ? iters : 3;   // 每个 assignment 的整网测量次数（取 min busy）
+  const double kMinGain = 0.005;              // 至少 0.5% 整网 busy 改善才接受
+
+  auto opWanted = [&](const std::string & op) {
+    // 目前只有这三族在 run() 里消费 per-node 覆盖（choiceEntry）；gemm / cat4 / 小算子
+    // 直接读 tuning_.lookup，用「直接赋值」测不到候选（见审计文档）。先限定在可覆盖族。
+    const bool overridable = (op == "conv3x3" || op == "conv1x1" || op == "depthwise");
+    return overridable && (ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end());
+  };
+
+  // 目标签名 = 短名单里能在本 plan 里找到节点的签名（按隔离 ms 取 top-K）。
+  struct Target { CandidateSet cs; std::vector<size_t> nodes; };
+  std::vector<Target> targets;
+  for (auto & kv : cand_short_)
+  {
+    CandidateSet & cs = kv.second;
+    if (cs.cands.empty() || !opWanted(cs.sig.op)) continue;
+    std::vector<size_t> nodes;
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      bool ok = false;
+      const OpSignature s = nodeSignature(nodes_[ni], &ok);
+      if (ok && s.str() == kv.first) nodes.push_back(ni);
+    }
+    if (nodes.empty()) continue;
+    std::stable_sort(cs.cands.begin(), cs.cands.end(),
+                     [](const TuningEntry & a, const TuningEntry & b) { return a.ms < b.ms; });
+    if (static_cast<int>(cs.cands.size()) > topK) cs.cands.resize(static_cast<size_t>(topK));
+    Target t;
+    t.cs = cs;
+    t.nodes = std::move(nodes);
+    targets.push_back(std::move(t));
+    if (limit > 0 && static_cast<int>(targets.size()) >= limit) break;
+  }
+  if (targets.empty()) return 0;
+
+  // 整网输入：零填充（卷积耗时对数值不敏感；只为给 run() 一个确定输入）。
+  if (!input_name_.empty() && inputNumel() > 0)
+  {
+    std::vector<uint16_t> zeros(inputNumel(), 0);
+    setInput(zeros.data());
+  }
+
+  // per-node 赋值：初始为构造期（联合不动点）的实际选择。测量走直接赋值 + planBlockedLayout，
+  // 不走 resolveLayoutChoices —— 否则不动点会用隔离 #blk/#non 覆盖我们正在回验的候选。
+  std::vector<TuningEntry> assign(nodes_.size());
+  for (auto & t : targets)
+    for (size_t ni : t.nodes)
+    {
+      if (const TuningEntry * ce = choiceEntry(ni, t.cs.sig)) assign[ni] = *ce;
+      else if (const TuningEntry * b = tuning_.lookup(t.cs.sig)) assign[ni] = *b;
+    }
+
+  auto busyFor = [&](const std::vector<size_t> & nodes, const TuningEntry & e) -> double {
+    for (size_t ni : nodes) assign[ni] = e;
+    node_choice_ = assign;
+    invalidateCapture();
+    planBlockedLayout();   // 只重规划布局，不覆盖 assign
+    double best = 1e300;
+    try
+    {
+      for (int r = 0; r <= reps; ++r)
+      {
+        clearProfile();
+        run();
+        if (r == 0) continue;  // 第 1 次是 capture/热身
+        const double b = profile().busy_ms;
+        if (b > 0.0 && b < best) best = b;
+      }
+    }
+    catch (const std::exception & ex)
+    {
+      // 候选无法执行（几何/资源）→ 用极大值拒绝，不中断整轮回验。
+      if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+        std::fprintf(stderr, "[global-retune] candidate %s rejected: %s\n", e.kernel.c_str(),
+                     ex.what());
+      return 1e300;
+    }
+    return best;
+  };
+
+  if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+    std::fprintf(stderr, "[global-retune] %zu signatures, topK=%d reps=%d rounds=%d\n",
+                 targets.size(), topK, reps, rounds);
+
+  // 落盘：base 签名写回 winner；同时把**同族**的 #blk / #non 备选更新为 winner，使运行时
+  // 的联合布局不动点在本 plan 上复现出同一个选择（跨 plan 的 #blk/#non 唯一分解限制见审计）。
+  auto persist = [&](const CandidateSet & cs, const TuningEntry & e) {
+    tuning_.put(cs.sig, e);
+    const bool isBlk = e.kernel.find("_blk") != std::string::npos;
+    const OpSignature altKey =
+      OpSignature::custom(cs.sig.str() + (isBlk ? "#blk" : "#non"), {});
+    if (tuning_.lookup(altKey)) tuning_.put(altKey, e);
+  };
+
+  std::vector<char> won(targets.size(), 0);
+  for (int round = 0; round < rounds; ++round)
+  {
+    int changed = 0;
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+    {
+      auto & t = targets[ti];
+      if (t.nodes.empty()) continue;
+      const TuningEntry base = assign[t.nodes[0]];
+      TuningEntry bestE = base;
+      double bestBusy = busyFor(t.nodes, base);
+      const double baseBusy = bestBusy;
+      for (const auto & c : t.cs.cands)
+      {
+        if (c.kernel == bestE.kernel && c.options == bestE.options) continue;
+        const double b = busyFor(t.nodes, c);
+        if (b > 0.0 && b < bestBusy * (1.0 - kMinGain))
+        {
+          bestBusy = b;
+          bestE = c;
+        }
+      }
+      for (size_t ni : t.nodes) assign[ni] = bestE;   // busyFor 会把 assign 留在最后一个候选
+      persist(t.cs, bestE);
+      if (bestE.kernel != base.kernel || bestE.options != base.options)
+      {
+        ++changed;
+        won[ti] = 1;
+        if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+          std::fprintf(stderr,
+                       "[global-retune] %-40s %s -> %s  busy %.4f -> %.4f ms (%.1f%%)\n",
+                       t.cs.sig.str().c_str(), base.kernel.c_str(), bestE.kernel.c_str(),
+                       baseBusy, bestBusy,
+                       baseBusy > 0.0 ? (baseBusy - bestBusy) / baseBusy * 100.0 : 0.0);
+      }
+    }
+    if (changed == 0) break;
+  }
+  int changed_total = 0;
+  for (char w : won) if (w) ++changed_total;
+
+  invalidateCapture();
+  resolveLayoutChoices();
+  return changed_total;
 }
 
 int PlanModel::onlineTuneMissing(int budget, int iters, const std::vector<std::string> & ops)

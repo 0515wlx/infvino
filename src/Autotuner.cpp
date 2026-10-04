@@ -47,13 +47,25 @@ bool benchCandidate(
 TuningEntry autotuneOp(
   ClRuntime & rt, const OpSignature & sig, const std::vector<Candidate> & cands,
   const std::function<std::function<cl_event()>(const Candidate &)> & makeEnqueue,
-  double flops, int iters)
+  double flops, int iters, std::vector<TuningEntry> * measured)
 {
   TuningEntry best;
   best.expected = expectedOps(sig, rt.info());
   best.device_id = TuningCache::deviceKey(rt.info());
   best.iters = iters;
   best.source = "tuned";
+
+  // 给一个（已填 kernel/options/ms/ops 的）entry 补齐中间标准：优先用「胜出族」自己的
+  // 上限模型（修 R33 的口径失真），硬上限只取 ISA 配额/roofline 下界（R43）。
+  auto applyStandard = [&](TuningEntry & e) {
+    const KernelFamily * f = familyByName(e.kernel);
+    e.expected = expectedOps(sig, rt.info());
+    if (f && f->ceiling) e.expected = f->ceiling(sig, rt.info());
+    e.hard_ceiling = (f && f->hardCeiling) ? f->hardCeiling(sig, rt.info()) : e.expected;
+    if (e.expected <= 0.0) e.expected = e.hard_ceiling;
+    e.ratio = e.expected > 0 ? e.ops / e.expected : 0.0;
+    e.hard_ratio = e.hard_ceiling > 0 ? e.ops / e.hard_ceiling : 0.0;
+  };
 
   const bool dbg = std::getenv("INFVINO_AUTOTUNE_DEBUG") != nullptr;
   // R42 anti-noise: instability is dominated by the LLC->DRAM cliff (working set
@@ -87,6 +99,19 @@ TuningEntry autotuneOp(
     if (dbg)
       std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f  spread=%+.0f%%\n",
                    c.kernel.c_str(), c.options.c_str(), ms, ops, sp * 100.0);
+    if (measured)
+    {
+      TuningEntry me;
+      me.kernel = c.kernel;
+      me.config = c.config;
+      me.options = c.options;
+      me.ms = ms;
+      me.ops = ops;
+      me.iters = iters;
+      me.device_id = best.device_id;
+      me.source = "candidate";
+      measured->push_back(std::move(me));
+    }
     if (best.kernel.empty() || ms < best.ms) {
       best.kernel = c.kernel;
       best.config = c.config;
@@ -121,15 +146,12 @@ TuningEntry autotuneOp(
       "[autotune] WARN %s: %d/%zu candidates unstable (spread>%.0f%%) — likely LLC "
       "spill/DRAM contention.\n",
       sig.str().c_str(), noisy, cands.size(), kSpreadWarn * 100.0);
-  if (!best.kernel.empty()) {
-    // 中间标准：优先用「胜出族」自己的上限模型（修 R33 的口径失真）。
-    const KernelFamily * f = familyByName(best.kernel);
-    if (f && f->ceiling) best.expected = f->ceiling(sig, rt.info());
-    // R43：硬上限只取 ISA 配额/roofline 下界（经验 derate 不进这里）。
-    best.hard_ceiling = (f && f->hardCeiling) ? f->hardCeiling(sig, rt.info()) : best.expected;
-    if (best.expected <= 0.0) best.expected = best.hard_ceiling;
-    best.ratio = best.expected > 0 ? best.ops / best.expected : 0.0;
-    best.hard_ratio = best.hard_ceiling > 0 ? best.ops / best.hard_ceiling : 0.0;
+  if (!best.kernel.empty()) applyStandard(best);
+  if (measured && !measured->empty())
+  {
+    for (auto & me : *measured) applyStandard(me);
+    std::stable_sort(measured->begin(), measured->end(),
+                     [](const TuningEntry & a, const TuningEntry & b) { return a.ms < b.ms; });
   }
   return best;
 }
