@@ -131,12 +131,16 @@ int main(int argc, char ** argv)
 
     if (expected)
     {
-      // 中间标准对照：期望 vs 实测（缓存命中项）。
-      std::printf("\n== expected vs measured (middle standard) ==\n");
-      std::printf("%-46s %8s %8s %6s\n", "signature", "measured", "expected", "ratio");
+      // 中间标准对照：软预测 vs 硬上限 vs 实测。
+      //   ratio      = ops/expected（软：含 amort/gridFactor，仅用于同族排序）
+      //   hard_ratio = ops/hard_ceiling（硬：ISA 配额/roofline，"离物理极限"）
+      std::printf("\n== expected(soft) / hard ceiling vs measured ==\n");
+      std::printf("%-44s %8s %8s %6s %8s %6s\n", "signature", "measured", "expected",
+                  "ratio", "hardC", "hardR");
       for (auto & kv : done)
-        std::printf("%-46s %8.2f %8.2f %6.2f\n", kv.first.c_str(), kv.second.ops,
-                    kv.second.expected, kv.second.ratio);
+        std::printf("%-44s %8.2f %8.2f %6.2f %8.2f %6.2f\n", kv.first.c_str(), kv.second.ops,
+                    kv.second.expected, kv.second.ratio, kv.second.hard_ceiling,
+                    kv.second.hard_ratio);
     }
 
     if (!cache_path.empty())

@@ -159,13 +159,17 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
         std::vector<std::pair<int, int>> blocks =
-          (s.stride == 2) ? std::vector<std::pair<int, int>>{{5, 4}, {4, 4}, {5, 2}, {6, 2}, {8, 2}, {3, 4}}
+          (s.stride == 2) ? std::vector<std::pair<int, int>>{{5, 4}, {4, 4}, {5, 2}, {6, 2}, {7, 2}, {8, 2}, {3, 4}}
                           : std::vector<std::pair<int, int>>{{8, 2}, {5, 2}, {6, 2}, {4, 4}, {8, 1}, {4, 2}, {10, 2}, {8, 4}};
-        // R37: conv_ov SLM_DIV>1 is implemented in kernels/conv_ov.cl but currently
-        // produces wrong results (model_check FAIL; root cause TBD), so it is NOT
-        // enumerated. Only SLM_DIV=1 (numerically equivalent to the pre-R37 kernel)
-        // is offered. Re-enable once the reduce is fixed.
+        // R37/R39: conv_ov SLM_DIV splits the kd loop across SLM_DIV sub-groups in
+        // one work-group (upstream SLM_DIV_FACTOR). The R37 numerical bug was a
+        // work-group-geometry error in the reduction (fixed in kernels/conv_ov.cl;
+        // R39), verified PASS by kernel_bench --verify and model_check. Enumerate
+        // powers of two bounded by Cin (the kd split is per-channel, so a
+        // non-divisor split is still correct and balanced to within one channel).
         std::vector<int> slms = {1};
+        for (int d = 2; d <= 8; d *= 2)
+          if (s.Cin >= d) slms.push_back(d);
         for (auto [obw, obh] : blocks) {
           if (s.W > 0 && obw > s.W) continue;
           if (s.H > 0 && obh > s.H) continue;
@@ -184,7 +188,18 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.ceiling = [peak](const OpSignature & s, const ClDeviceInfo & dev) {
         const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
         const int obw = (s.stride == 2) ? 5 : 8, obh = (s.stride == 2) ? 4 : 2;
-        const long n = wgCount(s.W, s.H, s.Cout, obw, obh, 16);
+        // R39 fix #1: an osv32 sub-group owns OSV=32 output channels (2/lane), so the
+        // channel factor is ceil(Cout/32), not ceil(Cout/16). The old value
+        // double-counted WGs and inflated gridFactor (inconsistent with expectedOps
+        // and with the actual gws).
+        // R39 fix #2: SLM_DIV packs up to SLM_DIV independent sub-groups into one
+        // work-group, so the occupancy unit is the sub-group, not the work-group.
+        // Now that SLM_DIV>1 is enumerated again, count sub-groups for the
+        // wave-quantization factor so the ceiling stays an upper bound (without this
+        // the measured ops of small grids exceed the modeled ceiling, e.g. ratio>1).
+        int slmMax = 1;
+        for (int d = 2; d <= 8; d *= 2) if (s.Cin >= d) slmMax = d;
+        const long n = wgCount(s.W, s.H, s.Cout, obw, obh, 32) * slmMax;
         double e = peak * kConvOvMadFraction * convAmort(s.Cin, obw, obh);
         e *= std::max(0.25, gridFactor(n, eu));
         return std::max(1.0, std::min(e, kConvOvIssueCeiling));
@@ -279,9 +294,15 @@ const std::vector<KernelFamily> & kernelFamilies()
           std::sort(cincs.begin(), cincs.end());
           cincs.erase(std::unique(cincs.begin(), cincs.end()), cincs.end());
         }
+        // R40: CB=8 for very narrow outputs. With Cout=8 a CB=16 work-item leaves
+        // half its accumulator lanes addressing out-of-range channels; CB=8 measured
+        // +21% (5.03 vs 4.16 ops) on 160x160 16->8. Only offered when Cout<=8 so the
+        // common Cout%16==0 shapes keep their existing candidate set.
+        std::vector<int> cbs = {32, 16};
+        if (s.Cout > 0 && s.Cout <= 8) cbs.insert(cbs.begin(), 8);
         for (int tx : {40, 20}) {
           if (s.W > 0 && tx > s.W) continue;
-          for (int cb : {32, 16}) {
+          for (int cb : cbs) {
             for (int cinc : cincs) {
               Conv3x3Cfg cfg;
               cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = cinc;
@@ -298,7 +319,12 @@ const std::vector<KernelFamily> & kernelFamilies()
       };
       f.ceiling = [peak](const OpSignature & s, const ClDeviceInfo & dev) {
         const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
-        const long n = wgCount(s.W, s.H, s.Cout, 40, 8, 32);
+        // R39 fix: the native conv3x3 work-group is (TX/TM, TY) = (40, 8) = 320
+        // work-items = 20 sub-groups, so the wave-quantization unit is the
+        // sub-group, not the work-group. Counting WGs made the ceiling ~20x too
+        // low on small grids (measured > ceiling, e.g. W80 Cin32 Cout16 ratio 1.59).
+        const int subPerWg = (40 / 1) * 8 / 16;
+        const long n = wgCount(s.W, s.H, s.Cout, 40, 8, 32) * subPerWg;
         double e = kConvStagingFreeCeiling * convAmort(s.Cin, 40, 8);
         e *= std::max(0.25, gridFactor(n, eu));
         return std::max(1.0, std::min(e, kConvStagingFreeCeiling));
@@ -586,6 +612,23 @@ const std::vector<KernelFamily> & kernelFamilies()
     }
     // 激活码契约（规范码，全族统一）：conv3x3 只实现 {0,1,3}；depthwise {0..4}；其余 {0..5}。
     for (auto & f : v) f.actMask = (f.op == "conv3x3") ? 0xB : (f.op == "depthwise" ? 0x1F : 0x3F);
+    // R43: 硬上限（只放 ISA 指令发射配额 / roofline 下界，不含 amort/gridFactor/延迟等
+    // 经验 derate）。集中在这里声明，避免散落；未命中者回退为软 `ceiling`。
+    for (auto & f : v) {
+      if (f.hardCeiling) continue;
+      const std::string & n = f.name;
+      if (n == "conv3x3_ov")         f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return kConvOvIssueCeiling; };
+      else if (n == "conv3x3_blk")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 16.9; };
+      else if (n == "conv3x3_f16")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return kConvStagingFreeCeiling; };
+      else if (n == "conv3x3_cin3")  f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 12.0; };
+      else if (n == "gemm_f16" || n == "gemm_sk_f16") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 13.7; };
+      else if (n == "conv1x1_blk")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 11.5; };
+      else if (n == "conv1x1_gemv_f16") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 8.0; };
+      else if (n == "depthwise_f16" || n == "depthwise_v") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.086; };
+      else if (n == "depthwise_vp")  f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.12; };
+      else if (n == "depthwise_blk") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.11; };
+      else f.hardCeiling = f.ceiling;   // 小算子 = roofline，本身就是物理下界
+    }
     return v;
   }();
   return fams;

@@ -87,15 +87,30 @@ target_link_libraries(kernel_autotune PRIVATE infvino)
 
 add_executable(tuning_test src/tools/tuning_test.cpp)
 target_link_libraries(tuning_test PRIVATE infvino)
-
 enable_testing()
 add_test(NAME tuning_test COMMAND tuning_test)
+
+# R43: GPU hardware counters via the Intel Metrics Discovery API (optional).
+# Provides independent evidence for "which wall" (EU time, L3/DRAM bytes, stalls),
+# cross-checking kernel_bench's -DPROBE attribution. Skipped if libigdmd is absent.
+find_library(IGDMD_LIB igdmd)
+find_path(IGDMD_INC metrics_discovery_api.h)
+if(IGDMD_LIB AND IGDMD_INC)
+  add_executable(gpu_metrics src/tools/gpu_metrics.cpp)
+  target_include_directories(gpu_metrics PRIVATE ${IGDMD_INC})
+  target_link_libraries(gpu_metrics PRIVATE ${IGDMD_LIB})
+else()
+  message(STATUS "gpu_metrics skipped: libigdmd / metrics_discovery_api.h not found")
+endif()
 
 install(TARGETS infvino infvino_bench infvino_numtest reuse_check kernel_run kernel_bench kernel_numtest kernel_autotune tuning_test
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+if(TARGET gpu_metrics)
+  install(TARGETS gpu_metrics RUNTIME DESTINATION bin)
+endif()
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY kernels/ DESTINATION share/infvino/kernels)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/config)

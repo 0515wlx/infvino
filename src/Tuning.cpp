@@ -251,6 +251,11 @@ TuningCache TuningCache::load(const std::string & path)
     e.ops      = std::atof(findField(body, "ops_per_eu_cyc", &f4).c_str());
     e.expected = std::atof(findField(body, "expected_ops_per_eu_cyc", &f5).c_str());
     e.ratio    = std::atof(findField(body, "ratio", &f6).c_str());
+    // R43: 硬上限字段（向后兼容：旧缓存没有则回退为软值）。
+    e.hard_ceiling = std::atof(findField(body, "hard_ceiling_ops_per_eu_cyc", &f7).c_str());
+    e.hard_ratio   = std::atof(findField(body, "hard_ratio", &f7).c_str());
+    if (e.hard_ceiling <= 0.0) e.hard_ceiling = e.expected;
+    if (e.hard_ratio <= 0.0 && e.hard_ceiling > 0.0) e.hard_ratio = e.ops / e.hard_ceiling;
     e.iters    = std::atoi(findField(body, "iters", &f7).c_str());
     e.device_id = findField(body, "device_id", &f7);
     e.source    = findField(body, "source", &f7);
@@ -301,6 +306,8 @@ bool TuningCache::save(const std::string & path) const
       << "\"ops_per_eu_cyc\": " << e.ops << ", "
       << "\"expected_ops_per_eu_cyc\": " << e.expected << ", "
       << "\"ratio\": " << e.ratio << ", "
+      << "\"hard_ceiling_ops_per_eu_cyc\": " << e.hard_ceiling << ", "
+      << "\"hard_ratio\": " << e.hard_ratio << ", "
       << "\"iters\": " << e.iters << ", "
       << "\"device_id\": \"" << jsonEscape(e.device_id) << "\", "
       << "\"source\": \"" << jsonEscape(e.source) << "\""

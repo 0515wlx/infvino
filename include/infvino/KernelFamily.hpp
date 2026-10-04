@@ -69,7 +69,14 @@ struct KernelFamily
   int actMask = 0x3F;
   std::function<bool(const OpSignature &)> supports;
   std::function<std::vector<Candidate>(const OpSignature &)> candidates;
+  // 软预测（"我们认为这层能到多少"）：含 amort / gridFactor / 占用等**经验 derate**。
+  // 仅用于排序与相对比较，**不是物理上界**。
   std::function<double(const OpSignature &, const ClDeviceInfo &)> ceiling;
+  // 硬上限（"物理上不可能超过"）：只放 ISA 指令发射配额 `32·mad_frac`（或 roofline
+  // 的唯一字节下界）这类**不可越**的界。经验 derate（延迟/L3 复用/占用）只能作为
+  // **告警/证据**，不得进这里——否则一次证伪（measured>hard）就同时污染了这些结论。
+  // 未设置时回退为 `ceiling`（本来就是 roofline 的族）。
+  std::function<double(const OpSignature &, const ClDeviceInfo &)> hardCeiling;
 };
 
 /** @brief 全部已注册的算子族（单一真相源）。 */

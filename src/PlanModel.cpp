@@ -909,7 +909,7 @@ void PlanModel::planBlockedLayout()
       const int act = attrInt(n, "act", 0);
       const bool dres = n.ins.size() > 3 && n.ins[3] != "-";
       const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
-      const TuningEntry * e = tuning_.lookup(sig);
+      const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "conv1x1_blk") return familyByName("conv1x1_blk");
     }
     if (n.op == "conv_general" && n.ins.size() >= 2 && !n.outs.empty()) {
@@ -925,7 +925,7 @@ void PlanModel::planBlockedLayout()
       if (!(G == Cin && (K == 3 || K == 5) && Cin == Cout)) return nullptr;
       const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
       const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
-      const TuningEntry * e = tuning_.lookup(sig);
+      const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "depthwise_blk") return familyByName("depthwise_blk");
     }
     return nullptr;
@@ -982,7 +982,7 @@ void PlanModel::resolveLayoutChoices()
   {
     bool ok = false;
     const OpSignature sig = nodeSignature(nodes_[ni], &ok);
-    if (!ok || sig.op != "conv3x3") continue;
+    if (!ok) continue;   // R43: generalized beyond conv3x3 (any op with #blk/#non)
     const TuningEntry * b = tuning_.lookup(OpSignature::custom(sig.str() + "#blk", {}));
     const TuningEntry * n = tuning_.lookup(OpSignature::custom(sig.str() + "#non", {}));
     if (!b || !n) continue;
@@ -1009,10 +1009,13 @@ void PlanModel::resolveLayoutChoices()
       if (!alt[ni].has) continue;
       const Node & n = nodes_[ni];
       // Is this node's input already persisted fsv16 (reorder free)?
+      // NB: conv1x1 keeps weights first (ins[0]) and the activation at ins[1];
+      // conv3x3 / depthwise keep the activation at ins[0].
+      const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
       bool in_fsv16 = false;
-      if (!n.ins.empty())
+      if (n.ins.size() > inIdx)
       {
-        auto xit = T_.find(n.ins[0]);
+        auto xit = T_.find(n.ins[inIdx]);
         if (xit != T_.end()) in_fsv16 = xit->second.fsv16;
       }
       double blkCost = alt[ni].blk.ms + (in_fsv16 ? 0.0 : alt[ni].reorder.ms);
@@ -2095,7 +2098,8 @@ void PlanModel::run()
         std::string gopts = t.options();
         const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
         std::string gkernel = "gemm_f16";
-        if (const TuningEntry * e = tuning_.lookup(sig)) {
+        const size_t ni1 = static_cast<size_t>(&n - nodes_.data());
+        if (const TuningEntry * e = choiceEntry(ni1, sig)) {
           gopts = e->options;
           if (!e->kernel.empty()) gkernel = e->kernel;
           if (gkernel == "gemm_f16") {
@@ -2199,7 +2203,8 @@ void PlanModel::run()
         std::string dwopts = dopts;
         std::string dkern = "depthwise_f16";
         const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
-        if (const TuningEntry * e = tuning_.lookup(sig)) {
+        const size_t ni1 = static_cast<size_t>(&n - nodes_.data());
+        if (const TuningEntry * e = choiceEntry(ni1, sig)) {
           if (!e->kernel.empty()) dkern = e->kernel;
           dwopts = e->options;
         }
@@ -2469,11 +2474,11 @@ void PlanModel::run()
         setArg(kk, 8, sizeof(Cout), &Cout);
         setArg(kk, 9, sizeof(Hout), &Hout);
         setArg(kk, 10, sizeof(Wout), &Wout);
-        const size_t lws[3] = {1, static_cast<size_t>(slm), 16};
+        const size_t lws[3] = {1, 1, static_cast<size_t>(16 * slm)};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw),
-          static_cast<size_t>(((Hout + obh - 1) / obh) * slm),
-          static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+          static_cast<size_t>((Hout + obh - 1) / obh),
+          static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16 * static_cast<size_t>(slm)};
         timed("conv3x3ov@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
                 std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout) + "(tuned)",
@@ -2965,10 +2970,28 @@ int PlanModel::refreshExpected(const std::vector<std::string> & ops)
         sig = OpSignature::conv1x1Cat4(C, N, K, 0, 0, 0, 0, nullptr, 0, 0);
         have = true;
       }
+    } else if (op == "conv3x3" && want("conv3x3")) {
+      // R39: refresh conv3x3 too, using the *winner family* ceiling (consistent with
+      // autotuneOp). Previously only gemm/conv1x1 were refreshed, so a ceiling-model
+      // fix for conv3x3 could not be applied without a full GPU retune. The key body
+      // is "W<w>H<h>s<stride>p<pad>_Cin<cin>_Cout<cout>_act<a>_f16[#...]".
+      int w = 0, h = 0, st = 0, pd = 0, cin = 0, cout = 0, act = 0;
+      if (std::sscanf(body.c_str(), "W%dH%ds%dp%d_Cin%d_Cout%d_act%d",
+                      &w, &h, &st, &pd, &cin, &cout, &act) == 7) {
+        sig = OpSignature::conv3x3(w, h, st, pd, cin, cout, act);
+        have = true;
+      }
     }
     if (!have) continue;
+    // Prefer the winner family's own ceiling (matches autotuneOp); fall back to the
+    // global middle standard for families without one.
     e.expected = expectedOps(sig, rt_.info());
+    const KernelFamily * fam = familyByName(e.kernel);
+    if (fam && fam->ceiling) e.expected = fam->ceiling(sig, rt_.info());
+    e.hard_ceiling = (fam && fam->hardCeiling) ? fam->hardCeiling(sig, rt_.info()) : e.expected;
+    if (e.hard_ceiling <= 0.0) e.hard_ceiling = e.expected;
     if (e.expected > 0.0) e.ratio = e.ops / e.expected;
+    e.hard_ratio = e.hard_ceiling > 0.0 ? e.ops / e.hard_ceiling : 0.0;
     ++n;
   }
   return n;
@@ -3044,11 +3067,11 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kk, 8, sizeof(Cout), &Cout);
           setArg(kk, 9, sizeof(Hout), &Hout);
           setArg(kk, 10, sizeof(Wout), &Wout);
-          const size_t lws[3] = {1, static_cast<size_t>(slm), 16};
+          const size_t lws[3] = {1, 1, static_cast<size_t>(16 * slm)};
           const size_t gws[3] = {
             static_cast<size_t>((Wout + obw - 1) / obw),
-            static_cast<size_t>(((Hout + obh - 1) / obh) * slm),
-            static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
+            static_cast<size_t>((Hout + obh - 1) / obh),
+            static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16 * static_cast<size_t>(slm)};
           return [this, kk, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
           };
@@ -3411,12 +3434,15 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       std::vector<Candidate> xCandsBlk, xCandsNon;
       for (const auto & c : cands)
         (c.kernel == "conv1x1_blk" ? xCandsBlk : xCandsNon).push_back(c);
-      TuningEntry e = autotuneOp(rt_, sig, xCandsNon, makeEnqueue, flops, iters);
+      TuningEntry eNon = autotuneOp(rt_, sig, xCandsNon, makeEnqueue, flops, iters);
+      TuningEntry e = eNon;
       if (!xCandsBlk.empty()) {
         TuningEntry eb = autotuneOp(rt_, sig, xCandsBlk, makeEnqueue, flops, iters);
         if (!eb.kernel.empty()) {
-          // 保守计费：总是按每帧一次 bfyx->fsv16 计入。2-pass 布局不动点在本机模型上
-          // 无额外收益（见 docs/kernel-families.md），保守值更稳（不依赖构造期布局）。
+          // R43: no longer a one-way "conservative billing" baked into the entry.
+          // Store the two alternatives + the reorder cost separately (like conv3x3)
+          // so the plan-time joint (family, layout) fixpoint can decide with exact
+          // layout knowledge (input persisted fsv16 => reorder 0).
           double reorderMs = 0.0;
           {
             Tensor & xt = ref(n.ins[1]);
@@ -3437,13 +3463,21 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);
           }
-          const double eff = eb.ms + reorderMs;
-          if (e.kernel.empty() || eff < e.ms) {
-            eb.ms = eff;
-            eb.ops = rt_.opsPerEuCycle(flops, eff);
-            eb.ratio = eb.expected > 0 ? eb.ops / eb.expected : 0.0;
-            e = eb;
+          if (merge) {
+            tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
+            TuningEntry er;
+            er.kernel = "reorder_bfyx_to_fsv16";
+            er.ms = reorderMs;
+            er.device_id = eb.device_id;
+            er.source = "tuned";
+            tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
+            if (!eNon.kernel.empty())
+              tuning_.put(OpSignature::custom(sig.str() + "#non", {}), eNon);
           }
+          // Fallback base entry (used when the joint fixpoint has no alternatives):
+          // select on the billed cost, store kernel-only ms.
+          const double eff = eb.ms + reorderMs;
+          if (eNon.kernel.empty() || eff < eNon.ms) e = eb;
         }
       }
       if (!e.kernel.empty()) {
@@ -3580,11 +3614,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       std::vector<Candidate> candsBlk, candsNonBlk;
       for (const auto & c : candsNoPad)
         (c.kernel == "depthwise_blk" ? candsBlk : candsNonBlk).push_back(c);
-      TuningEntry e = autotuneOp(rt_, sig, candsNonBlk, makeEnqueue, flops, iters);
+      TuningEntry eNon = autotuneOp(rt_, sig, candsNonBlk, makeEnqueue, flops, iters);
+      TuningEntry e = eNon;
       if (!candsBlk.empty()) {
         TuningEntry eb = autotuneOp(rt_, sig, candsBlk, makeEnqueue, flops, iters);
         if (!eb.kernel.empty()) {
-          // 保守计费（同 conv1x1_blk）：总是按每帧一次 bfyx->fsv16 计入。
+          // R43：不再只做单向「保守计费」；与 conv3x3/conv1x1 一样把 blk/non/reorder
+          // 分开存，交给联合 (族,布局) 不动点按实际持久化精确判定。
           double reorderMs = 0.0;
           {
             Tensor & xt = ref(n.ins[0]);
@@ -3605,13 +3641,19 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);
           }
-          const double eff = eb.ms + reorderMs;
-          if (e.kernel.empty() || eff < e.ms) {
-            eb.ms = eff;
-            eb.ops = rt_.opsPerEuCycle(flops, eff);
-            eb.ratio = eb.expected > 0 ? eb.ops / eb.expected : 0.0;
-            e = eb;
+          if (merge) {
+            tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
+            TuningEntry er;
+            er.kernel = "reorder_bfyx_to_fsv16";
+            er.ms = reorderMs;
+            er.device_id = eb.device_id;
+            er.source = "tuned";
+            tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
+            if (!eNon.kernel.empty())
+              tuning_.put(OpSignature::custom(sig.str() + "#non", {}), eNon);
           }
+          const double eff = eb.ms + reorderMs;   // billed selection cost
+          if (eNon.kernel.empty() || eff < eNon.ms) e = eb;   // store kernel-only ms
         }
       }
       if (!candsPad.empty()) {

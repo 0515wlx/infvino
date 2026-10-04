@@ -25,10 +25,19 @@ std::vector<Candidate> candidatesDepthwise(const OpSignature & sig) { return can
 std::vector<Candidate> candidatesSmall(const OpSignature & sig) { return candidatesFromRegistry(sig); }
 
 bool benchCandidate(
-  ClRuntime & rt, const std::function<cl_event()> & enqueue, int iters, double * ms)
+  ClRuntime & rt, const std::function<cl_event()> & enqueue, int iters, double * ms,
+  double * spread)
 {
   try {
-    *ms = rt.timeMs(enqueue, 3, iters);
+    // R42: use the MINIMUM over the measured samples, not the median. External
+    // interference (LLC->DRAM spill near the 3.75 MB boundary, thermal, other
+    // containers) can only ADD time, so the min is a far more stable estimator of
+    // the kernel's intrinsic cost (min is ~±1–2% across repeats; the median shows
+    // ±10–20% tails). `spread` = (p90/min − 1) exposes residual instability.
+    double mn = 0.0, p90 = 0.0;
+    rt.timeMs(enqueue, 5, iters, &mn, &p90);
+    *ms = mn;
+    if (spread) *spread = (mn > 0.0) ? (p90 / mn - 1.0) : 0.0;
     return true;
   } catch (const std::exception &) {
     return false;
@@ -47,6 +56,13 @@ TuningEntry autotuneOp(
   best.source = "tuned";
 
   const bool dbg = std::getenv("INFVINO_AUTOTUNE_DEBUG") != nullptr;
+  // R42 anti-noise: instability is dominated by the LLC->DRAM cliff (working set
+  // straddling the 3.75 MB L3). We (a) select on min, (b) flag candidates whose
+  // p90/min spread is high, (c) re-confirm the winner with more iterations and, if
+  // the two measurements disagree, take the smaller and warn.
+  const double kSpreadWarn = 0.15;   // 15% (p90/min − 1)
+  const Candidate * bestCand = nullptr;
+  int noisy = 0;
   if (dbg)
     std::fprintf(stderr, "[autotune] %s: %zu candidates\n", sig.str().c_str(), cands.size());
   for (const auto & c : cands) {
@@ -59,30 +75,61 @@ TuningEntry autotuneOp(
                      c.config.c_str(), e.what());
       continue;  // build 失败（资源/编译）→ 跳过
     }
-    double ms = 0;
-    if (!benchCandidate(rt, enq, iters, &ms)) {
+    double ms = 0, sp = 0;
+    if (!benchCandidate(rt, enq, iters, &ms, &sp)) {
       if (dbg)
         std::fprintf(stderr, "  [skip] %-18s %-16s bench failed\n", c.kernel.c_str(),
                      c.config.c_str());
       continue;
     }
+    if (sp > kSpreadWarn) ++noisy;
     const double ops = rt.opsPerEuCycle(flops, ms);
     if (dbg)
-      std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f\n", c.kernel.c_str(),
-                   c.options.c_str(), ms, ops);
+      std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f  spread=%+.0f%%\n",
+                   c.kernel.c_str(), c.options.c_str(), ms, ops, sp * 100.0);
     if (best.kernel.empty() || ms < best.ms) {
       best.kernel = c.kernel;
       best.config = c.config;
       best.options = c.options;
       best.ms = ms;
       best.ops = ops;
+      bestCand = &c;
     }
   }
+  // Confirmation pass: same-condition disagreement on the winner -> warn + keep min.
+  if (bestCand) {
+    try {
+      auto enq2 = makeEnqueue(*bestCand);
+      double ms2 = 0, sp2 = 0;
+      const int iters2 = (iters < 8 ? 8 : iters) * 3;
+      if (benchCandidate(rt, enq2, iters2, &ms2, &sp2)) {
+        if (ms2 < best.ms) {
+          best.ms = ms2;
+          best.ops = rt.opsPerEuCycle(flops, ms2);
+        }
+        if (sp2 > kSpreadWarn)
+          std::fprintf(stderr,
+            "[autotune] WARN %s: winner %s unstable (spread %.0f%%); result may be "
+            "LLC/DRAM-noise limited — rerun (scripts/gpu_clocks.sh lock) or isolate.\n",
+            sig.str().c_str(), best.kernel.c_str(), sp2 * 100.0);
+      }
+    } catch (const std::exception &) {}
+  }
+  if (noisy > 0 &&
+      noisy >= std::max<int>(2, static_cast<int>(cands.size() / 10)))
+    std::fprintf(stderr,
+      "[autotune] WARN %s: %d/%zu candidates unstable (spread>%.0f%%) — likely LLC "
+      "spill/DRAM contention.\n",
+      sig.str().c_str(), noisy, cands.size(), kSpreadWarn * 100.0);
   if (!best.kernel.empty()) {
     // 中间标准：优先用「胜出族」自己的上限模型（修 R33 的口径失真）。
-    if (const KernelFamily * f = familyByName(best.kernel))
-      if (f->ceiling) best.expected = f->ceiling(sig, rt.info());
+    const KernelFamily * f = familyByName(best.kernel);
+    if (f && f->ceiling) best.expected = f->ceiling(sig, rt.info());
+    // R43：硬上限只取 ISA 配额/roofline 下界（经验 derate 不进这里）。
+    best.hard_ceiling = (f && f->hardCeiling) ? f->hardCeiling(sig, rt.info()) : best.expected;
+    if (best.expected <= 0.0) best.expected = best.hard_ceiling;
     best.ratio = best.expected > 0 ? best.ops / best.expected : 0.0;
+    best.hard_ratio = best.hard_ceiling > 0 ? best.ops / best.hard_ceiling : 0.0;
   }
   return best;
 }

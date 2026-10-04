@@ -59,7 +59,8 @@ std::vector<Candidate> candidatesSmall(const OpSignature & sig);
  * @return 成功返回 true；build/set-arg 失败（异常）返回 false。
  */
 bool benchCandidate(
-  ClRuntime & rt, const std::function<cl_event()> & enqueue, int iters, double * ms);
+  ClRuntime & rt, const std::function<cl_event()> & enqueue, int iters, double * ms,
+  double * spread = nullptr);
 
 /**
  * @brief 通用调优：枚举 → build → 计时 → 取最优，写入 entry。

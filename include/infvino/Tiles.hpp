@@ -146,6 +146,9 @@ struct Conv3x3Cfg
   int OV = 0;
   // Round 25: OpenVINO blocked conv port (kernels/conv_blk.cl), OBW = TX.
   int BLK = 0;
+  // Round 41: conv_ov software-pipelining knob: 1 = double-buffer / prefetch the
+  // next input-channel block one `kd` ahead (diagnostic; hides global-read latency).
+  int PF = 0;
 
   std::string options() const
   {
@@ -158,6 +161,7 @@ struct Conv3x3Cfg
       << " -DWVEC=" << WVEC << " -DPROBE=" << PROBE
       << " -DWCOAL=" << WC
       << " -DXGN=" << XG
+      << " -DPF=" << PF
       << " -DWGL=" << WGL
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
@@ -345,6 +349,7 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 19) c.WC = v[19];
   if (v.size() > 20) c.XG = v[20];
   if (v.size() > 21) c.WGL = v[21];
+  if (v.size() > 22) c.PF = v[22];
   return c;
 }
 

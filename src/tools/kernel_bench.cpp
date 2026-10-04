@@ -378,27 +378,39 @@ int benchConv(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const Conv
     lyThreads = c.RT ? static_cast<size_t>(c.TY) * (c.CB / c.TN)
                      : static_cast<size_t>(c.TY);
   }
-  const size_t lws[3] = {lxThreads, c.OV ? static_cast<size_t>(ovslm) : lyThreads,
-                         c.OV ? static_cast<size_t>(c.SG) : 1};
+  const int ovSg = (c.SG > 0) ? c.SG : 16;
+  const size_t lws[3] = {lxThreads, c.OV ? 1 : lyThreads,
+                         c.OV ? static_cast<size_t>(ovSg * ovslm) : 1};
   const size_t gws[3] = {
     static_cast<size_t>((Wout + c.TX - 1) / c.TX) * lxThreads,
-    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * (c.OV ? static_cast<size_t>(ovslm) : lyThreads),
-    c.OV ? static_cast<size_t>((((s.Cout + 1) / 2 + 15) / 16) * 16)
+    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * (c.OV ? 1 : lyThreads),
+    c.OV ? static_cast<size_t>((((s.Cout + 1) / 2 + 15) / 16) * ovSg * ovslm)
          : static_cast<size_t>((Cout + c.CB - 1) / c.CB)};
 
+  double tmin = 0.0, tp90 = 0.0;
   const double med = rt.timeMs(
-    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters,
+    &tmin, &tp90);
   const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
     "  conv3x3 %-18s Cin=%-4d Cout=%-4d %dx%d s%d  %8.3f ms  %7.1f GFLOP/s  "
-    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)  [min %.3f p90 %.3f, spread %+.0f%%]",
     s.label.c_str(), Cin, Cout, H, W, c.STRIDE, med, flops / (med * 1e-3) / 1e9,
-    ops, ops / 32 * 100);
+    ops, ops / 32 * 100, tmin, tp90,
+    tp90 > 0 ? (tp90 / tmin - 1.0) * 100.0 : 0.0);
 
   if (verify) {
     rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
     double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
+    // R41: apply the same activation as the kernel (canonical conv3x3 codes:
+    // 1=SiLU, 3=HardSwish). The reference previously stored the raw conv, so any
+    // ACT!=0 verify was wrong by construction.
+    auto ref_act = [&](float f) -> double {
+      if (c.ACT == 1) return f / (1.0 + std::exp(-(double)f));
+      if (c.ACT == 3) return (double)(f * std::min(std::max(f + 3.0f, 0.0f), 6.0f) / 6.0f);
+      return (double)f;
+    };
     std::vector<float> ref((size_t)Cout * Hout * Wout);
     for (int oc = 0; oc < Cout; ++oc)
       for (int oy = 0; oy < Hout; ++oy)
@@ -412,7 +424,7 @@ int benchConv(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const Conv
                   acc += infvino::f16_to_f32(hX[((size_t)ci * H + yy) * W + xx]) *
                          infvino::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
               }
-          ref[((size_t)oc * Hout + oy) * Wout + ox] = acc;
+          ref[((size_t)oc * Hout + oy) * Wout + ox] = static_cast<float>(ref_act(acc));
         }
     for (size_t i = 0; i < ref.size(); ++i) {
       const double got = infvino::f16_to_f32(hY[i]);
@@ -506,21 +518,24 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
   const size_t gws[3] = {
     static_cast<size_t>(((Wout + OBW - 1) / OBW) * Hout),
     static_cast<size_t>(((Cout + 15) / 16) * 16 * SLM_DIV), 1};
+  double btmin = 0.0, btp90 = 0.0;
   const double med = rt.timeMs(
-    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters,
+    &btmin, &btp90);
   const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
     "  conv3x3blk %-15s Cin=%-4d Cout=%-4d %dx%d s%d OBW%d  %8.3f ms  %7.1f GFLOP/s  "
-    "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
+    "ops/EU/cyc=%5.2f (%5.1f%% of 32)  [min %.3f p90 %.3f, spread %+.0f%%]",
     s.label.c_str(), Cin, Cout, s.H, s.W, c.STRIDE, OBW, med,
-    flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
+    flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100, btmin, btp90,
+    btp90 > 0 ? (btp90 / btmin - 1.0) * 100.0 : 0.0);
 
   if (verify) {
     rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
     auto ref_act = [&](float f) -> double {
       if (c.ACT == 1) return f / (1.0 + std::exp(-(double)f));
-      if (c.ACT == 2) return (double)(f * std::min(std::max(f + 3.0f, 0.0f), 6.0f) / 6.0f);
+      if (c.ACT == 3) return (double)(f * std::min(std::max(f + 3.0f, 0.0f), 6.0f) / 6.0f);
       return (double)f;
     };
     double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;

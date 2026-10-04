@@ -75,8 +75,10 @@ struct TuningEntry
   std::string options;  // kernel 编译宏（运行时据此 build/cache）
   double ms = 0.0;
   double ops = 0.0;          // 实测 ops/EU/cyc
-  double expected = 0.0;     // 中间标准：期望 ops/EU/cyc
-  double ratio = 0.0;        // ops / expected（1.0 = 达到期望）
+  double expected = 0.0;     // 软预测（中间标准）：含经验 derate，仅用于排序/相对比较
+  double ratio = 0.0;        // ops / expected（软）
+  double hard_ceiling = 0.0; // 硬上限（ISA 配额/roofline 下界）：物理上不可能超过
+  double hard_ratio = 0.0;   // ops / hard_ceiling（"离物理极限"）
   int    iters = 0;
   std::string device_id;
   std::string source;        // "tuned" / "heuristic"

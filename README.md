@@ -323,6 +323,15 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] 首层 Cin=3 专用 conv（`kernels/conv_cin3.cl`）：y8/y11 stem −40%/−50%，三模型 `model_check` PASS
 - [x] 小算子缓存命中分析器 `scripts/analyze_cache.py`：多数已贴住「工作集+launch」上限，余额在 permute/resize（跨步）与 gap（网格）
 - [x] depthwise padded（A 方向）：指令 −41%、逐位一致，但 pad 带宽相抵 → 整网负结果，默认关闭（Round 31）
+- [x] 修复 `conv_ov` 的 `SLM_DIV` 数值 bug（工作组几何：子组须沿最快 local 维铺开）+ 重开 ov 的 SLM 候选；conv3×3 小网格再拿一块，busy **y8 −11.2% / y11 −8.1% / mb −3.2%**，三模型 `model_check`/`reuse_check` PASS（`docs/round39-convov-slm-fix.md`）
+- [x] 分析框架反查：修 `conv3x3_ov` ceiling 通道粒度（16→32）、ov/native ceiling 的「WG vs sub-group」占用口径、`refresh-expected` 覆盖 conv3x3；记录内存族 roofline ceiling 偏低（未决）（Round 39）
+- [x] conv kernel 全局 `ops/EU/cyc` × size 分析：ov+SLM 已通吃（24/32 签名）；推翻 R33「blk 赢小空间大通道」、修正 R24「40×40 无解」；补 native `CB=8`（Cout≤8，+21%）与 ov stride-2 `OBW=7` 候选（`docs/round40-conv-ops-size-analysis.md`）
+- [x] conv 离天花板差距的**系统归因**：主因是「无 L1 + ~150cyc 访存延迟」被 128-GRF 墙卡死的单线程 ILP（软件流水/手工预取**无效**），DRAM/L3 带宽只在工作集>L3 与**输出写大**（stem、窄 Cout）的层主导；新增 `-DPROBE`/`-DPF` 诊断宏（默认关）；顺带修 `kernel_bench --verify` 的参考激活（此前 ACT≠0 全错，R33「native verify 坏」实为工具 bug）（`docs/round41-kernel-bottleneck-attribution.md`）
+- [x] 标尺/噪声/计费治理：`ops/EU/cyc` 分层为 **hard_ceiling（只放 ISA 配额/roofline 下界）+ 软 expected + 告警**；autotune 改 **min 估计器** + spread 告警 + `scripts/gpu_clocks.sh` 锁频；`scripts/noise_check.sh` 判稳定；修 **reorder 折进 kernel ms** 的记账 bug（污染 ops/ratio）；确认噪声根因 = **LLC→DRAM 带宽断崖**（`docs/round42-rulers-noise-and-tooling.md`）
+- [x] 硬/软标尺落地：`KernelFamily.hardCeiling` + `TuningEntry.hard_ceiling/hard_ratio`（向后兼容），`kernel_autotune --expected` 同打 soft/hard（`docs/round43-hard-ceiling-mdapi-jointlayout.md`）
+- [x] dev 镜像加 MD API 依赖（`intel-metrics-discovery(+dev)`/`intel-gpu-tools`/`libdrm-dev`）并验证；新增 `gpu_metrics --list/--sample`（枚举 EuActive/EuStall/L3/SLM 计数器 + `CalculateMetrics` 解码；**OA 采样受本机内核 `CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS` 未开限制**）
+- [x] `scripts/kernel_diag.sh`：一命令跑 feed/store 隔离探针 + `hard_ratio` + 墙判决（R41/R43 归因工具化）
+- [x] 联合 (族,布局) 不动点从 conv3x3 **推广到 conv1x1/depthwise**（去保守计费、`choiceEntry`/`nodeFamily` 统一、修 conv1x1 输入下标）；三模型 retune 后 `#blk/#non/#reorder` 就位、`model_check`/`reuse_check` PASS，busy y8 **−0.9%** / y11 **−1.3%** / mb +1.6%；**发现「隔离 bench ≠ 流水线表现」**（候选选择目标函数问题）（`docs/round43-...md`）
 - [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）
