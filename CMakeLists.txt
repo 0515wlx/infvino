@@ -44,6 +44,7 @@ add_library(infvino SHARED
   src/ClRuntime.cpp
   src/Tuning.cpp
   src/Autotuner.cpp
+  src/KernelFamilies.cpp
   src/PlanModel.cpp
   src/ClBackend.cpp
   src/InferenceEngine.cpp

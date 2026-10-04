@@ -50,11 +50,11 @@ inline half act_c3(half v)
 #if ACT == 1
   float f = (float)v;
   return (half)(f / (1.0f + exp(-f)));               // SiLU
-#elif ACT == 2
+#elif ACT == 3
   float f = (float)v;
   float t = clamp(f + 3.0f, 0.0f, 6.0f) / 6.0f;      // Hardswish
   return (half)(f * t);
-#elif ACT == 3
+#elif ACT == 2
   return (half)max((float)v, 0.0f);                  // ReLU
 #elif ACT == 4
   float f = (float)v;

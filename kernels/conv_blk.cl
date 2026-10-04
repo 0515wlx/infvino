@@ -100,7 +100,7 @@ inline half blk_activate(half v) {
 #if ACT == 1
   float f = (float)v;
   return (half)(f / (1.0f + exp(-f)));                        // SiLU
-#elif ACT == 2
+#elif ACT == 3
   float f = (float)v;
   return (half)(f * fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f);  // Hardswish
 #else

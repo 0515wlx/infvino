@@ -16,6 +16,7 @@
 #include "infvino/Half.hpp"
 #include "infvino/Tiles.hpp"
 #include "infvino/Autotuner.hpp"
+#include "infvino/KernelFamily.hpp"
 
 namespace infvino
 {
@@ -154,6 +155,46 @@ cl_mem PlanModel::blkWeight(const std::string & name, Tensor & w, int Cout, int 
   cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
   rt_.write(m, sw.size() * 2, sw.data());
   blk_w_[name] = m;
+  owned_blk_.push_back(m);
+  return m;
+}
+
+cl_mem PlanModel::blk1x1Weight(const std::string & name, Tensor & w, int Cout, int Cin)
+{
+  auto it = blk1x1_w_.find(name);
+  if (it != blk1x1_w_.end()) return it->second;
+  const int icb = (Cin + 15) / 16, ocb = (Cout + 15) / 16;
+  std::vector<uint16_t> host(static_cast<size_t>(w.numel()));
+  rt_.read(w.mem, host.size() * 2, host.data());
+  // os_is_yx_isv16_osv16 (1x1): [Cout/16][Cin/16][isv16][osv16]
+  std::vector<uint16_t> sw(static_cast<size_t>(ocb) * icb * 16 * 16, 0);
+  for (int oc = 0; oc < Cout; ++oc)
+    for (int ic = 0; ic < Cin; ++ic)
+      sw[(((static_cast<size_t>(oc / 16) * icb + (ic / 16)) * 16) + (ic % 16)) * 16 + (oc % 16)] =
+          host[static_cast<size_t>(oc) * Cin + ic];
+  cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
+  rt_.write(m, sw.size() * 2, sw.data());
+  blk1x1_w_[name] = m;
+  owned_blk_.push_back(m);
+  return m;
+}
+
+cl_mem PlanModel::blkDwWeight(const std::string & name, Tensor & w, int C, int K)
+{
+  auto it = blk_dw_w_.find(name);
+  if (it != blk_dw_w_.end()) return it->second;
+  const int cb = (C + 15) / 16;
+  std::vector<uint16_t> host(static_cast<size_t>(w.numel()));
+  rt_.read(w.mem, host.size() * 2, host.data());
+  // [C/16][K][K][16]
+  std::vector<uint16_t> sw(static_cast<size_t>(cb) * K * K * 16, 0);
+  for (int c = 0; c < C; ++c)
+    for (int kk = 0; kk < K * K; ++kk)
+      sw[((static_cast<size_t>(c / 16) * K * K) + kk) * 16 + (c % 16)] =
+          host[static_cast<size_t>(c) * K * K + kk];
+  cl_mem m = rt_.alloc(sw.size() * 2, CL_MEM_READ_ONLY);
+  rt_.write(m, sw.size() * 2, sw.data());
+  blk_dw_w_[name] = m;
   owned_blk_.push_back(m);
   return m;
 }
@@ -836,6 +877,9 @@ bool PlanModel::convWillUseBlk(const Node & n) const
 
 void PlanModel::planBlockedLayout()
 {
+  // 可重入：先清空所有张量的 fsv16，再依据**当前 tuning_**重新规划（autotune 之后
+  // 布局会变；本函数在构造期与 autotune 末尾各调一次）。
+  for (auto & kv : T_) kv.second.fsv16 = false;
   if (std::getenv("INFVINO_NO_BLOCK_LAYOUT")) return;
 
   std::unordered_map<std::string, std::vector<std::pair<size_t, int>>> consumers;
@@ -845,11 +889,51 @@ void PlanModel::planBlockedLayout()
 
   const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
 
+  // 通用布局框架：每个节点「选中的族」（由 tuning 驱动）给出它的 in/out 布局契约。
+  // 生产者能写 FSV16 且其**所有**消费者都只吃 FSV16 → 该张量持久 FSV16（零 reorder）。
+  // 这是 R36「只覆盖 conv3x3」的推广：新增 blocked 族（conv1x1_blk/depthwise_blk）
+  // 只要在注册表声明布局，规划器自动接上，无需改这里。
+  auto nodeFamily = [&](const Node & n) -> const KernelFamily * {
+    if (n.op == "conv3x3")
+      return familyByName(convWillUseBlk(n) ? "conv3x3_blk" : "conv3x3_ov");
+    if (n.op == "conv1x1" && n.ins.size() >= 2 && !n.outs.empty()) {
+      auto wit = T_.find(n.ins[0]), xit = T_.find(n.ins[1]);
+      if (wit == T_.end() || xit == T_.end() || wit->second.dims.size() < 2) return nullptr;
+      const int Cout = static_cast<int>(wit->second.dims[0]);
+      const int Cin = static_cast<int>(wit->second.dims[1]);
+      const int64_t xn = xit->second.numel();
+      const int N = Cin > 0 ? static_cast<int>(xn / Cin) : 0;
+      const int act = attrInt(n, "act", 0);
+      const bool dres = n.ins.size() > 3 && n.ins[3] != "-";
+      const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+      const TuningEntry * e = tuning_.lookup(sig);
+      if (e && e->kernel == "conv1x1_blk") return familyByName("conv1x1_blk");
+    }
+    if (n.op == "conv_general" && n.ins.size() >= 2 && !n.outs.empty()) {
+      auto xit = T_.find(n.ins[0]), oit = T_.find(n.outs[0]);
+      if (xit == T_.end() || oit == T_.end()) return nullptr;
+      const auto & id = xit->second.dims;
+      const auto & od = oit->second.dims;
+      if (id.size() < 3 || od.size() < 3) return nullptr;
+      const int Cin = static_cast<int>(id[id.size() - 3]);
+      const int Cout = static_cast<int>(od[od.size() - 3]);
+      const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
+                act = attrInt(n, "act", 0), G = attrInt(n, "G", 1);
+      if (!(G == Cin && (K == 3 || K == 5) && Cin == Cout)) return nullptr;
+      const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
+      const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
+      const TuningEntry * e = tuning_.lookup(sig);
+      if (e && e->kernel == "depthwise_blk") return familyByName("depthwise_blk");
+    }
+    return nullptr;
+  };
+
   int marked = 0;
   for (size_t i = 0; i < nodes_.size(); ++i)
   {
     const Node & n = nodes_[i];
-    if (!convWillUseBlk(n)) continue;
+    const KernelFamily * prod = nodeFamily(n);
+    if (!prod || !prod->layout.canOutFsv16 || n.outs.empty()) continue;
     const std::string & t = n.outs[0];
     auto tit = T_.find(t);
     if (tit == T_.end()) continue;
@@ -864,8 +948,8 @@ void PlanModel::planBlockedLayout()
     bool all_blk = true;
     for (const auto & c : cit->second)
     {
-      const Node & cn = nodes_[c.first];
-      if (c.second != 0 || cn.op != "conv3x3" || !convWillUseBlk(cn)) { all_blk = false; break; }
+      const KernelFamily * cf = nodeFamily(nodes_[c.first]);
+      if (c.second != 0 || !cf || cf->layout.in != Layout::FSV16) { all_blk = false; break; }
     }
     if (!all_blk) continue;                          // 有非 blocked 消费者 → 保持 NCHW
     tit->second.fsv16 = true;
@@ -873,7 +957,7 @@ void PlanModel::planBlockedLayout()
   }
 
   if (std::getenv("INFVINO_LAYOUT_REPORT"))
-    std::fprintf(stderr, "[layout] fsv16 tensors: %d (blk-driven persistent block layout)\n",
+    std::fprintf(stderr, "[layout] fsv16 tensors: %d (family-driven persistent block layout)\n",
                  marked);
 }
 
@@ -1660,6 +1744,7 @@ std::string sourceOfKernel(const std::string & kernel)
   if (kernel == "conv1x1_gemv_f16" || kernel == "conv1x1_f16") return "conv1x1";
   if (kernel == "depthwise_f16" || kernel == "depthwise_v" || kernel == "depthwise_vp" ||
       kernel == "depthwise_pad" || kernel == "conv_general") return "conv_general";
+  if (kernel == "depthwise_blk") return "depthwise_blk";
   return "ops";
 }
 
@@ -1888,6 +1973,12 @@ void PlanModel::run()
       const int Cin  = static_cast<int>(w.dims[1]);
       const int64_t xnumel = in(1).numel();
       const int N = (Cin > 0) ? static_cast<int>(xnumel / Cin) : 0;
+      int Hin = 1, Win = 1;
+      {
+        const auto & xd = in(1).dims;
+        if (xd.size() >= 2) { Hin = static_cast<int>(xd[xd.size() - 2]); Win = static_cast<int>(xd.back()); }
+        if (Hin * Win != N) { Hin = N; Win = 1; }
+      }
       cl_mem dw = w.mem, dx = in(1).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
       cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? in(3).mem : nullptr;
@@ -1944,6 +2035,39 @@ void PlanModel::run()
             t.TN = optInt("-DTN=", t.TN);
           }
         }
+        if (gkernel == "conv1x1_blk") {
+          // blocked 1x1（fsv16 输入 + osv16 权重 + NCHW 输出）。几何从 options 回放。
+          auto optInt = [&](const char * k, int def) {
+            const auto p = gopts.find(k);
+            return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
+          };
+          const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1);
+          if (std::getenv("INFVINO_DEBUG_BLK"))
+            std::fprintf(stderr, "[blk1x1] out=%s Cout=%d Cin=%d Hin=%d Win=%d N=%d xfsv16=%d XB=%d SLM=%d\n",
+                         n.outs[0].c_str(), Cout, Cin, Hin, Win, N, (int)in(1).fsv16, xb, slm);
+          cl_mem dxb = blkInput(n.ins[1], in(1), Cin, Hin, Win);
+          cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
+          std::string kbopts = gopts;
+          if (out.fsv16 && kbopts.find("-DOUT_FSV16=") == std::string::npos)
+            kbopts += " -DOUT_FSV16=1";
+          if (dres) setResOpt(kbopts, true);
+          cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", kbopts);
+          setArg(kb, 0, sizeof(dxb), &dxb);
+          setArg(kb, 1, sizeof(dwb), &dwb);
+          setArg(kb, 2, sizeof(db), &db);
+          setArg(kb, 3, sizeof(dy), &dy);
+          setArg(kb, 4, sizeof(dres), &dres);
+          setArg(kb, 5, sizeof(Cin), &Cin);
+          setArg(kb, 6, sizeof(Hin), &Hin);
+          setArg(kb, 7, sizeof(Win), &Win);
+          setArg(kb, 8, sizeof(Cout), &Cout);
+          const size_t blws[3] = {1, static_cast<size_t>(16 * slm), 1};
+          const size_t bgws[3] = {static_cast<size_t>(((Win + xb - 1) / xb) * Hin),
+                                  static_cast<size_t>(((Cout + 15) / 16) * blws[1]), 1};
+          timed("conv1x1blk@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
+                  std::to_string(Cin),
+                kb, 3, bgws, blws);
+        } else {
         // R32: split-K（lane 沿 K）候选走 gemm_sk_f16，几何不同；两者参数表相同。
         const bool sk = (gkernel == "gemm_sk_f16");
         if (dres) setResOpt(gopts, true);  // R33 融合残差（gemm_f16/gemm_sk 都支持 RES）
@@ -1977,6 +2101,7 @@ void PlanModel::run()
         timed("conv1x1@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
                 std::to_string(Cin),
               kg, 2, gws, lws);
+        }
       }
     }
     else if (n.op == "conv_general")
@@ -2004,7 +2129,34 @@ void PlanModel::run()
           if (!e->kernel.empty()) dkern = e->kernel;
           dwopts = e->options;
         }
-        if (dkern == "depthwise_vp") {
+        if (dkern == "depthwise_blk") {
+          // blocked depthwise（fsv16 输入/输出 + [C/16][K][K][16] 权重）。
+          auto optInt = [&](const char * key, int def) {
+            const auto p = dwopts.find(key);
+            return p == std::string::npos ? def : std::atoi(dwopts.c_str() + p + std::strlen(key));
+          };
+          const int xb = optInt("-DX_BLOCK=", 8);
+          cl_mem dxb = blkInput(n.ins[0], in(0), Cin, H, W);
+          cl_mem dwb = blkDwWeight(n.ins[1], in(1), Cin, K);
+          std::string bopts = dwopts;
+          if (out.fsv16 && bopts.find("-DOUT_FSV16=") == std::string::npos)
+            bopts += " -DOUT_FSV16=1";
+          cl_kernel kd = getKernel("depthwise_blk", "depthwise_blk", bopts);
+          setArg(kd, 0, sizeof(dxb), &dxb);
+          setArg(kd, 1, sizeof(dwb), &dwb);
+          setArg(kd, 2, sizeof(db), &db);
+          setArg(kd, 3, sizeof(dy), &dy);
+          setArg(kd, 4, sizeof(Cin), &Cin);
+          setArg(kd, 5, sizeof(H), &H);
+          setArg(kd, 6, sizeof(W), &W);
+          int ho = Hout, wo = Wout;
+          setArg(kd, 7, sizeof(ho), &ho);
+          setArg(kd, 8, sizeof(wo), &wo);
+          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * Hout),
+                               static_cast<size_t>(((Cin + 15) / 16) * 16), 1};
+          const size_t l[3] = {1, 16, 1};
+          timed("depthwise", kd, 3, g, l);
+        } else if (dkern == "depthwise_vp") {
           // R31: 每帧先把 interior 重排进零边 Xp（约 2×输入字节的一趟），再无边界地卷积。
           int Hp = H + 2 * P, Wpad = 0;
           cl_mem xp = dwPadInput(n.ins[0], Cin, H, W, K, S, P, &Hp, &Wpad);
@@ -3030,6 +3182,14 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       const int Cin  = static_cast<int>(w.dims[1]);
       const int64_t xnumel = ref(n.ins[1]).numel();
       const int N = (Cin > 0) ? static_cast<int>(xnumel / Cin) : 0;
+      int Hin = 1, Win = 1;
+      {
+        const auto & xd = ref(n.ins[1]).dims;
+        const size_t xb = xd.size() >= 3 ? xd.size() - 3 : 0;
+        if (xd.size() >= 2) { Hin = static_cast<int>(xd[xd.size() - 2]); Win = static_cast<int>(xd.back()); }
+        (void)xb;
+        if (Hin * Win != N) { Hin = N; Win = 1; }
+      }
       cl_mem dw = w.mem, dx = ref(n.ins[1]).mem, dy = ref(n.outs[0]).mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
       cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? ref(n.ins[3]).mem : nullptr;
@@ -3052,6 +3212,34 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
           return [this, kg, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kg, 1, gws, lws);
+          };
+        }
+        if (c.kernel == "conv1x1_blk") {
+          // blocked 1x1（fsv16 输入 + osv16 权重）：几何从 options 回放。
+          auto optInt = [&](const char * k, int def) {
+            const auto p = c.options.find(k);
+            return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
+          };
+          const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1);
+          cl_mem dxb = blkInput(n.ins[1], ref(n.ins[1]), Cin, Hin, Win);
+          cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
+          std::string bopts = c.options;
+          if (dres) setResOpt(bopts, true);
+          cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", bopts);
+          setArg(kb, 0, sizeof(dxb), &dxb);
+          setArg(kb, 1, sizeof(dwb), &dwb);
+          setArg(kb, 2, sizeof(db), &db);
+          setArg(kb, 3, sizeof(dy), &dy);
+          setArg(kb, 4, sizeof(dres), &dres);
+          setArg(kb, 5, sizeof(Cin), &Cin);
+          setArg(kb, 6, sizeof(Hin), &Hin);
+          setArg(kb, 7, sizeof(Win), &Win);
+          setArg(kb, 8, sizeof(Cout), &Cout);
+          const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
+          const size_t gws[3] = {static_cast<size_t>(((Win + xb - 1) / xb) * Hin),
+                                 static_cast<size_t>(((Cout + 15) / 16) * lws[1]), 1};
+          return [this, kb, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kb, 3, gws, lws);
           };
         }
         const bool sk = (c.kernel == "gemm_sk_f16");
@@ -3087,7 +3275,45 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kg, 2, gws, lws);
         };
       };
-      TuningEntry e = autotuneOp(rt_, sig, cands, makeEnqueue, flops, iters);
+      // blocked 1x1：同样把 bfyx->fsv16 输入重排计入成本（输入已持久化时为 0）。
+      std::vector<Candidate> xCandsBlk, xCandsNon;
+      for (const auto & c : cands)
+        (c.kernel == "conv1x1_blk" ? xCandsBlk : xCandsNon).push_back(c);
+      TuningEntry e = autotuneOp(rt_, sig, xCandsNon, makeEnqueue, flops, iters);
+      if (!xCandsBlk.empty()) {
+        TuningEntry eb = autotuneOp(rt_, sig, xCandsBlk, makeEnqueue, flops, iters);
+        if (!eb.kernel.empty()) {
+          // 保守计费：总是按每帧一次 bfyx->fsv16 计入。2-pass 布局不动点在本机模型上
+          // 无额外收益（见 docs/kernel-families.md），保守值更稳（不依赖构造期布局）。
+          double reorderMs = 0.0;
+          {
+            Tensor & xt = ref(n.ins[1]);
+            const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * Hin * Win * 16 * 2;
+            cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+            cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+            cl_mem xm = xt.mem;
+            setArg(kr, 0, sizeof(xm), &xm);
+            setArg(kr, 1, sizeof(scratch), &scratch);
+            setArg(kr, 2, sizeof(Cin), &Cin);
+            setArg(kr, 3, sizeof(Hin), &Hin);
+            setArg(kr, 4, sizeof(Win), &Win);
+            const size_t rg[3] = {static_cast<size_t>(Win), static_cast<size_t>(Hin),
+                                  static_cast<size_t>(Cin)};
+            std::function<cl_event()> renq = [this, kr, rg]() {
+              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+            };
+            benchCandidate(rt_, renq, iters, &reorderMs);
+            clReleaseMemObject(scratch);
+          }
+          const double eff = eb.ms + reorderMs;
+          if (e.kernel.empty() || eff < e.ms) {
+            eb.ms = eff;
+            eb.ops = rt_.opsPerEuCycle(flops, eff);
+            eb.ratio = eb.expected > 0 ? eb.ops / eb.expected : 0.0;
+            e = eb;
+          }
+        }
+      }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;
         ++n_tuned;
@@ -3147,6 +3373,32 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         benchCandidate(rt_, padEnq, iters, &padMs);
       }
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
+        if (c.kernel == "depthwise_blk") {
+          auto optInt = [&](const char * key, int def) {
+            const auto p = c.options.find(key);
+            return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(key));
+          };
+          const int xb = optInt("-DX_BLOCK=", 8);
+          cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
+          cl_mem dwb = blkDwWeight(n.ins[1], ref(n.ins[1]), Cin, K);
+          cl_kernel kd = getKernel("depthwise_blk", "depthwise_blk", c.options);
+          setArg(kd, 0, sizeof(dxb), &dxb);
+          setArg(kd, 1, sizeof(dwb), &dwb);
+          setArg(kd, 2, sizeof(db), &db);
+          setArg(kd, 3, sizeof(dy), &dy);
+          setArg(kd, 4, sizeof(Cin), &Cin);
+          setArg(kd, 5, sizeof(H), &H);
+          setArg(kd, 6, sizeof(W), &W);
+          int ho = Hout, wo = Wout;
+          setArg(kd, 7, sizeof(ho), &ho);
+          setArg(kd, 8, sizeof(wo), &wo);
+          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * Hout),
+                               static_cast<size_t>(((Cin + 15) / 16) * 16), 1};
+          const size_t l[3] = {1, 16, 1};
+          return [this, kd, g, l]() {
+            return ClRuntime::enqueueND(rt_.queue(), kd, 3, g, l);
+          };
+        }
         cl_kernel kd = getKernel("conv_general", c.kernel, c.options);
         int ho = Hout, wo = Wout;
         if (c.kernel == "depthwise_vp") {
@@ -3190,7 +3442,46 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kd, 1, gdw, nullptr);
         };
       };
-      TuningEntry e = autotuneOp(rt_, sig, candsNoPad, makeEnqueue, flops, iters);
+      // blocked depthwise：kernel 之外还多一趟 bfyx->fsv16 输入重排。把它计入成本，
+      // 避免「kernel 略快但每帧多付 reorder」的 net 负收益（depthwise 的 reorder 相对
+      // kernel 很大，与 conv3x3_blk 不同）。若输入已被持久化为 fsv16 则成本为 0。
+      std::vector<Candidate> candsBlk, candsNonBlk;
+      for (const auto & c : candsNoPad)
+        (c.kernel == "depthwise_blk" ? candsBlk : candsNonBlk).push_back(c);
+      TuningEntry e = autotuneOp(rt_, sig, candsNonBlk, makeEnqueue, flops, iters);
+      if (!candsBlk.empty()) {
+        TuningEntry eb = autotuneOp(rt_, sig, candsBlk, makeEnqueue, flops, iters);
+        if (!eb.kernel.empty()) {
+          // 保守计费（同 conv1x1_blk）：总是按每帧一次 bfyx->fsv16 计入。
+          double reorderMs = 0.0;
+          {
+            Tensor & xt = ref(n.ins[0]);
+            const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
+            cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+            cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+            cl_mem xm = xt.mem;
+            setArg(kr, 0, sizeof(xm), &xm);
+            setArg(kr, 1, sizeof(scratch), &scratch);
+            setArg(kr, 2, sizeof(Cin), &Cin);
+            setArg(kr, 3, sizeof(H), &H);
+            setArg(kr, 4, sizeof(W), &W);
+            const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                                  static_cast<size_t>(Cin)};
+            std::function<cl_event()> renq = [this, kr, rg]() {
+              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+            };
+            benchCandidate(rt_, renq, iters, &reorderMs);
+            clReleaseMemObject(scratch);
+          }
+          const double eff = eb.ms + reorderMs;
+          if (e.kernel.empty() || eff < e.ms) {
+            eb.ms = eff;
+            eb.ops = rt_.opsPerEuCycle(flops, eff);
+            eb.ratio = eb.expected > 0 ? eb.ops / eb.expected : 0.0;
+            e = eb;
+          }
+        }
+      }
       if (!candsPad.empty()) {
         TuningEntry ev = autotuneOp(rt_, sig, candsPad, makeEnqueue, flops, iters);
         if (!ev.kernel.empty()) {
@@ -3268,6 +3559,8 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
     }
   }
 
+  // tuning 改变后同步布局（联合选择的一步：布局契约随选中的族变化）。
+  if (n_tuned > 0) planBlockedLayout();
   return done;
 }
 

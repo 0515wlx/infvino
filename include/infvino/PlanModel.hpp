@@ -233,6 +233,10 @@ private:
   cl_mem  ovWeight(const std::string & name, Tensor & w, int Cout, int Cin);
   /** @brief R25: repack weights to OpenVINO os_is_yx_isv16_osv16 for conv3x3_blk. */
   cl_mem  blkWeight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief blocked 1x1 (conv1x1_blk) 的 os_is_yx_isv16_osv16 权重重排 [Cout/16][Cin/16][isv16][osv16]。 */
+  cl_mem  blk1x1Weight(const std::string & name, Tensor & w, int Cout, int Cin);
+  /** @brief blocked depthwise (depthwise_blk) 的 [C/16][K][K][16] 权重重排。 */
+  cl_mem  blkDwWeight(const std::string & name, Tensor & w, int C, int K);
   /** @brief Cin<=4 首层 conv：把权重从 [Cout][Cin*9] 重排成 [Cin*9][Cout]（通道连续，
    *  让 conv3x3_cin3 的跨通道 half2 读是连续/广播的）。 */
   cl_mem  cin3Weight(const std::string & name, Tensor & w, int Cout, int Cin);
@@ -328,6 +332,10 @@ private:
   std::unordered_map<std::string, cl_mem> blk_w_;
   std::unordered_map<std::string, cl_mem> blk_in_;
   std::vector<cl_mem>                     owned_blk_;
+  // blocked 1x1 (conv1x1_blk) 权重重排缓存。
+  std::unordered_map<std::string, cl_mem> blk1x1_w_;
+  // blocked depthwise (depthwise_blk) 权重重排缓存。
+  std::unordered_map<std::string, cl_mem> blk_dw_w_;
   // Cin<=4 首层 conv 的 [Cin*9][Cout] 权重重排（keyed by init name）。
   std::unordered_map<std::string, cl_mem> cin3_w_;
   std::vector<cl_mem>                     owned_cin3_;

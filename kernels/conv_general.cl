@@ -71,9 +71,9 @@ __kernel void conv_general(__global const half *restrict X,   // [Cin][H][W]
 static inline half dw_activate(half v) {
 #if DW_ACT == 1
   float f = (float)v; return (half)(f / (1.0f + exp(-f)));
-#elif DW_ACT == 2
-  float f = (float)v; return (half)(f * (fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f));
 #elif DW_ACT == 3
+  float f = (float)v; return (half)(f * (fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f));
+#elif DW_ACT == 2
   return (half)fmax((float)v, 0.0f);
 #elif DW_ACT == 4
   float f = (float)v; return (half)(fmin(fmax(f + 3.0f, 0.0f), 6.0f) / 6.0f);

@@ -127,13 +127,15 @@ def main():
     # Only when the producer output feeds exactly one node, that node is one of
     # the supported activations, and its result is not a graph output.
     graph_out_names = {o.name for o in g.output}
-    # kernel act codes: 1x1/gemm use the ew_unary codes; conv3x3 uses its own
-    # (1=SiLU, 2=Hardswish) so only HardSwish can be folded there.
+    # Canonical activation codes (shared by ALL kernel families; see
+    # include/infvino/KernelFamily.hpp): 1=SiLU 2=ReLU 3=HardSwish 4=HardSigmoid
+    # 5=Sigmoid. SiLU is folded as code 1 via `conv_act`; these tables fold the
+    # other supported activations. conv3x3 kernels only implement {SiLU, HardSwish}.
     ACT_CODE_1X1 = {"Sigmoid": 5, "Relu": 2, "HardSwish": 3, "HardSigmoid": 4}
-    ACT_CODE_CONV = {"HardSwish": 2}
-    # generic/depthwise kernel (conv_general.cl) act codes: 1 SiLU / 2 Hardswish /
-    # 3 ReLU / 4 Hardsigmoid (no Sigmoid).
-    ACT_CODE_GENERAL = {"HardSwish": 2, "Relu": 3, "HardSigmoid": 4}
+    ACT_CODE_CONV = {"HardSwish": 3}
+    # generic/depthwise kernel (conv_general.cl) implements {SiLU, ReLU, HardSwish,
+    # HardSigmoid} (no Sigmoid).
+    ACT_CODE_GENERAL = {"HardSwish": 3, "Relu": 2, "HardSigmoid": 4}
 
     def fuse_act(producer_out, allowed):
         """producer_out -> (final_out, act_code). Fuses a sole activation consumer."""
