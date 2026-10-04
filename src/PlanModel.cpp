@@ -1970,11 +1970,12 @@ void PlanModel::run()
 
     // Round 28: 小算子调优查表 —— 命中缓存用其 kernel/options，否则内置默认。
     // 只影响「用哪个变体」，数值由 kernel 语义决定。
+    // R45: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存），与 conv 族一致。
     auto smallKernelFor = [&](const OpSignature & sig, const char * dk, std::string & kernOut,
                               std::string & optsOut) -> cl_kernel {
       kernOut = dk;
       optsOut.clear();
-      if (const TuningEntry * e = tuning_.lookup(sig)) {
+      if (const TuningEntry * e = choiceEntry(cur_node_, sig)) {
         kernOut = e->kernel;
         optsOut = e->options;
       }
@@ -2014,7 +2015,8 @@ void PlanModel::run()
       const int coff[4] = {o0, o1, o2, o3};
       const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
                                                        act, dres ? 1 : 0);
-      if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+      // R45: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
+      if (const TuningEntry * e = choiceEntry(ni, sig)) gopts = e->options;
       if (dres) setResOpt(gopts, true);  // R33 融合残差
       cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
       auto optInt = [&](const char * key, int def) {
@@ -2602,8 +2604,9 @@ void PlanModel::run()
       if (K < 32) t.SG = 0;
       std::string gopts = t.options();
       // 自动调优：命中则用缓存的 tile（options 已含全部编译宏）。
+      // R45: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
       const OpSignature gsig = OpSignature::gemm(M, N, K, 0);
-      if (const TuningEntry * ge = tuning_.lookup(gsig)) {
+      if (const TuningEntry * ge = choiceEntry(ni, gsig)) {
         gopts = ge->options;
         auto optInt = [&](const char * k, int def) {
           const auto p = gopts.find(k);
@@ -3808,10 +3811,9 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   const double kMinGain = 0.005;              // 至少 0.5% 整网 busy 改善才接受
 
   auto opWanted = [&](const std::string & op) {
-    // 目前只有这三族在 run() 里消费 per-node 覆盖（choiceEntry）；gemm / cat4 / 小算子
-    // 直接读 tuning_.lookup，用「直接赋值」测不到候选（见审计文档）。先限定在可覆盖族。
-    const bool overridable = (op == "conv3x3" || op == "conv1x1" || op == "depthwise");
-    return overridable && (ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end());
+    // R45：所有 autotune 处理的族在 run() 里都已统一走 choiceEntry（per-node 覆盖），
+    // 因此整网回验对全部可调算子生效，不再限定 conv3x3/conv1x1/depthwise。
+    return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
   };
 
   // 目标签名 = 短名单里能在本 plan 里找到节点的签名（按隔离 ms 取 top-K）。
