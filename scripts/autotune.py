@@ -107,11 +107,17 @@ def main() -> int:
     ]
     # R44: 整网回验参数（每个批进程内先隔离扫描、再整网坐标下降；--global-limit 与 batch 对齐）。
     gargs = ""
+    retune = ""
     if args.global_:
         glimit = args.global_limit if args.global_limit > 0 else args.batch
         gargs = (f"--global --global-topk {args.global_topk} --global-iters {args.global_iters} "
                  f"--global-rounds {args.global_rounds} --global-limit {glimit} "
                  f"--global-margin {args.global_margin} --global-budget {args.global_budget}")
+        # 整网回验须重扫隔离候选；分批进度由 per-plan 工件承载（不能靠共享缓存的 tuned 跳过）。
+        retune = "--retune"
+        loop.append("export INFVINO_GLOBAL_PROGRESS=1")
+        # 新一轮 campaign：清掉旧 per-plan 工件（否则所有节点都被判为「已回验」而全跳过）。
+        loop.append(f"rm -f /workspace/infvino/models/{args.model}/model.plan.tuning.json")
     for op in ops:
         loop.append(f"echo '=== autotune {args.model} op={op} (batch={args.batch}) ==='")
         # 最多 64 批的安全上限（远超任何模型签名数）。
@@ -119,7 +125,7 @@ def main() -> int:
             f"for b in $(seq 1 64); do\n"
             f"  out=$(timeout 200 /workspace/infvino/build-ct/kernel_autotune "
             f"--plan {plan} --cache /workspace/infvino/{args.cache} "
-            f"--op {op} --limit {args.batch} --iters {args.iters} {gargs} --expected 2>&1) || {{\n"
+            f"--op {op} --limit {args.batch} --iters {args.iters} {retune} {gargs} --expected 2>&1) || {{\n"
             f"    echo \"$out\"; echo '[autotune] batch failed; stop'; exit 1; }}\n"
             f"  echo \"$out\" | grep -E 'expected vs|ratio|wrote|global-retune|WARN' || true\n"
             f"  echo \"$out\" | grep -q '(0 entries this run' && {{ echo '[autotune] op done'; break; }}\n"

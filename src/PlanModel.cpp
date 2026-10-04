@@ -2143,7 +2143,8 @@ void PlanModel::run()
         cfg.SG  = 16;
         std::string gopts = cfg.options();
         const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
-        if (const TuningEntry * e = tuning_.lookup(sig)) gopts = e->options;
+        // R45 P0#6: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
+        if (const TuningEntry * e = choiceEntry(ni, sig)) gopts = e->options;
         if (dres) setResOpt(gopts, true);  // R33 融合残差
         cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", gopts);
         setArg(kg, 0, sizeof(dw), &dw);
@@ -3083,16 +3084,27 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
   int n_tuned = 0;
   cand_short_.clear();  // R44: 每次隔离扫描重建短名单
   std::map<std::string, int> sig_seen;  // 同一签名只调一次（plan 里大量层共享签名）
+  // R45: 整网 retune 的**分批进度标记**用 per-plan 工件承载：本图已写入 plan_overrides_ 的
+  // 节点（即已整网回验过）直接跳过。这样 `--retune --limit N` 的多个独立批进程能自然推进，
+  // 而不是每批都从第一个签名重来（`INFVINO_GLOBAL_PROGRESS=1` 由安全驱动设置）。
+  const bool planProgress = std::getenv("INFVINO_GLOBAL_PROGRESS") != nullptr;
   // 返回 true 表示该签名还未调过（并登记）；false 表示跳过。
   // 已在本进程调过、或缓存里已有 source=="tuned" 的条目 → 跳过（让分批调用自然推进）。
   // retune=true 时忽略已有 tuned 条目（用于候选集/中间标准更新后重扫）。
-  auto shouldTune = [&](const OpSignature & sig) {
+  auto shouldTune = [&](const OpSignature & sig, const Node & n) {
     const std::string k = sig.str();
     if (sig_seen.count(k)) return false;
     sig_seen[k] = 1;
     if (!retune)
+    {
       if (const TuningEntry * e = tuning_.lookup(sig))
         if (e->source == "tuned") return false;
+    }
+    else if (planProgress && !n.outs.empty() &&
+             plan_overrides_.lookup(planNodeKey(n.outs[0])))
+    {
+      return false;  // 本图已整网回验过 → 跳过（分批推进）
+    }
     return true;
   };
 
@@ -3119,7 +3131,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       if (!onlySubstr.empty() && tag.find(onlySubstr) == std::string::npos) continue;
 
       const OpSignature sig = OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
-      if (!shouldTune(sig)) continue;
+      if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(Hout) * Wout * Cin * 9.0;
       const std::vector<Candidate> cands = candidatesConv3x3(sig);
 
@@ -3304,7 +3316,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       cl_mem da = ref(n.ins[0]).mem, db = ref(n.ins[1]).mem, dc = ref(n.outs[0]).mem;
       const OpSignature sig = OpSignature::gemm(M, N, K, 0);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
-      if (!shouldTune(sig)) continue;
+      if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * M * N * static_cast<double>(K);
       const std::vector<Candidate> cands = candidatesGemm(sig);
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
@@ -3368,7 +3380,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
                                                        act, dres ? 1 : 0);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
-      if (!shouldTune(sig)) continue;
+      if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(HW) * Cin;
       // reuse the gemm candidate spectrum; each candidate is compiled with -DCAT4=1.
       std::vector<Candidate> cands = candidatesGemm(OpSignature::gemm(Cout, HW, Cin, act));
@@ -3449,7 +3461,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? ref(n.ins[3]).mem : nullptr;
       const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
-      if (!shouldTune(sig)) continue;
+      if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(N) * Cin;
       const std::vector<Candidate> cands = candidatesConv1x1(sig);
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
@@ -3614,7 +3626,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
       const OpSignature sig = OpSignature::depthwise(Wout, Hout, S, P, Cin, K, act);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
-      if (!shouldTune(sig)) continue;
+      if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cin * static_cast<double>(Hout) * Wout * K * K;
       const std::vector<Candidate> cands = candidatesDepthwise(sig);
       // vp 与其它候选分开计时：vp 的真实每帧成本 = depthwise_vp + pad（pad 单独量）。
@@ -3809,7 +3821,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       {
         const OpSignature sig = smallSig(n);
         if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
-        if (!shouldTune(sig)) continue;
+        if (!shouldTune(sig, n)) continue;
         const std::vector<Candidate> cands = candidatesSmall(sig);
         if (cands.empty()) continue;
         const double flops = 2.0 * static_cast<double>(ref(n.outs[0]).numel());
@@ -3957,6 +3969,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       if (const TuningEntry * ce = choiceEntry(ni, t.cs.sig)) assign[ni] = *ce;
       else if (const TuningEntry * b = tuning_.lookup(t.cs.sig)) assign[ni] = *b;
     }
+  const std::vector<TuningEntry> baseline = assign;  // R45: 最终验收门的对照
 
   int evals = 0;   // 整网测量次数（预算控制）
   auto busyFor = [&](const std::vector<size_t> & nodes, const TuningEntry & e,
@@ -3994,6 +4007,32 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     if (spread && best > 0.0 && best < 1e299) *spread = (worst - best) / best;
     return best;
   };
+
+  // 整网测量当前 assign（用于最终验收门）。
+  auto measureWhole = [&]() -> double {
+    node_choice_ = assign;
+    invalidateCapture();
+    planBlockedLayout();
+    ++evals;
+    double best = 1e300;
+    try
+    {
+      for (int r = 0; r <= reps; ++r)
+      {
+        clearProfile();
+        run();
+        if (r == 0) continue;
+        const double b = profile().busy_ms;
+        if (b > 0.0 && b < best) best = b;
+      }
+    }
+    catch (const std::exception &) { return 1e300; }
+    return best;
+  };
+
+  // R45: 最终验收门 —— 先量基线，坐标下降结束后再量最终组合。若**最终整网反而更慢**
+  // （超过噪声地板），整轮回退。修「逐签名贪心改坏整体、且没有对照」的缺口（全流程实测 mb +6~7%）。
+  const double baseNet = measureWhole();
 
   if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
     std::fprintf(stderr, "[global-retune] %zu signatures, topK=%d reps=%d rounds=%d\n",
@@ -4044,7 +4083,6 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         }
       }
       for (size_t ni : t.nodes) assign[ni] = bestE;   // busyFor 会把 assign 留在最后一个候选
-      persist(t.cs, bestE);
       if (bestE.kernel != base.kernel || bestE.options != base.options)
       {
         ++changed;
@@ -4063,6 +4101,33 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     std::fprintf(stderr, "[global-retune] budget hit (%d evals); stopped early\n", evals);
   int changed_total = 0;
   for (char w : won) if (w) ++changed_total;
+
+  // R45 最终验收门：只有最终整网组合确实不慢于基线，才把选择**落盘**；否则整轮回退。
+  // （全流程实测：逐签名/逐批贪心可把 mb 改慢 6–7%——逐 op 分批看不到跨 op 的布局交互。）
+  {
+    const double finalNet = measureWhole();
+    const bool revert = (baseNet > 0.0 && finalNet > baseNet * (1.0 + kMinGain));
+    if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+      std::fprintf(stderr, "[global-retune] net %.4f -> %.4f ms (%+.1f%%)%s\n", baseNet, finalNet,
+                   baseNet > 0.0 ? (finalNet - baseNet) / baseNet * 100.0 : 0.0,
+                   revert ? "  REVERT (final worse than baseline)" : "");
+    if (revert)
+    {
+      assign = baseline;
+      std::fill(won.begin(), won.end(), 0);
+      changed_total = 0;
+    }
+    else
+    {
+      // 通过验收：把**真正改变**的 target 写回（base 签名 + 同族备选）；未改变的不动共享缓存。
+      for (size_t ti = 0; ti < targets.size(); ++ti)
+      {
+        auto & t = targets[ti];
+        if (!won[ti] || t.nodes.empty()) continue;
+        if (!assign[t.nodes[0]].kernel.empty()) persist(t.cs, assign[t.nodes[0]]);
+      }
+    }
+  }
 
   // R45 P0#4: 把本图的位置相关选择写进 per-plan 覆盖（node 输出名为键），与跨模型共享的
   // tuning_ 分离——避免「在 y8 上做的全局选择覆盖掉 y11 需要的那份」。
