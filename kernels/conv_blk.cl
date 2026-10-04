@@ -62,6 +62,13 @@
 #ifndef FIT_CIN
 #define FIT_CIN 0         // Cin % 16 == 0
 #endif
+// R36 (P1-layout): persist the blocked layout on the output side. When the consumer
+// is another `conv3x3_blk` (and every consumer is), we write `b_fs_yx_fsv16` directly
+// instead of bfyx, so the consumer can read it with zero reorder. Requires Cout % 16 == 0
+// (the planner only sets it then), so the store index stays in bounds.
+#ifndef OUT_FSV16
+#define OUT_FSV16 0
+#endif
 
 #define FEATURE_SLICE_SIZE 16
 // INPUT_LINE_SIZE = stride*(OBW-1) + (3-1)*dil + 1 = stride*(OBW-1) + 3
@@ -217,7 +224,15 @@ __kernel void conv3x3_blk(
 #else
     if (!out_left && ox < Wout && y < Hout)
 #endif
+    {
+#if OUT_FSV16
+      // b_fs_yx_fsv16: [Cout/16][Hout][Wout][16]; oc == f_block*16 + lid.
+      output[(((size_t)f_block * Hout + y) * Wout + ox) * 16 + lid] =
+          blk_activate(dst[i] + b);
+#else
       output[((size_t)oc * Hout + y) * Wout + ox] = blk_activate(dst[i] + b);
+#endif
+    }
   }
 }
 

@@ -21,6 +21,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,11 @@ private:
   {
     std::vector<int64_t> dims;
     cl_mem               mem{nullptr};
+    // R36 (P1-layout): 物理布局。false=普通 NCHW(bfyx)；true=阻塞式
+    // b_fs_yx_fsv16 [C/16][H][W][16]。仅当生产者是 blocked conv、所有消费者也是
+    // blocked conv、且 Cout%16==0 时才置位（见 planBlockedLayout）。同一 size 的
+    // 元素数不变，因此不影响内存池分配。
+    bool                 fsv16{false};
     int64_t              numel() const
     {
       int64_t n = 1;
@@ -166,6 +172,12 @@ private:
   void    parse();
   /** @brief P0: assign activation tensors to the shared buffer pool by liveness. */
   void    allocateActivations();
+  /** @brief R36 (P1-layout): 自动布局规划 —— 由 autotune 选出的 conv kernel 驱动，
+   *  把「生产者是 blocked conv 且所有消费者也是 blocked conv」的激活张量标记为
+   *  fsv16，使 blocked 链内零 reorder。`INFVINO_NO_BLOCK_LAYOUT=1` 关闭。 */
+  void    planBlockedLayout();
+  /** @brief R36: 该 conv3x3 节点是否会被纳入 blocked 通路（与 dispatch 同判据）。 */
+  bool    convWillUseBlk(const Node & n) const;
   /** @brief R30c: fuse `concat4 -> conv1x1` into a CAT4 gemm (skip concat materialisation). */
   void    fuseConcatConv1x1();
   /** @brief R33: fuse `conv -> ew_binary(add)` into the conv epilogue (RES), removing the
@@ -267,6 +279,9 @@ private:
   std::unordered_map<std::string, cl_mem> blk_w_;
   std::unordered_map<std::string, cl_mem> blk_in_;
   std::vector<cl_mem>                     owned_blk_;
+  // R36: 同一帧内对同一张量只重排一次（多个 blocked 消费者共享 bfyx->fsv16 结果）。
+  // capture 期填充；重放期 blkInput 不再被调用。每帧 run() 开头清空。
+  std::unordered_set<std::string>         reordered_frame_;
   // R31: cached zero-padded depthwise inputs (keyed by input tensor name).
   std::unordered_map<std::string, cl_mem> dw_pad_;
   std::vector<cl_mem>                     owned_dwp_;

@@ -209,6 +209,10 @@ y8/y11 各 **24/23 次 dispatch、0.66–0.68 ms（≈5% busy）**。这是 ov-s
 - 真正要省掉它需要**持久 blocked 布局**（生产者直接输出 blocked、跨层传播），
   是 multi-hour 重构，且当前 blk/ov/native 按 shape 混选，只有部分相邻 conv 能受益。
 - 因此 **P1-layout 在本机的现实收益 ≈5%，风险高，暂缓**；若做，优先「持久 blocked 链」。
+  > **R36 已落地该子集**：持久 `b_fs_yx_fsv16` 链 + 同帧去重，并由 autotune 自动决定布局
+  > （`scripts/analyze_layout.py` + `PlanModel::planBlockedLayout`）。y8 reorder 24→10/帧、
+  > busy −2.2%、逐位一致。实测确如当时判断是「小收益」量级，但已变成零数值风险、可回归的
+  > 自动机制。见 [`block-layout.md`](block-layout.md)。
 
 > **结论**：P1 的融合项已落地（−2.4% mobilenet）；布局项的余额（reorder ~5%）需要
 > 持久 blocked 重构，ROI 与风险不匹配，建议先看 P2（调度/墙钟）或 depthwise 内核

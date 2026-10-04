@@ -68,6 +68,10 @@ PlanModel::PlanModel(
   tuning_ = TuningCache::loadDefault();
   tuning_.setDeviceId(TuningCache::deviceKey(rt_.info()));
 
+  // R36 (P1-layout): 布局规划必须在 tuning 载入之后（决策由 autotune 选出的 kernel
+  // 驱动）、首次 run() 之前（P2 dispatch 缓存会录制参数）。只在计划期跑一次。
+  planBlockedLayout();
+
   // P3: 在线调优（opt-in）。默认关闭——开发板上跑长 GPU 任务有风险，部署端若要
   // 自适应再显式打开 `INFVINO_TUNING=online`（需要 profiling=true 才能计时）。
   // 只调优「缓存未命中」的签名，且用 INFVINO_ONLINE_BUDGET 限制数量。
@@ -154,6 +158,10 @@ cl_mem PlanModel::blkWeight(const std::string & name, Tensor & w, int Cout, int 
 
 cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H, int W)
 {
+  // R36 (P1-layout)：输入本身已是 fsv16（同一 blocked 链的生产者直接写的就是阻塞布局）
+  // → 零 reorder、零额外 buffer，直接返回。
+  if (x.fsv16) return x.mem;
+
   // 注意：**每次调用都要重跑 reorder**——输入张量在每次 run() 里会被重新计算/写入，
   // 之前「按名字缓存 reordered buffer 且只重排一次」会让第 2 次及以后的推理用上一帧
   // 的数据（跨推理陈旧 bug；见 2026-10 修复）。这里只缓存**设备 buffer**，重排每 run 一次。
@@ -167,6 +175,9 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     blk_in_[name] = m;
     owned_blk_.push_back(m);
   }
+  // R36：同一帧内同一张量若已被重排过（多个 blocked 消费者共享），直接复用，跳过重复
+  // launch。capture 期生效；重放期 blkInput 不再被调用。
+  if (!std::getenv("INFVINO_NO_REORDER_DEDUP") && reordered_frame_.count(name)) return m;
   cl_kernel k = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
   setArg(k, 0, sizeof(x.mem), &x.mem);
   setArg(k, 1, sizeof(m), &m);
@@ -186,6 +197,7 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     tprof_["reorder(blk)"].second += 1;
     clReleaseEvent(ev);
   }
+  reordered_frame_.insert(name);
   return m;
 }
 
@@ -729,6 +741,77 @@ void PlanModel::allocateActivations()
     for (const auto & l : lives)
       std::fprintf(stderr, "[map] id=%d [%d,%d] %s\n", l.id, l.birth, l.death, l.name.c_str());
   }
+}
+
+bool PlanModel::convWillUseBlk(const Node & n) const
+{
+  // 与 run() 里 conv3x3 分支的 kernel 选择保持**完全一致**，否则布局规划会和实际执行的
+  // 通路脱节（规划说 fsv16、执行却走了 native，消费者就会读到非阻塞布局）。
+  if (n.op != "conv3x3" || n.ins.empty() || n.outs.empty()) return false;
+  auto xit = T_.find(n.ins[0]);
+  auto oit = T_.find(n.outs[0]);
+  if (xit == T_.end() || oit == T_.end()) return false;
+  const auto & id = xit->second.dims;
+  const auto & od = oit->second.dims;
+  const size_t xb = id.size() >= 3 ? id.size() - 3 : 0;
+  const size_t ob = od.size() >= 3 ? od.size() - 3 : 0;
+  const int Cin = static_cast<int>(id[xb]);
+  const int Cout = static_cast<int>(od[ob]);
+  const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1),
+            act = attrInt(n, "act", 0);
+  const int Hout = attrInt(n, "Hout", 0), Wout = attrInt(n, "Wout", 0);
+  const bool dres = n.ins.size() > 3 && n.ins[3] != "-";
+  const OpSignature tsig = OpSignature::conv3x3(Wout, Hout, stride, pad, Cin, Cout, act);
+  const TuningEntry * te = tuning_.lookup(tsig);
+  // R33: 带残差的 conv3x3 只有 conv3x3_ov 支持 RES；非 ov 命中会被绕回。
+  if (dres && te && te->kernel != "conv3x3_ov") te = nullptr;
+  if (te && te->kernel == "conv3x3_blk") return true;
+  // 未命中时的内置启发式：只有显式 blk 属性才走 blocked（且 blk 不支持 RES）。
+  if (attrInt(n, "blk", 0) != 0 && !te && !dres) return true;
+  return false;
+}
+
+void PlanModel::planBlockedLayout()
+{
+  if (std::getenv("INFVINO_NO_BLOCK_LAYOUT")) return;
+
+  std::unordered_map<std::string, std::vector<std::pair<size_t, int>>> consumers;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (size_t s = 0; s < nodes_[i].ins.size(); ++s)
+      if (nodes_[i].ins[s] != "-") consumers[nodes_[i].ins[s]].push_back({i, static_cast<int>(s)});
+
+  const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
+
+  int marked = 0;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    const Node & n = nodes_[i];
+    if (!convWillUseBlk(n)) continue;
+    const std::string & t = n.outs[0];
+    auto tit = T_.find(t);
+    if (tit == T_.end()) continue;
+    if (out_set.count(t)) continue;                 // 网络输出必须是 NCHW
+    const auto & od = tit->second.dims;
+    const size_t ob = od.size() >= 3 ? od.size() - 3 : 0;
+    const int Cout = static_cast<int>(od[ob]);
+    // fsv16 按 16 通道补齐；Cout%16!=0 会越界（也保证消费者 Cin 整块）。
+    if (Cout <= 0 || Cout % 16 != 0) continue;
+    auto cit = consumers.find(t);
+    if (cit == consumers.end() || cit->second.empty()) continue;
+    bool all_blk = true;
+    for (const auto & c : cit->second)
+    {
+      const Node & cn = nodes_[c.first];
+      if (c.second != 0 || cn.op != "conv3x3" || !convWillUseBlk(cn)) { all_blk = false; break; }
+    }
+    if (!all_blk) continue;                          // 有非 blocked 消费者 → 保持 NCHW
+    tit->second.fsv16 = true;
+    ++marked;
+  }
+
+  if (std::getenv("INFVINO_LAYOUT_REPORT"))
+    std::fprintf(stderr, "[layout] fsv16 tensors: %d (blk-driven persistent block layout)\n",
+                 marked);
 }
 
 void PlanModel::buildKernels()
@@ -1474,6 +1557,9 @@ void PlanModel::run()
 {
   const auto t0 = std::chrono::steady_clock::now();
 
+  // R36：新的帧——清空「本帧已重排」集合（同帧多消费者共享一次 bfyx->fsv16）。
+  reordered_frame_.clear();
+
   // R32 原型：command buffer 录制完成后，整帧一次提交。
   if (cmdbuf_)
   {
@@ -1925,19 +2011,26 @@ void PlanModel::run()
       else if ((te && te->kernel == "conv3x3_blk") || (attrInt(n, "blk", 0) != 0 && !te))
       {
         // R25: OpenVINO blocked conv port (kernels/conv_blk.cl). Reorders the
-        // input bfyx -> b_fs_yx_fsv16 (cached scratch) then runs the blocked
-        // kernel, writing plain bfyx output.
+        // input bfyx -> b_fs_yx_fsv16 (cached scratch, unless the producer already
+        // emitted fsv16 — R36) then runs the blocked kernel, writing bfyx output
+        // (or b_fs_yx_fsv16 when the whole consumer set is blocked — R36).
         int obw = 8;
-        char oo[192];
+        std::string oo;
         if (te) {
-          auto p = te->options.find("-DOBW=");
-          if (p != std::string::npos) obw = std::atoi(te->options.c_str() + p + 6);
-          std::snprintf(oo, sizeof(oo), "%s", te->options.c_str());
+          oo = te->options;
+          auto p = oo.find("-DOBW=");
+          if (p != std::string::npos) obw = std::atoi(oo.c_str() + p + 6);
         } else {
-          std::snprintf(oo, sizeof(oo),
+          char buf[192];
+          std::snprintf(buf, sizeof(buf),
                         "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
                         "-cl-mad-enable -cl-fast-relaxed-math", obw, stride, pad, act);
+          oo = buf;
         }
+        // R36 (P1-layout)：输出端持久 blocked —— 消费者全是 blocked conv 时直接写
+        // b_fs_yx_fsv16，让它们零 reorder 直接读。
+        if (out.fsv16 && oo.find("-DOUT_FSV16=") == std::string::npos)
+          oo += " -DOUT_FSV16=1";
         cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", oo);
         cl_mem dw = blkWeight(n.ins[1], in(1), Cout, Cin);
         cl_mem dxb = blkInput(n.ins[0], in(0), Cin, H, W);
@@ -2305,8 +2398,32 @@ bool PlanModel::readTensor(const std::string & name, void * fp16_host) const
 {
   auto it = T_.find(name);
   if (it == T_.end() || it->second.mem == nullptr) return false;
-  const_cast<ClRuntime &>(rt_).read(it->second.mem, static_cast<size_t>(it->second.numel()) * 2,
-                                   fp16_host);
+  const Tensor & t = it->second;
+  const size_t   n = static_cast<size_t>(t.numel());
+  const int64_t  C = t.dims.size() >= 3 ? t.dims[t.dims.size() - 3] : 0;
+  if (t.fsv16 && t.dims.size() >= 3 && C > 0 && C % 16 == 0)
+  {
+    // R36: 持久 blocked 张量在设备上是 [C/16][H][W][16]；诊断读回时转回 NCHW，
+    // 这样 `kernel_run --dump-tensor` 与数值检查看到的语义不变。
+    const int64_t H = t.dims[t.dims.size() - 2];
+    const int64_t W = t.dims[t.dims.size() - 1];
+    std::vector<uint16_t> tmp(n);
+    const_cast<ClRuntime &>(rt_).read(t.mem, n * 2, tmp.data());
+    uint16_t * dst = static_cast<uint16_t *>(fp16_host);
+    for (int64_t p = 0; p < static_cast<int64_t>(n); ++p)
+    {
+      const int64_t l  = p % 16;
+      const int64_t q  = p / 16;
+      const int64_t x  = q % W;
+      const int64_t q2 = q / W;
+      const int64_t y  = q2 % H;
+      const int64_t cb = q2 / H;
+      const int64_t c  = cb * 16 + l;
+      dst[(c * H + y) * W + x] = tmp[p];
+    }
+    return true;
+  }
+  const_cast<ClRuntime &>(rt_).read(t.mem, n * 2, fp16_host);
   return true;
 }
 

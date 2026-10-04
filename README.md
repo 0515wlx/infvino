@@ -147,6 +147,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) | **R25 OV 阻塞式 conv 完整移植**：逐 size 对照 / 第三条 autotune 通路 |
 | [`docs/round30-smallops.md`](docs/round30-smallops.md) | **R30 剩余 kernel（非 conv/gemm）的物理模型**：内存 roofline / ISA 配额 / 哪堵墙 |
 | [`docs/round33-conv3x3-headroom.md`](docs/round33-conv3x3-headroom.md) | **R33 conv3×3 剩余空间**：三通路逐配额重算 / 「赢 OV」的两块区域 / CINC 候选（+45%，逐位一致） |
+| [`docs/block-layout.md`](docs/block-layout.md) | **R36 持久 blocked 布局 + 布局自动化**：`b_fs_yx_fsv16` 链 / `OUT_FSV16` / 同帧去重 / autotune 驱动的规划器 |
 | [`docs/openvino-gap-analysis.md`](docs/openvino-gap-analysis.md) | **infvino vs OpenVINO GPU 差距分析**：逐维对标 / 强项 / 学习清单（P0–P3） |
 | [`docs/memory-reuse-design.md`](docs/memory-reuse-design.md) | **P0 激活内存池设计 + R-P0 实测**：生存期复用 / 视图并集 / 墙钟收益 |
 | [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
@@ -263,6 +264,16 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > `cl_khr_command_buffer`；上游实现本身也**只完成一半**（无 `clCommandNDRangeKernelKHR`
 > 等录制入口，且仅在实验性 LEO 驱动、默认关闭）。见
 > [`docs/command-buffer.md`](docs/command-buffer.md)。
+>
+> **R36（block layout，P1-layout 重开落地）**：把 `conv_blk` 的输入重排从「每层每帧一次」
+> 升级成**持久 blocked 链 + 同帧去重**，并让**布局决策由 autotune 自动驱动**：生产者
+> （blocked conv）直接写 `b_fs_yx_fsv16`（`-DOUT_FSV16=1`），消费者直接读、零 reorder。
+> 三模型数值**逐位一致**、`model_check` PASS、`reuse_check` PASS；yolov8n reorder
+> **24→10/帧（−58%）**、busy **−2.2%**、墙钟 **−1.6%**，yolo11n reorder **23→13**、
+> 墙钟 **−2.2%**（与当初 P1-layout「≈2%」的定量一致，但现在自动且零数值风险）。
+> 离线规划/分析器：`scripts/analyze_layout.py`；运行时开关
+> `INFVINO_NO_BLOCK_LAYOUT=1` / `INFVINO_NO_REORDER_DEDUP=1`。
+> 详见 [`docs/block-layout.md`](docs/block-layout.md)。
 
 ## 状态
 
@@ -278,7 +289,8 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] 剩余 kernel（非 conv/gemm）物理模型：内存 roofline + ISA 配额；concat4 已到 DRAM 墙；标量广播快路径 + `expectedOps` 真实模型（R30）
 - [x] 激活内存池（P0）：按生存期复用 + reshape 视图并集；wall −5%、数值逐位一致（R-P0）
 - [x] 融合通用化（P1）：通用/depthwise conv 折入激活 epilogue；mobilenet `ew_unary` 11→0、busy −2.4%、逐位一致
-- [x] P1-layout 调研收口：重排 launch floor 主导、可省边 <2% 墙钟 → 关闭（负结果）
+- [x] P1-layout 调研收口：重排 launch floor 主导、可省边 <2% 墙钟（首轮暂缓）
+- [x] block layout（R36）：持久 `b_fs_yx_fsv16` 链 + 同帧去重 + **autotune 驱动的布局自动化**；y8 reorder 24→10、busy −2.2%、逐位一致（`docs/block-layout.md`）
 - [x] P2 host 分段实测：busy 占墙钟 52–74%，缺口 = 入队提交 + setArg/簿记（`docs/benchmark.md` §2.4）
 - [x] depthwise padded（A 方向）：指令 −41%、逐位一致，但 pad 带宽相抵 → 整网负结果，默认关闭（Round 31）
 - [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
