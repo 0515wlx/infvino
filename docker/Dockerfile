@@ -37,6 +37,7 @@ RUN curl -fsSL https://repositories.intel.com/graphics/intel-graphics.key \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       intel-opencl-icd libigc1 libigdfcl1 intel-level-zero-gpu level-zero \
+      libigc-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # --- Python 开发/测试工具 ---
