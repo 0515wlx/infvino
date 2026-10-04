@@ -143,6 +143,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/kernel.md`](docs/kernel.md) | 自研 kernel 优化日志与 ops/EU/cyc |
 | [`docs/benchmark.md`](docs/benchmark.md) | 整网数值/性能基准与复现 |
 | [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) | **GPU 基准安全协议**（防止开发板死机）|
+| [`docs/profiling-budget.md`](docs/profiling-budget.md) | **busy/net/e2e 预算与优化记分卡**：统一三态口径 + 消融归因（`kernel_run --profile-json` / `scripts/analyze_budget.py` / `scripts/profile_ablation.py`）|
 | [`docs/command-buffer.md`](docs/command-buffer.md) | **`cl_khr_command_buffer` 可行性实测**：最新 26.35 runtime 仍不可用（LEO 门控 + 录制入口未实现）|
 | [`docs/dependencies.md`](docs/dependencies.md) | 依赖与版本清单 |
 | [`docs/round22-status.md`](docs/round22-status.md) | **R22–R23 现状分析**：1×1 kernel / OV conv3×3 / 融合 / 与 OV 对照 |

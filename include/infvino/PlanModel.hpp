@@ -142,8 +142,46 @@ public:
   double hostEnqueueMs() const { return prof_enqueue_ms_; }
   /** @brief P2: profiling 下 host 侧累计 clWaitForEvents 等待耗时（含 GPU 执行）。 */
   double hostWaitMs() const { return prof_wait_ms_; }
-  /** @brief 清空算子耗时表与 host 分段计时（在统计循环前调用）。 */
-  void clearProfile() { tprof_.clear(); prof_enqueue_ms_ = prof_wait_ms_ = 0.0; }
+
+  /**
+   * @brief Phase 2: 结构化剖面 —— 逐节点 GPU 时间 + 结构计数 + 内存 + host 分段。
+   *
+   * 这是 busy/net/e2e 分析框架（`scripts/analyze_budget.py`）的机器可读来源：
+   * 结构计数（节点数/dispatch/融合/alias/布局）任何时候都有效；逐节点/逐算子时间
+   * 需要 profiling=true，且在多次 run() 间**累加**（除以 iters 得每帧值）。
+   * 统计前先调用 clearProfile()。
+   */
+  struct PlanProfile
+  {
+    struct NodeRow
+    {
+      int         index = 0;
+      std::string op;        ///< plan 节点算子名（conv3x3 / conv1x1 / depthwise / ew_binary ...）
+      std::string tag;       ///< 运行时 profile tag（含 shape / 数据通路）
+      std::string signature; ///< 该节点的调优签名（与 tuning.json 的 key 一致，可精确 join）
+      double      ms = 0.0;  ///< 累计 GPU 时间（含该节点的 reorder 等附属 dispatch）
+      int         calls = 0; ///< 累计 dispatch 次数
+    };
+    std::vector<NodeRow> nodes;
+    int    plan_nodes = 0, dispatched_nodes = 0, skipped_nodes = 0, dispatches = 0;
+    int    reorder_calls = 0;
+    double reorder_ms = 0.0;
+    int    fusions_res = 0, fusions_concat = 0;
+    int    fsv16_tensors = 0;
+    size_t pool_requested = 0, pool_allocated = 0, pool_buffers = 0;
+    double wall_ms = 0.0, busy_ms = 0.0, enqueue_ms = 0.0, sync_ms = 0.0;
+  };
+  PlanProfile profile() const;
+
+  /** @brief 清空算子耗时表、逐节点耗时表与 host 分段计时（在统计循环前调用）。 */
+  void clearProfile()
+  {
+    tprof_.clear();
+    node_ms_.clear();
+    node_calls_.clear();
+    node_tag_.clear();
+    prof_enqueue_ms_ = prof_wait_ms_ = 0.0;
+  }
 
 private:
   struct Tensor
@@ -238,6 +276,10 @@ private:
                       const char * tag, bool useLws);
   /** @brief P2: 重放第 ni 个节点录制好的 dispatch 列表。 */
   void    replayNode(size_t ni);
+  /** @brief Phase2: 记录第 ni 个节点的 GPU 时间/tag（reorder 等附属 dispatch 也计入该节点）。 */
+  void    noteNode(size_t ni, const std::string & tag, double ms);
+  /** @brief 求一个节点的调优签名（与 `tuningTargets` 同源；不支持的 op 置 ok=false）。 */
+  OpSignature nodeSignature(const Node & n, bool * ok = nullptr) const;
   /** @brief P2: 克隆一个 kernel（独立参数状态，用于跨帧跳过 setArg）。 */
   cl_kernel cloneKernel(cl_kernel src);
   /** @brief R32 原型：把整帧 dispatch 录制进 cl_khr_command_buffer（CUDA-graph 类比）。*/
@@ -318,6 +360,13 @@ private:
   bool   cmdbuf_failed_{false};
 
   std::map<std::string, std::pair<double, int>> tprof_;   // op -> {ms, calls}
+  // Phase2: 逐节点 GPU 时间（tag/ms/calls），与 tprof_ 一样跨 run 累加。
+  std::vector<double>                           node_ms_;
+  std::vector<int>                              node_calls_;
+  std::vector<std::string>                      node_tag_;
+  size_t                                        cur_node_{0};   // run() 当前节点序号
+  int                                           fusions_res_{0};    // R33 残差融合次数
+  int                                           fusions_concat_{0}; // R30c concat->conv1x1 次数
   double                                        last_run_ms_{0.0};
   // P2: host-side segmentation (only filled when profiling_): cumulative time in
   // clEnqueueNDRangeKernel and in clWaitForEvents.

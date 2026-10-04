@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <fstream>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,11 +31,77 @@ bool readFile(const std::string & path, std::vector<uint16_t> & buf)
   f.read(reinterpret_cast<char *>(buf.data()), bytes);
   return true;
 }
+
+std::string jsonEscape(const std::string & s)
+{
+  std::string o;
+  o.reserve(s.size() + 2);
+  for (char c : s)
+  {
+    switch (c)
+    {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\t': o += "\\t"; break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+// Phase 2: 把结构化剖面写成机器可读 JSON（busy/net/e2e 分析框架的来源）。
+void writeProfileJson(
+  const std::string & path, const std::string & label, const std::string & plan,
+  const std::string & device, int iters, const infvino::PlanModel::PlanProfile & p,
+  const std::map<std::string, std::pair<double, int>> & ops)
+{
+  const double inv = iters > 0 ? 1.0 / iters : 1.0;
+  std::ofstream f(path);
+  if (!f) { std::fprintf(stderr, "[kernel_run] cannot write %s\n", path.c_str()); return; }
+  f << "{\n";
+  f << "  \"model\": \"" << jsonEscape(label) << "\",\n";
+  f << "  \"plan\": \"" << jsonEscape(plan) << "\",\n";
+  f << "  \"device\": \"" << jsonEscape(device) << "\",\n";
+  f << "  \"iters\": " << iters << ",\n";
+  f << "  \"timing_ms\": {\"wall\": " << p.wall_ms << ", \"busy\": " << p.busy_ms * inv
+    << ", \"enqueue\": " << p.enqueue_ms * inv << ", \"sync\": " << p.sync_ms * inv << "},\n";
+  f << "  \"structural\": {\"plan_nodes\": " << p.plan_nodes
+    << ", \"dispatched_nodes\": " << p.dispatched_nodes << ", \"skipped_nodes\": " << p.skipped_nodes
+    << ", \"dispatches_per_frame\": " << p.dispatches * inv << ", \"reorder_calls_per_frame\": "
+    << p.reorder_calls * inv << ", \"reorder_ms_per_frame\": " << p.reorder_ms * inv
+    << ", \"fusions_res\": " << p.fusions_res << ", \"fusions_concat\": " << p.fusions_concat
+    << ", \"fsv16_tensors\": " << p.fsv16_tensors << "},\n";
+  f << "  \"memory\": {\"requested_bytes\": " << p.pool_requested
+    << ", \"allocated_bytes\": " << p.pool_allocated << ", \"buffers\": " << p.pool_buffers << "},\n";
+  f << "  \"ops\": [\n";
+  bool first = true;
+  for (const auto & kv : ops)
+  {
+    f << (first ? "" : ",\n") << "    {\"tag\": \"" << jsonEscape(kv.first)
+      << "\", \"ms_per_frame\": " << kv.second.first * inv << ", \"calls_per_frame\": "
+      << kv.second.second * inv << "}";
+    first = false;
+  }
+  f << "\n  ],\n  \"nodes\": [\n";
+  first = true;
+  for (const auto & r : p.nodes)
+  {
+    f << (first ? "" : ",\n") << "    {\"index\": " << r.index << ", \"op\": \""
+      << jsonEscape(r.op) << "\", \"tag\": \"" << jsonEscape(r.tag) << "\", \"signature\": \""
+      << jsonEscape(r.signature) << "\", \"ms_per_frame\": " << r.ms * inv
+      << ", \"calls_per_frame\": " << r.calls * inv << "}";
+    first = false;
+  }
+  f << "\n  ]\n}\n";
+  std::fprintf(stderr, "[kernel_run] wrote %s\n", path.c_str());
+}
 }  // namespace
 
 int main(int argc, char ** argv)
 {
   std::string plan_path, kernel_dir, input_path, output_path, out_dir, dump_tensor, input2_path;
+  std::string profile_json, profile_label;
   int         iters  = 1;
   bool        report = false;
 
@@ -51,6 +118,8 @@ int main(int argc, char ** argv)
     else if (a == "--iters") iters = std::atoi(next().c_str());
     else if (a == "--report") report = true;
     else if (a == "--dump-tensor") dump_tensor = next();
+    else if (a == "--profile-json") profile_json = next();
+    else if (a == "--profile-label") profile_label = next();
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
   }
   if (plan_path.empty()) { std::fprintf(stderr, "usage: kernel_run --plan <plan.txt>\n"); return 2; }
@@ -80,6 +149,10 @@ int main(int argc, char ** argv)
     model.run();  // warmup（构建/预热 cache，不计入统计）
     model.clearProfile();
     for (int it = 0; it < iters; ++it) model.run();
+
+    // Phase 2：在 iters 循环之后、input2 帧之前抓取结构化剖面（input2 不计入统计）。
+    const infvino::PlanModel::PlanProfile prof     = model.profile();
+    const auto                              prof_ops = model.opProfile();
 
     // --input2：再喂一份**不同**的输入并前向一次，输出/*dump 都取这一帧。
     // 这样任何「把每帧激活错误缓存成只算一次」的 bug 都会在输出里暴露
@@ -154,6 +227,14 @@ int main(int argc, char ** argv)
           "host_total~=%.3f setarg_est~=%.3f ms\n",
           wall, busy, enq, wait, wall - wait, wall - wait - enq);
       }
+      // Phase 2: 结构计数（nodes / launch / 融合 / alias / 布局），每帧值。
+      std::printf(
+        "structural: nodes=%d launched=%d alias/skip=%d dispatches=%.1f reorder=%.1f(%.3fms) "
+        "fusions(res=%d,concat=%d) fsv16=%d\n",
+        prof.plan_nodes, prof.dispatched_nodes, prof.skipped_nodes,
+        static_cast<double>(prof.dispatches) / iters,
+        static_cast<double>(prof.reorder_calls) / iters, prof.reorder_ms / iters,
+        prof.fusions_res, prof.fusions_concat, prof.fsv16_tensors);
       std::vector<std::pair<std::string, std::pair<double, int>>> v(
         model.opProfile().begin(), model.opProfile().end());
       std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
@@ -161,6 +242,13 @@ int main(int argc, char ** argv)
         std::printf(
           "  %-12s %8.3f ms  x%d\n", kv.first.c_str(), kv.second.first / iters,
           kv.second.second / iters);
+    }
+
+    if (!profile_json.empty())
+    {
+      const std::string label = profile_label.empty() ? plan_path : profile_label;
+      writeProfileJson(
+        profile_json, label, plan_path, model.device().describe(), iters, prof, prof_ops);
     }
   }
   catch (const std::exception & e)

@@ -195,6 +195,7 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
     tprof_["reorder(blk)"].first += static_cast<double>(e - s) * 1e-6;
     tprof_["reorder(blk)"].second += 1;
+    noteNode(cur_node_, "reorder(blk)", static_cast<double>(e - s) * 1e-6);
     clReleaseEvent(ev);
   }
   reordered_frame_.insert(name);
@@ -437,6 +438,7 @@ void PlanModel::fuseConcatConv1x1()
     n.ins.insert(n.ins.begin() + 3, s2);
     n.ins.insert(n.ins.begin() + 4, s3);
     n.op = "conv1x1_cat4";
+    ++fusions_concat_;
     remove[pit->second] = 1;
   }
 
@@ -518,6 +520,7 @@ void PlanModel::fuseResidualAdd()
     }
   }
   if (nfused == 0) return;
+  fusions_res_ += nfused;
   std::vector<Node> kept;
   kept.reserve(nodes_.size());
   for (size_t i = 0; i < nodes_.size(); ++i)
@@ -935,6 +938,7 @@ void PlanModel::replayNode(size_t ni)
       clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
       tprof_[c.tag].first += static_cast<double>(e - s) * 1e-6;
       tprof_[c.tag].second += 1;
+      noteNode(ni, c.tag, static_cast<double>(e - s) * 1e-6);
     }
     else
     {
@@ -942,6 +946,67 @@ void PlanModel::replayNode(size_t ni)
     }
     if (ev) clReleaseEvent(ev);
   }
+}
+
+void PlanModel::noteNode(size_t ni, const std::string & tag, double ms)
+{
+  if (ni >= node_ms_.size()) return;
+  node_ms_[ni] += ms;
+  node_calls_[ni] += 1;
+  // tag 取该节点的主要算子：reorder(blk) 是该节点的附属 dispatch，不要占主标签。
+  if (node_tag_[ni].empty() || (node_tag_[ni] == "reorder(blk)" && tag != "reorder(blk)"))
+    node_tag_[ni] = tag;
+}
+
+PlanModel::PlanProfile PlanModel::profile() const
+{
+  PlanProfile p;
+  p.plan_nodes = static_cast<int>(nodes_.size());
+  for (char s : node_skipped_)
+    if (s) p.skipped_nodes++;
+  p.dispatched_nodes = p.plan_nodes - p.skipped_nodes;
+  for (const auto & kv : tprof_) p.dispatches += kv.second.second;
+  auto rit = tprof_.find("reorder(blk)");
+  if (rit != tprof_.end())
+  {
+    p.reorder_calls = rit->second.second;
+    p.reorder_ms    = rit->second.first;
+  }
+  p.fusions_res    = fusions_res_;
+  p.fusions_concat = fusions_concat_;
+  for (const auto & kv : T_)
+    if (kv.second.fsv16) p.fsv16_tensors++;
+  p.pool_requested = act_pool_.requestedBytes();
+  p.pool_allocated = act_pool_.allocatedBytes();
+  p.pool_buffers   = act_pool_.bufferCount();
+  p.wall_ms        = last_run_ms_;
+  p.enqueue_ms     = prof_enqueue_ms_;
+  p.sync_ms        = prof_wait_ms_;
+  p.busy_ms        = 0.0;
+  for (const auto & kv : tprof_) p.busy_ms += kv.second.first;
+  p.nodes.reserve(node_ms_.size());
+  for (size_t i = 0; i < node_ms_.size(); ++i)
+  {
+    if (node_ms_[i] == 0.0 && node_calls_[i] == 0) continue;
+    PlanProfile::NodeRow r;
+    r.index = static_cast<int>(i);
+    r.op    = i < nodes_.size() ? nodes_[i].op : std::string();
+    r.tag   = node_tag_[i];
+    if (i < nodes_.size())
+    {
+      try
+      {
+        bool ok = true;
+        const OpSignature s = nodeSignature(nodes_[i], &ok);
+        if (ok) r.signature = s.str();
+      }
+      catch (const std::exception &) {}  // 诊断字段，绝不因签名失败影响主流程
+    }
+    r.ms    = node_ms_[i];
+    r.calls = node_calls_[i];
+    p.nodes.push_back(std::move(r));
+  }
+  return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,16 +1689,24 @@ void PlanModel::run()
       clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, nullptr);
       tprof_[tag].first += static_cast<double>(e - s) * 1e-6;
       tprof_[tag].second += 1;
+      noteNode(cur_node_, tag, static_cast<double>(e - s) * 1e-6);
     }
     clReleaseEvent(ev);
   };
 
   if (!captured_)
     node_cmds_.assign(nodes_.size(), {});
+  if (node_ms_.size() != nodes_.size())
+  {
+    node_ms_.assign(nodes_.size(), 0.0);
+    node_calls_.assign(nodes_.size(), 0);
+    node_tag_.assign(nodes_.size(), std::string());
+  }
 
   for (size_t ni = 0; ni < nodes_.size(); ++ni)
   {
     const auto & n = nodes_[ni];
+    cur_node_ = ni;
     if (ni < node_skipped_.size() && node_skipped_[ni]) continue;  // P0: 已被别名取代
     auto & out = ref(n.outs[0]);
     if (n.op == "reshape" || n.op == "flatten")
@@ -2446,6 +2519,71 @@ bool opInList(const std::vector<std::string> & ops, const std::string & op)
 }
 }  // namespace
 
+OpSignature PlanModel::nodeSignature(const Node & n, bool * ok) const
+{
+  if (ok) *ok = true;
+  if (n.op == "conv3x3")
+  {
+    const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1), act = attrInt(n, "act", 0);
+    const auto & id = T_.at(n.ins[0]).dims;
+    const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+    const int Cin = (int)id[base];
+    const auto & od = T_.at(n.outs[0]).dims;
+    const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
+    return OpSignature::conv3x3(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), stride, pad, Cin, Cout, act);
+  }
+  if (n.op == "gemm")
+  {
+    const auto & ad = T_.at(n.ins[0]).dims;
+    const int M = (int)ad[0], K = (int)ad[1];
+    const int N = (int)(T_.at(n.ins[1]).numel() / K);
+    return OpSignature::gemm(M, N, K, 0);
+  }
+  if (n.op == "conv1x1_cat4")
+  {
+    const int act = attrInt(n, "act", 0);
+    const auto & wd = T_.at(n.ins[0]).dims;
+    const int Cout = (int)wd[0], Cin = (int)wd[1];
+    const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
+              cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
+    const int HW = Cout > 0 ? (int)(T_.at(n.outs[0]).numel() / Cout) : 0;
+    const bool res = n.ins.size() > 6 && n.ins[6] != "-";
+    const int coff[4] = {attrInt(n, "cat_o0", 0), attrInt(n, "cat_o1", 0),
+                         attrInt(n, "cat_o2", 0), attrInt(n, "cat_o3", 0)};
+    return OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff, act, res ? 1 : 0);
+  }
+  if (n.op == "conv1x1")
+  {
+    const int act = attrInt(n, "act", 0);
+    const auto & wd = T_.at(n.ins[0]).dims;
+    const int Cout = (int)wd[0], Cin = (int)wd[1];
+    const int N = Cin > 0 ? (int)(T_.at(n.ins[1]).numel() / Cin) : 0;
+    const bool res = n.ins.size() > 3 && n.ins[3] != "-";
+    return OpSignature::conv1x1(Cout, N, Cin, act, res ? 1 : 0);
+  }
+  if (n.op == "conv_general")
+  {
+    const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
+              G = attrInt(n, "G", 1), act = attrInt(n, "act", 0);
+    const auto & id = T_.at(n.ins[0]).dims;
+    const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
+    const int Cin = (int)id[base];
+    const auto & od = T_.at(n.outs[0]).dims;
+    const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
+    if (G == Cin && (K == 3 || K == 5) && Cin == Cout)
+      return OpSignature::depthwise(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), S, P, Cin, K, act);
+    if (ok) *ok = false;
+    return OpSignature::convGeneral(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), S, P, Cin, Cout, G, K, act);
+  }
+  if (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
+      n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
+      n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
+      n.op == "softmax_axis" || n.op == "gap")
+    return smallSig(n);  // Round 28: 小算子签名（与 dispatch/autotune 完全一致）
+  if (ok) *ok = false;
+  return OpSignature::custom(n.op, {});
+}
+
 std::vector<OpSignature> PlanModel::tuningSignatures(const std::vector<std::string> & ops) const
 {
   std::vector<OpSignature> out;
@@ -2454,60 +2592,14 @@ std::vector<OpSignature> PlanModel::tuningSignatures(const std::vector<std::stri
     const std::string k = s.str();
     if (!seen.count(k)) { seen[k] = 1; out.push_back(s); }
   };
-  auto want = [&](const std::string & op) {
-    return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
-  };
   for (const auto & n : nodes_)
   {
-    if (n.op == "conv3x3" && want("conv3x3")) {
-      const int stride = attrInt(n, "stride", 1), pad = attrInt(n, "pad", 1), act = attrInt(n, "act", 0);
-      const auto & id = T_.at(n.ins[0]).dims;
-      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
-      const int Cin = (int)id[base];
-      const auto & od = T_.at(n.outs[0]).dims;
-      const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
-      add(OpSignature::conv3x3(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), stride, pad, Cin, Cout, act));
-    } else if (n.op == "gemm" && want("gemm")) {
-      const auto & ad = T_.at(n.ins[0]).dims;
-      const int M = (int)ad[0], K = (int)ad[1];
-      const int N = (int)(T_.at(n.ins[1]).numel() / K);
-      add(OpSignature::gemm(M, N, K, 0));
-    } else if (n.op == "conv1x1_cat4" && want("conv1x1_cat4")) {
-      const int act = attrInt(n, "act", 0);
-      const auto & wd = T_.at(n.ins[0]).dims;
-      const int Cout = (int)wd[0], Cin = (int)wd[1];
-      const int ca = attrInt(n, "cat_ca", 0), cb = attrInt(n, "cat_cb", 0),
-                cc = attrInt(n, "cat_cc", 0), cd = attrInt(n, "cat_cd", 0);
-      const int HW = Cout > 0 ? (int)(T_.at(n.outs[0]).numel() / Cout) : 0;
-      const bool res = n.ins.size() > 6 && n.ins[6] != "-";
-      const int coff[4] = {attrInt(n, "cat_o0", 0), attrInt(n, "cat_o1", 0),
-                           attrInt(n, "cat_o2", 0), attrInt(n, "cat_o3", 0)};
-      add(OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff, act, res ? 1 : 0));
-    } else if (n.op == "conv1x1" && want("conv1x1")) {
-      const int act = attrInt(n, "act", 0);
-      const auto & wd = T_.at(n.ins[0]).dims;
-      const int Cout = (int)wd[0], Cin = (int)wd[1];
-      const int N = Cin > 0 ? (int)(T_.at(n.ins[1]).numel() / Cin) : 0;
-      const bool res = n.ins.size() > 3 && n.ins[3] != "-";
-      add(OpSignature::conv1x1(Cout, N, Cin, act, res ? 1 : 0));
-    } else if (n.op == "conv_general" && want("depthwise")) {
-      const int K = attrInt(n, "K", 3), S = attrInt(n, "S", 1), P = attrInt(n, "P", 1),
-                G = attrInt(n, "G", 1), act = attrInt(n, "act", 0);
-      const auto & id = T_.at(n.ins[0]).dims;
-      const size_t base = id.size() >= 3 ? id.size() - 3 : 0;
-      const int Cin = (int)id[base];
-      const auto & od = T_.at(n.outs[0]).dims;
-      const int Cout = (int)od[od.size() >= 3 ? od.size() - 3 : 0];
-      if (G == Cin && (K == 3 || K == 5) && Cin == Cout)
-        add(OpSignature::depthwise(attrInt(n, "Wout", 0), attrInt(n, "Hout", 0), S, P, Cin, K, act));
-    } else if (want(n.op) &&
-               (n.op == "ew_binary" || n.op == "ew_unary" || n.op == "copy_c" ||
-                n.op == "slice_axis" || n.op == "concat4" || n.op == "maxpool" ||
-                n.op == "resize_nn" || n.op == "permute_0213" || n.op == "bmm" ||
-                n.op == "softmax_axis" || n.op == "gap")) {
-      // Round 28: 小算子签名（与 dispatch/autotune 完全一致）。
-      add(smallSig(n));
-    }
+    // conv_general 仅当请求里含 "depthwise" 时才可能纳入（与旧语义一致）。
+    const std::string wop = n.op == "conv_general" ? "depthwise" : n.op;
+    if (!ops.empty() && std::find(ops.begin(), ops.end(), wop) == ops.end()) continue;
+    bool ok = true;
+    OpSignature s = nodeSignature(n, &ok);
+    if (ok) add(s);
   }
   return out;
 }
