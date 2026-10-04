@@ -43,18 +43,19 @@ std::string opt(const char * k, int v)
   o << "-D" << k << "=" << v;
   return o.str();
 }
-std::string ovOptions(int obw, int obh, int stride, int pad, int act, int res, const std::string & extra)
+std::string ovOptions(int obw, int obh, int stride, int pad, int act, int res, int slm,
+                      const std::string & extra)
 {
   std::ostringstream o;
-  o << "-DOBW=" << obw << " -DOBH=" << obh << " -DSTRIDE=" << stride << " -DPAD=" << pad
-    << " -DACT=" << act << " -DRES=" << res << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math"
-    << extra;
+  o << "-DOBW=" << obw << " -DOBH=" << obh << " -DSLM_DIV=" << slm << " -DSTRIDE=" << stride
+    << " -DPAD=" << pad << " -DACT=" << act << " -DRES=" << res
+    << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math" << extra;
   return o.str();
 }
-std::string ovConfig(int obw, int obh, int stride, int pad, int act, int res, bool fit)
+std::string ovConfig(int obw, int obh, int stride, int pad, int act, int res, int slm, bool fit)
 {
   std::ostringstream o;
-  o << "OBW=" << obw << ",OBH=" << obh << ",STRIDE=" << stride << ",PAD=" << pad
+  o << "OBW=" << obw << ",OBH=" << obh << ",SLM=" << slm << ",STRIDE=" << stride << ",PAD=" << pad
     << ",ACT=" << act << ",RES=" << res << (fit ? " fit" : "");
   return o.str();
 }
@@ -160,6 +161,11 @@ const std::vector<KernelFamily> & kernelFamilies()
         std::vector<std::pair<int, int>> blocks =
           (s.stride == 2) ? std::vector<std::pair<int, int>>{{5, 4}, {4, 4}, {5, 2}, {6, 2}, {8, 2}, {3, 4}}
                           : std::vector<std::pair<int, int>>{{8, 2}, {5, 2}, {6, 2}, {4, 4}, {8, 1}, {4, 2}, {10, 2}, {8, 4}};
+        // R37: conv_ov SLM_DIV>1 is implemented in kernels/conv_ov.cl but currently
+        // produces wrong results (model_check FAIL; root cause TBD), so it is NOT
+        // enumerated. Only SLM_DIV=1 (numerically equivalent to the pre-R37 kernel)
+        // is offered. Re-enable once the reduce is fixed.
+        std::vector<int> slms = {1};
         for (auto [obw, obh] : blocks) {
           if (s.W > 0 && obw > s.W) continue;
           if (s.H > 0 && obh > s.H) continue;
@@ -168,8 +174,10 @@ const std::vector<KernelFamily> & kernelFamilies()
           if (s.W > 0 && s.H > 0 && s.W % obw == 0 && s.H % obh == 0) { extra += " -DFIT_WH=1"; fit = true; }
           if (s.Cout > 0 && s.Cout % 32 == 0) extra += " -DFIT_COUT=1";
           const int res = (s.groups == 2) ? 1 : 0;
-          out.push_back(mk("conv3x3_ov", "conv_ov", ovOptions(obw, obh, s.stride, s.pad, s.act, res, extra),
-                           ovConfig(obw, obh, s.stride, s.pad, s.act, res, fit)));
+          for (int slm : slms)
+            out.push_back(mk("conv3x3_ov", "conv_ov",
+                             ovOptions(obw, obh, s.stride, s.pad, s.act, res, slm, extra),
+                             ovConfig(obw, obh, s.stride, s.pad, s.act, res, slm, fit)));
         }
         return out;
       };
@@ -218,17 +226,29 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.supports = [](const OpSignature & s) { return s.op == "conv3x3" && s.Cin > 0; };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
+        // R37: SLM_DIV splits the input-channel loop across that many sub-groups in
+        // one work-group (upstream SLM_DIV_FACTOR), hiding the global-read latency
+        // that dominates the occupancy-limited shapes. Enumerate exact divisors of
+        // the input-channel block count (bounded, balanced partition).
+        const int icb = (s.Cin > 0) ? ((s.Cin + 15) / 16) : 1;
+        std::vector<int> slms = {1};
+        for (int d = 2; d <= icb && d <= 8; ++d)
+          if (icb % d == 0) slms.push_back(d);
         for (int obw : {2, 4, 8}) {
           if (s.W > 0 && obw > s.W) continue;
-          std::ostringstream o;
-          o << "-DOBW=" << obw << " -DSTRIDE=" << s.stride << " -DPAD=" << s.pad
-            << " -DACT=" << s.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
-          if (s.W > 0 && s.W % obw == 0) o << " -DFIT_WH=1";
-          if (s.Cout > 0 && s.Cout % 16 == 0) o << " -DFIT_COUT=1";
-          if (s.Cin > 0 && s.Cin % 16 == 0) o << " -DFIT_CIN=1";
-          std::ostringstream cc;
-          cc << "OBW=" << obw << ",STRIDE=" << s.stride << ",PAD=" << s.pad << ",ACT=" << s.act;
-          out.push_back(mk("conv3x3_blk", "conv_blk", o.str(), cc.str()));
+          for (int slm : slms) {
+            std::ostringstream o;
+            o << "-DOBW=" << obw << " -DSLM_DIV=" << slm << " -DSTRIDE=" << s.stride
+              << " -DPAD=" << s.pad << " -DACT=" << s.act
+              << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+            if (s.W > 0 && s.W % obw == 0) o << " -DFIT_WH=1";
+            if (s.Cout > 0 && s.Cout % 16 == 0) o << " -DFIT_COUT=1";
+            if (s.Cin > 0 && s.Cin % 16 == 0) o << " -DFIT_CIN=1";
+            std::ostringstream cc;
+            cc << "OBW=" << obw << ",SLM=" << slm << ",STRIDE=" << s.stride
+               << ",PAD=" << s.pad << ",ACT=" << s.act;
+            out.push_back(mk("conv3x3_blk", "conv_blk", o.str(), cc.str()));
+          }
         }
         return out;
       };

@@ -265,10 +265,17 @@ int benchConv(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const Conv
 {
   const int Hout = (s.H + 2 * c.PAD - 3) / c.STRIDE + 1;
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
+  int ovslm = 1;
+  if (c.OV) {
+    const char * e = std::getenv("OV_SLM");
+    if (e) ovslm = std::atoi(e);
+    if (ovslm < 1) ovslm = 1;
+  }
   cl_kernel k;
   try {
     if (c.OV)
-      k = rt.buildKernel("conv_ov", "conv3x3_ov", c.options());
+      k = rt.buildKernel("conv_ov", "conv3x3_ov",
+                         c.options() + " -DSLM_DIV=" + std::to_string(ovslm));
     else if (c.SGK)
       k = rt.buildKernel("conv_sg", "conv3x3_sg", c.options());
     else if (c.OSV)
@@ -371,10 +378,11 @@ int benchConv(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const Conv
     lyThreads = c.RT ? static_cast<size_t>(c.TY) * (c.CB / c.TN)
                      : static_cast<size_t>(c.TY);
   }
-  const size_t lws[3] = {lxThreads, lyThreads, c.OV ? static_cast<size_t>(c.SG) : 1};
+  const size_t lws[3] = {lxThreads, c.OV ? static_cast<size_t>(ovslm) : lyThreads,
+                         c.OV ? static_cast<size_t>(c.SG) : 1};
   const size_t gws[3] = {
     static_cast<size_t>((Wout + c.TX - 1) / c.TX) * lxThreads,
-    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * lyThreads,
+    static_cast<size_t>((Hout + c.TY - 1) / c.TY) * (c.OV ? static_cast<size_t>(ovslm) : lyThreads),
     c.OV ? static_cast<size_t>((((s.Cout + 1) / 2 + 15) / 16) * 16)
          : static_cast<size_t>((Cout + c.CB - 1) / c.CB)};
 
@@ -432,9 +440,20 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
   const int Cin = s.Cin, Cout = s.Cout, OBW = c.TX;
   char oo[192];
+  const int SLM_DIV = (c.TY >= 1) ? c.TY : 1;
   std::snprintf(oo, sizeof(oo),
-                "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 -cl-mad-enable -cl-fast-relaxed-math",
-                OBW, c.STRIDE, c.PAD, c.ACT);
+                "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 -DSLM_DIV=%d "
+                "-cl-mad-enable -cl-fast-relaxed-math",
+                OBW, c.STRIDE, c.PAD, c.ACT, SLM_DIV);
+  // Mirror the registry's compile-time specialization so the bench matches the
+  // production candidate binary exactly.
+  {
+    std::string add;
+    if (Wout % OBW == 0) add += " -DFIT_WH=1";
+    if (Cout % 16 == 0) add += " -DFIT_COUT=1";
+    if (Cin % 16 == 0) add += " -DFIT_CIN=1";
+    std::strncat(oo, add.c_str(), sizeof(oo) - std::strlen(oo) - 1);
+  }
   cl_kernel k;
   try { k = rt.buildKernel("conv_blk", "conv3x3_blk", oo); }
   catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
@@ -483,10 +502,10 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
   clSetKernelArg(k, 8, sizeof(ho), &ho);
   clSetKernelArg(k, 9, sizeof(wo), &wo);
 
-  const size_t lws[3] = {1, 16, 1};
+  const size_t lws[3] = {1, static_cast<size_t>(16 * SLM_DIV), 1};
   const size_t gws[3] = {
     static_cast<size_t>(((Wout + OBW - 1) / OBW) * Hout),
-    static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
+    static_cast<size_t>(((Cout + 15) / 16) * 16 * SLM_DIV), 1};
   const double med = rt.timeMs(
     [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;

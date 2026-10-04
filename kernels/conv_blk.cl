@@ -69,6 +69,13 @@
 #ifndef OUT_FSV16
 #define OUT_FSV16 0
 #endif
+// R37: split the input-channel loop across SLM_DIV sub-groups in one
+// work-group (upstream `SLM_DIV_FACTOR`), then reduce in SLM. More in-flight work
+// per WG to hide the global-read latency that dominates the occupancy-limited
+// shapes. 1 = disabled.
+#ifndef SLM_DIV
+#define SLM_DIV 1
+#endif
 
 #define FEATURE_SLICE_SIZE 16
 // INPUT_LINE_SIZE = stride*(OBW-1) + (3-1)*dil + 1 = stride*(OBW-1) + 3
@@ -109,7 +116,7 @@ inline half blk_activate(half v) {
 }
 
 __attribute__((intel_reqd_sub_group_size(SG)))
-__attribute__((reqd_work_group_size(1, SG, 1)))
+__attribute__((reqd_work_group_size(1, SG * SLM_DIV, 1)))
 __kernel void conv3x3_blk(
   __global const half *restrict input,    // [Cin/16][H][W][16]
   __global const half *restrict weights,  // [Cout/16][Cin/16][3][3][16 isv][16 osv]
@@ -118,6 +125,8 @@ __kernel void conv3x3_blk(
   const int Cin, const int H, const int W,
   const int Cout, const int Hout, const int Wout) {
   const int lid = get_sub_group_local_id();
+  const int lid1 = get_local_id(1);
+  const int feature_sub_block = lid1 / SG;
   const int f_block = get_group_id(1);
   const int xy = get_global_id(0);
   const int X_BLOCKS = (Wout + OBW - 1) / OBW;
@@ -142,7 +151,14 @@ __kernel void conv3x3_blk(
 
   VEC_T dst = (VEC_T)0;
 
-  for (int icb = 0; icb < ic_blocks; ++icb) {
+#if SLM_DIV > 1
+  const int icb_begin = feature_sub_block * ic_blocks / SLM_DIV;
+  const int icb_end = (feature_sub_block + 1) * ic_blocks / SLM_DIV;
+#else
+  const int icb_begin = 0;
+  const int icb_end = ic_blocks;
+#endif
+  for (int icb = icb_begin; icb < icb_end; ++icb) {
     const int gc = icb * 16 + lid;                 // this lane's input channel
 #if FIT_CIN
     const bool in_left = false;
@@ -209,6 +225,18 @@ __kernel void conv3x3_blk(
     }
   }
 
+#if SLM_DIV > 1
+  // Reduce the per-sub-group partial sums. Sub-block 0 owns the final output.
+  __local VEC_T partial_summ[SG * SLM_DIV];
+  partial_summ[lid1] = dst;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (feature_sub_block == 0) {
+#pragma unroll
+    for (int i = 1; i < SLM_DIV; ++i) dst += partial_summ[(lid1 % SG) + i * SG];
+  }
+  if (feature_sub_block != 0) return;
+#endif
+
   const int oc = f_block * 16 + lid;
 #if FIT_COUT
   const bool out_left = false;
@@ -216,6 +244,10 @@ __kernel void conv3x3_blk(
   const bool out_left = (oc >= Cout);
 #endif
   half b = (bias != 0 && !out_left) ? bias[oc] : (half)0;
+  VEC_T res;
+#pragma unroll
+  for (int i = 0; i < OBW; ++i) res[i] = blk_activate(dst[i] + b);
+#if OUT_FSV16
 #pragma unroll
   for (int i = 0; i < OBW; ++i) {
     const int ox = x + i;
@@ -225,15 +257,41 @@ __kernel void conv3x3_blk(
     if (!out_left && ox < Wout && y < Hout)
 #endif
     {
-#if OUT_FSV16
       // b_fs_yx_fsv16: [Cout/16][Hout][Wout][16]; oc == f_block*16 + lid.
-      output[(((size_t)f_block * Hout + y) * Wout + ox) * 16 + lid] =
-          blk_activate(dst[i] + b);
-#else
-      output[((size_t)oc * Hout + y) * Wout + ox] = blk_activate(dst[i] + b);
-#endif
+      output[(((size_t)f_block * Hout + y) * Wout + ox) * 16 + lid] = res[i];
     }
   }
+#else
+  // R37: coalesced vector store. The lane's OBW outputs are
+  // contiguous in bfyx; one vstoreN replaces OBW scalar stores when the base is
+  // aligned. (OV's VSTORE path.)
+  const size_t obase = ((size_t)oc * Hout + y) * Wout + x;
+#if FIT_WH
+  const bool vec_ok = !out_left && (x + OBW <= Wout) && ((obase % OBW) == 0);
+#else
+  const bool vec_ok = !out_left && y < Hout && (x + OBW <= Wout) && ((obase % OBW) == 0);
+#endif
+  if (vec_ok) {
+#if OBW == 8
+    vstore8(res, 0, output + obase);
+#elif OBW == 4
+    vstore4(res, 0, output + obase);
+#else
+    vstore2(res, 0, output + obase);
+#endif
+  } else {
+#pragma unroll
+    for (int i = 0; i < OBW; ++i) {
+      const int ox = x + i;
+#if FIT_WH
+      if (!out_left)
+#else
+      if (!out_left && ox < Wout && y < Hout)
+#endif
+        output[obase + i] = res[i];
+    }
+  }
+#endif
 }
 
 // bfyx [C][H][W] -> b_fs_yx_fsv16 [C/16][H][W][16] (host-side reorder before

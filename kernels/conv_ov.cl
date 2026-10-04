@@ -81,6 +81,12 @@
 #ifndef FIT_COUT
 #define FIT_COUT 0       // Cout % (2*SG) == 0
 #endif
+// R37: split the input-channel loop across SLM_DIV sub-groups in one work-group
+// (upstream SLM_DIV_FACTOR-style), then reduce in SLM. More in-flight work per WG
+// to hide global-read latency on occupancy-limited shapes. 1 = disabled.
+#ifndef SLM_DIV
+#define SLM_DIV 1
+#endif
 
 // OV's get_bfyx_req_input_block_dims(): round the required input width up to a
 // whole sub-group (read_chunk_size == SUB_GROUP_SIZE == 16), min one chunk.
@@ -102,7 +108,7 @@ inline half ov_activate(half v) {
 }
 
 __attribute__((intel_reqd_sub_group_size(SG)))
-__attribute__((reqd_work_group_size(1, 1, SG)))
+__attribute__((reqd_work_group_size(1, SLM_DIV, SG)))
 __kernel void conv3x3_ov(
   __global const half *restrict input,    // [Cin][H][W] (bfyx, contiguous)
   __global const half *restrict weights,  // OSV-swizzled [ceil(Cout/32)][Cin][3][3][32]
@@ -112,11 +118,12 @@ __kernel void conv3x3_ov(
   const int Cin, const int H, const int W,
   const int Cout, const int Hout, const int Wout) {
   const int oc  = get_global_id(0) * OBW;   // output column block
-  const int orr = get_global_id(1) * OBH;   // output row block
+  const int orr = get_group_id(1) * OBH;    // output row block (SLM_DIV along local dim 1)
   // OV: fm = get_global_id(2) (includes the sub-group lane); the feature-map
   // group is fm / SUB_GROUP_SIZE, and each lane owns channel fmg*OSV + lid.
   const int fmg = get_global_id(2) / SG;
   const int lid = get_sub_group_local_id();
+  const int sub = get_local_id(1);           // R37: sub-block over input channels
   const int feature_idx = fmg * OSV + lid;   // this lane's first output channel
 
   half in[IN_BLOCK_ARRAY_SIZE];
@@ -128,7 +135,14 @@ __kernel void conv3x3_ov(
   const int base_y = orr * STRIDE - PAD;
   const int wbase = fmg * Cin * 9 * OSV;   // in halfs
 
-  for (int kd = 0; kd < Cin; ++kd) {
+#if SLM_DIV > 1
+  const int kd_begin = sub * Cin / SLM_DIV;
+  const int kd_end = (sub + 1) * Cin / SLM_DIV;
+#else
+  const int kd_begin = 0;
+  const int kd_end = Cin;
+#endif
+  for (int kd = kd_begin; kd < kd_end; ++kd) {
     // ---- load the input block for this input channel (OV's scatter mapping) ----
 #pragma unroll
     for (int q = 0; q < IN_BLOCK_ARRAY_SIZE; ++q) {
@@ -165,6 +179,22 @@ __kernel void conv3x3_ov(
       }
     }
   }
+
+#if SLM_DIV > 1
+  // Reduce the per-sub-group partial sums; sub-block 0 owns the final output.
+  __local half2 partial[SLM_DIV * SG * (OBW * OBH)];
+#pragma unroll
+  for (int i = 0; i < OBW * OBH; ++i) partial[(sub * SG + lid) * (OBW * OBH) + i] = out[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sub == 0) {
+#pragma unroll
+    for (int s = 1; s < SLM_DIV; ++s)
+#pragma unroll
+      for (int i = 0; i < OBW * OBH; ++i)
+        out[i] += partial[(s * SG + lid) * (OBW * OBH) + i];
+  }
+  if (sub != 0) return;
+#endif
 
   // ---- output phase: 2 channels per lane (fid = 0,1), bias + activation ----
 #pragma unroll

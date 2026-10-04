@@ -2322,16 +2322,19 @@ void PlanModel::run()
         // input bfyx -> b_fs_yx_fsv16 (cached scratch, unless the producer already
         // emitted fsv16 — R36) then runs the blocked kernel, writing bfyx output
         // (or b_fs_yx_fsv16 when the whole consumer set is blocked — R36).
-        int obw = 8;
+        int obw = 8, slm = 1;
         std::string oo;
         if (te) {
           oo = te->options;
           auto p = oo.find("-DOBW=");
           if (p != std::string::npos) obw = std::atoi(oo.c_str() + p + 6);
+          auto ps = oo.find("-DSLM_DIV=");
+          if (ps != std::string::npos) slm = std::atoi(oo.c_str() + ps + 10);  // len("-DSLM_DIV=")==10
+          if (slm < 1) slm = 1;
         } else {
           char buf[192];
           std::snprintf(buf, sizeof(buf),
-                        "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
+                        "-DOBW=%d -DSLM_DIV=1 -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
                         "-cl-mad-enable -cl-fast-relaxed-math", obw, stride, pad, act);
           oo = buf;
         }
@@ -2352,10 +2355,10 @@ void PlanModel::run()
         setArg(kk, 7, sizeof(Cout), &Cout);
         setArg(kk, 8, sizeof(Hout), &Hout);
         setArg(kk, 9, sizeof(Wout), &Wout);
-        const size_t lws[3] = {1, 16, 1};
+        const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
-          static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
+          static_cast<size_t>(((Cout + 15) / 16) * 16 * slm), 1};
         timed("conv3x3blk@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
                 std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
                 std::to_string(Cout) + (te ? "(tuned)" : ""),
@@ -2367,12 +2370,15 @@ void PlanModel::run()
         // 从 options 解析 OBW/OBH 以重建 grid（避免再解析 config 串）。
         std::string ovopts = te->options;
         if (dres) setResOpt(ovopts, true);  // R33 融合残差
-        int obw = 8, obh = 2;
+        int obw = 8, obh = 2, slm = 1;
         {
           auto p = ovopts.find("-DOBW=");
           if (p != std::string::npos) obw = std::atoi(ovopts.c_str() + p + 6);
           p = ovopts.find("-DOBH=");
           if (p != std::string::npos) obh = std::atoi(ovopts.c_str() + p + 6);
+          auto ps = ovopts.find("-DSLM_DIV=");
+          if (ps != std::string::npos) slm = std::atoi(ovopts.c_str() + ps + 10);  // len==10
+          if (slm < 1) slm = 1;
         }
         cl_kernel kk = getKernel(sourceOfKernel(te->kernel), te->kernel, ovopts);
         cl_mem dw = ovWeight(n.ins[1], in(1), Cout, Cin);
@@ -2387,10 +2393,10 @@ void PlanModel::run()
         setArg(kk, 8, sizeof(Cout), &Cout);
         setArg(kk, 9, sizeof(Hout), &Hout);
         setArg(kk, 10, sizeof(Wout), &Wout);
-        const size_t lws[3] = {1, 1, 16};
+        const size_t lws[3] = {1, static_cast<size_t>(slm), 16};
         const size_t gws[3] = {
           static_cast<size_t>((Wout + obw - 1) / obw),
-          static_cast<size_t>((Hout + obh - 1) / obh),
+          static_cast<size_t>(((Hout + obh - 1) / obh) * slm),
           static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
         timed("conv3x3ov@" + std::to_string(Wout) + "x" + std::to_string(Hout) + "s" +
                 std::to_string(stride) + "_Cin" + std::to_string(Cin) + "_Cout" +
@@ -2943,11 +2949,14 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         if (c.kernel == "conv3x3_ov") {
           cl_kernel kk = getKernel("conv_ov", "conv3x3_ov", c.options);
           cl_mem dw = ovWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
-          int obw = 8, obh = 2;
+          int obw = 8, obh = 2, slm = 1;
           auto p = c.options.find("-DOBW=");
           if (p != std::string::npos) obw = std::atoi(c.options.c_str() + p + 6);
           p = c.options.find("-DOBH=");
           if (p != std::string::npos) obh = std::atoi(c.options.c_str() + p + 6);
+          auto ps = c.options.find("-DSLM_DIV=");
+          if (ps != std::string::npos) slm = std::atoi(c.options.c_str() + ps + 10);  // len==10
+          if (slm < 1) slm = 1;
           setArg(kk, 0, sizeof(dx), &dx);
           setArg(kk, 1, sizeof(dw), &dw);
           setArg(kk, 2, sizeof(db), &db);
@@ -2959,10 +2968,10 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kk, 8, sizeof(Cout), &Cout);
           setArg(kk, 9, sizeof(Hout), &Hout);
           setArg(kk, 10, sizeof(Wout), &Wout);
-          const size_t lws[3] = {1, 1, 16};
+          const size_t lws[3] = {1, static_cast<size_t>(slm), 16};
           const size_t gws[3] = {
             static_cast<size_t>((Wout + obw - 1) / obw),
-            static_cast<size_t>((Hout + obh - 1) / obh),
+            static_cast<size_t>(((Hout + obh - 1) / obh) * slm),
             static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
           return [this, kk, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
@@ -2972,6 +2981,10 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           int obw = 8;
           auto p = c.options.find("-DOBW=");
           if (p != std::string::npos) obw = std::atoi(c.options.c_str() + p + 6);
+          int slm = 1;
+          auto ps = c.options.find("-DSLM_DIV=");
+          if (ps != std::string::npos) slm = std::atoi(c.options.c_str() + ps + 10);  // len==10
+          if (slm < 1) slm = 1;
           cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", c.options);
           cl_mem dw = blkWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
           cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
@@ -2985,10 +2998,10 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kk, 7, sizeof(Cout), &Cout);
           setArg(kk, 8, sizeof(Hout), &Hout);
           setArg(kk, 9, sizeof(Wout), &Wout);
-          const size_t lws[3] = {1, 16, 1};
+          const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
           const size_t gws[3] = {
             static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
-            static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
+            static_cast<size_t>(((Cout + 15) / 16) * 16 * slm), 1};
           return [this, kk, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
           };

@@ -46,16 +46,30 @@ TuningEntry autotuneOp(
   best.iters = iters;
   best.source = "tuned";
 
+  const bool dbg = std::getenv("INFVINO_AUTOTUNE_DEBUG") != nullptr;
+  if (dbg)
+    std::fprintf(stderr, "[autotune] %s: %zu candidates\n", sig.str().c_str(), cands.size());
   for (const auto & c : cands) {
     std::function<cl_event()> enq;
     try {
       enq = makeEnqueue(c);
-    } catch (const std::exception &) {
+    } catch (const std::exception & e) {
+      if (dbg)
+        std::fprintf(stderr, "  [skip] %-18s %-16s makeEnqueue: %s\n", c.kernel.c_str(),
+                     c.config.c_str(), e.what());
       continue;  // build 失败（资源/编译）→ 跳过
     }
     double ms = 0;
-    if (!benchCandidate(rt, enq, iters, &ms)) continue;
+    if (!benchCandidate(rt, enq, iters, &ms)) {
+      if (dbg)
+        std::fprintf(stderr, "  [skip] %-18s %-16s bench failed\n", c.kernel.c_str(),
+                     c.config.c_str());
+      continue;
+    }
     const double ops = rt.opsPerEuCycle(flops, ms);
+    if (dbg)
+      std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f\n", c.kernel.c_str(),
+                   c.options.c_str(), ms, ops);
     if (best.kernel.empty() || ms < best.ms) {
       best.kernel = c.kernel;
       best.config = c.config;
