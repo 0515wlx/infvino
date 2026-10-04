@@ -18,9 +18,9 @@ int g_fail = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("FAIL: %s\n", msg); ++g_fail; } \
                               else std::printf("ok:   %s\n", msg); } while (0)
 
-gk::DeviceInfo dev()
+infvino::ClDeviceInfo dev()
 {
-  gk::DeviceInfo d;
+  infvino::ClDeviceInfo d;
   d.name = "TestGT"; d.eu = 80; d.clock_mhz = 1300; d.subgroup_size = 16;
   d.pci_vendor_id = 0x8086; d.pci_device_id = 0x9a49;
   return d;
@@ -29,7 +29,7 @@ gk::DeviceInfo dev()
 
 int main()
 {
-  using namespace gk;
+  using namespace infvino;
 
   // --- 签名稳定性/可区分性 ---
   const auto a = OpSignature::conv3x3(40, 40, 1, 1, 64, 64, 1);
@@ -67,7 +67,7 @@ int main()
   CHECK(in.lookup(a) == nullptr, "device key mismatch -> miss（回退启发式）");
 
   // --- Round 28: 通用小算子签名 + 候选枚举 ---
-  DeviceInfo d = dev();
+  ClDeviceInfo d = dev();
   const auto ew1 = OpSignature::custom("ew_binary", {409600, 0, 0});
   const auto ew2 = OpSignature::custom("ew_binary", {409600, 0, 0});
   const auto ew3 = OpSignature::custom("ew_binary", {204800, 0, 0});

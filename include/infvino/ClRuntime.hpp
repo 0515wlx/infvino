@@ -2,8 +2,8 @@
 //
 // 轻量 OpenCL 运行时封装：设备枚举 / 上下文 / 队列 / kernel 构建缓存 / 计时。
 // 仅用于自研 kernel 的开发与基准，不参与生产推理。
-#ifndef INFVINO_GK__CL_RUNTIME_HPP_
-#define INFVINO_GK__CL_RUNTIME_HPP_
+#ifndef INFVINO__CL_RUNTIME_HPP_
+#define INFVINO__CL_RUNTIME_HPP_
 
 #include <CL/cl.h>
 
@@ -18,7 +18,7 @@
 #define INFVINO_KERNEL_DIR "kernels"
 #endif
 
-namespace gk
+namespace infvino
 {
 
 /**
@@ -123,7 +123,7 @@ private:
   size_t              allocCount_{0};
 };
 
-struct DeviceInfo
+struct ClDeviceInfo
 {
   std::string     name;
   std::string     vendor;
@@ -149,7 +149,7 @@ class ClRuntime
 {
 public:
   /** @brief 枚举平台/设备（不建立上下文）。 */
-  static std::vector<DeviceInfo> enumerate();
+  static std::vector<ClDeviceInfo> enumerate();
 
   /**
    * @param kernel_dir  运行时加载 .cl 的目录（默认编译期写死的源码 kernels/）.
@@ -165,7 +165,7 @@ public:
   ClRuntime(const ClRuntime &) = delete;
   ClRuntime & operator=(const ClRuntime &) = delete;
 
-  const DeviceInfo & info() const { return info_; }
+  const ClDeviceInfo & info() const { return info_; }
   cl_device_id       device() const { return device_; }
   cl_context         context() const { return context_; }
   cl_command_queue   queue() const { return queue_; }
@@ -206,7 +206,7 @@ public:
 
 private:
   std::string      kernel_dir_;
-  DeviceInfo       info_;
+  ClDeviceInfo       info_;
   cl_device_id     device_{nullptr};
   cl_context       context_{nullptr};
   cl_command_queue queue_{nullptr};
@@ -214,6 +214,6 @@ private:
   std::unordered_map<std::string, std::string> sources_;  // source_name -> .cl text
 };
 
-}  // namespace gk
+}  // namespace infvino
 
-#endif  // INFVINO_GK__CL_RUNTIME_HPP_
+#endif  // INFVINO__CL_RUNTIME_HPP_

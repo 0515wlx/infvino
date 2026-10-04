@@ -1,13 +1,13 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
 // FP16 <-> FP32 位运算转换（不依赖 _Float16，便于跨编译器）。
-#ifndef INFVINO_GK__HALF_HPP_
-#define INFVINO_GK__HALF_HPP_
+#ifndef INFVINO__HALF_HPP_
+#define INFVINO__HALF_HPP_
 
 #include <cstdint>
 #include <cstring>
 
-namespace gk
+namespace infvino
 {
 
 inline uint16_t f32_to_f16(float f)
@@ -47,6 +47,6 @@ inline float f16_to_f32(uint16_t h)
   return out;
 }
 
-}  // namespace gk
+}  // namespace infvino
 
-#endif  // INFVINO_GK__HALF_HPP_
+#endif  // INFVINO__HALF_HPP_

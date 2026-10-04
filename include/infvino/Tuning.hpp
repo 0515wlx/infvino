@@ -8,8 +8,8 @@
 //
 // 设计见 docs/autotuning.md。缓存只影响「选哪个 kernel/config」，不参与数值，
 // 查不到时永远可以回退到内核里的启发式。
-#ifndef INFVINO_GK__TUNING_HPP_
-#define INFVINO_GK__TUNING_HPP_
+#ifndef INFVINO__TUNING_HPP_
+#define INFVINO__TUNING_HPP_
 
 #include <cstdint>
 #include <map>
@@ -18,7 +18,7 @@
 
 #include "infvino/ClRuntime.hpp"
 
-namespace gk
+namespace infvino
 {
 
 /**
@@ -106,8 +106,8 @@ public:
   std::map<std::string, TuningEntry> &       entries() { return entries_; }
   size_t size() const { return entries_.size(); }
 
-  /** @brief 由 DeviceInfo 生成设备键（优先 PCI id，其次 vendor:name:eu）。*/
-  static std::string deviceKey(const DeviceInfo & d);
+  /** @brief 由 ClDeviceInfo 生成设备键（优先 PCI id，其次 vendor:name:eu）。*/
+  static std::string deviceKey(const ClDeviceInfo & d);
 
 private:
   bool                              enabled_ = true;
@@ -123,7 +123,7 @@ private:
  *
  * @param dev 设备信息（EU 数等，用于网格占用修正）。
  */
-double expectedOps(const OpSignature & sig, const DeviceInfo & dev);
+double expectedOps(const OpSignature & sig, const ClDeviceInfo & dev);
 
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/
 constexpr double kPeakOpsPerEuCycle = 32.0;
@@ -144,6 +144,6 @@ constexpr double kConvOvIssueCeiling = 20.3;
 /** @brief conv3x3 OV 主循环的 mad 指令占比（R24 ISA：288/453）。*/
 constexpr double kConvOvMadFraction = 0.636;
 
-}  // namespace gk
+}  // namespace infvino
 
-#endif  // INFVINO_GK__TUNING_HPP_
+#endif  // INFVINO__TUNING_HPP_

@@ -1,15 +1,15 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
 // GEMM/conv kernel 的编译期 tile 配置（bench 与 numtest 共用）。
-#ifndef INFVINO_GK__TILES_HPP_
-#define INFVINO_GK__TILES_HPP_
+#ifndef INFVINO__TILES_HPP_
+#define INFVINO__TILES_HPP_
 
 #include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
 
-namespace gk
+namespace infvino
 {
 
 struct Tiles
@@ -254,6 +254,6 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   return c;
 }
 
-}  // namespace gk
+}  // namespace infvino
 
-#endif  // INFVINO_GK__TILES_HPP_
+#endif  // INFVINO__TILES_HPP_

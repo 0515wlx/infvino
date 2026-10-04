@@ -29,7 +29,7 @@ static std::vector<float> loadF16(const std::string & path, size_t n)
   std::vector<uint16_t> h(n);
   f.read(reinterpret_cast<char *>(h.data()), static_cast<std::streamsize>(n * 2));
   std::vector<float> o(n);
-  for (size_t i = 0; i < n; ++i) o[i] = gk::f16_to_f32(h[i]);
+  for (size_t i = 0; i < n; ++i) o[i] = infvino::f16_to_f32(h[i]);
   return o;
 }
 

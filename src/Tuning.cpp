@@ -10,7 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace gk
+namespace infvino
 {
 
 namespace
@@ -174,7 +174,7 @@ OpSignature OpSignature::custom(const std::string & op, std::vector<int> params,
 // Device key
 // ---------------------------------------------------------------------------
 
-std::string TuningCache::deviceKey(const DeviceInfo & d)
+std::string TuningCache::deviceKey(const ClDeviceInfo & d)
 {
   char buf[128];
   if (d.pci_device_id)
@@ -387,7 +387,7 @@ double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
 }
 }  // namespace
 
-double expectedOps(const OpSignature & s, const DeviceInfo & dev)
+double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
 {
   const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
 
@@ -520,4 +520,4 @@ double expectedOps(const OpSignature & s, const DeviceInfo & dev)
   return 1.0;
 }
 
-}  // namespace gk
+}  // namespace infvino

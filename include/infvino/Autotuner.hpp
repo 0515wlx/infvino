@@ -5,8 +5,8 @@
 // 与 OpenVINO 的差异：infvino 的候选**带实测指标**（ops/EU/cyc 与 expected），
 // 因此调优缓存本身就是「物理极限的数据库」。枚举规则尽量小：候选来自 docs/kernel.md
 // 里已验证的 config 谱系（而不是无脑笛卡尔积），避免开发板上 IGC 反复 JIT。
-#ifndef INFVINO_GK__AUTOTUNER_HPP_
-#define INFVINO_GK__AUTOTUNER_HPP_
+#ifndef INFVINO__AUTOTUNER_HPP_
+#define INFVINO__AUTOTUNER_HPP_
 
 #include <functional>
 #include <string>
@@ -16,7 +16,7 @@
 #include "infvino/Tiles.hpp"
 #include "infvino/Tuning.hpp"
 
-namespace gk
+namespace infvino
 {
 
 /** @brief 一个候选 kernel 配置（不变量：kernel 名 + 编译选项 + 可读 config 串）。 */
@@ -77,6 +77,6 @@ TuningEntry autotuneOp(
   const std::function<std::function<cl_event()>(const Candidate &)> & makeEnqueue,
   double flops, int iters);
 
-}  // namespace gk
+}  // namespace infvino
 
-#endif  // INFVINO_GK__AUTOTUNER_HPP_
+#endif  // INFVINO__AUTOTUNER_HPP_

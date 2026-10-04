@@ -9,7 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace gk
+namespace infvino
 {
 
 namespace
@@ -424,4 +424,4 @@ TuningEntry autotuneOp(
   return best;
 }
 
-}  // namespace gk
+}  // namespace infvino

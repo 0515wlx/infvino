@@ -18,7 +18,7 @@ ClBackend::ClBackend(const ModelInfo & info, bool profiling)
       "scripts/onnx2plan.py --onnx <model.onnx> --out-dir models");
 
   const std::string kernel_dir = info.kernel_dir.empty() ? INFVINO_KERNEL_DIR : info.kernel_dir;
-  model_ = std::make_unique<gk::PlanModel>(info.plan, kernel_dir, -1, 0, profiling);
+  model_ = std::make_unique<infvino::PlanModel>(info.plan, kernel_dir, -1, 0, profiling);
 
   input_dims_ = model_->inputDims();
   output_shapes_.clear();
@@ -39,7 +39,7 @@ std::vector<Tensor> ClBackend::infer(const float * input_f32, size_t numel)
       std::to_string(expect));
 
   in_f16_.resize(numel);
-  for (size_t i = 0; i < numel; ++i) in_f16_[i] = gk::f32_to_f16(input_f32[i]);
+  for (size_t i = 0; i < numel; ++i) in_f16_[i] = infvino::f32_to_f16(input_f32[i]);
 
   const auto t0 = std::chrono::steady_clock::now();
   model_->setInput(in_f16_.data());
@@ -58,7 +58,7 @@ std::vector<Tensor> ClBackend::infer(const float * input_f32, size_t numel)
     Tensor t;
     t.shape = model_->outputDims(i);
     t.data.resize(n);
-    for (size_t j = 0; j < n; ++j) t.data[j] = gk::f16_to_f32(out_f16_[j]);
+    for (size_t j = 0; j < n; ++j) t.data[j] = infvino::f16_to_f32(out_f16_[j]);
     outputs.push_back(std::move(t));
   }
   return outputs;

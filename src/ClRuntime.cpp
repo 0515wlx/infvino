@@ -23,7 +23,7 @@
 #define CL_DEVICE_VENDOR_ID 0x1000
 #endif
 
-namespace gk
+namespace infvino
 {
 
 namespace
@@ -55,9 +55,9 @@ std::vector<cl_device_id> devicesOf(cl_platform_id p, cl_device_type type)
   return v;
 }
 
-DeviceInfo queryDevice(cl_device_id d)
+ClDeviceInfo queryDevice(cl_device_id d)
 {
-  DeviceInfo i;
+  ClDeviceInfo i;
   i.name = getStr(d, CL_DEVICE_NAME);
   i.vendor = getStr(d, CL_DEVICE_VENDOR);
   i.driver_version = getStr(d, CL_DRIVER_VERSION);
@@ -88,7 +88,7 @@ DeviceInfo queryDevice(cl_device_id d)
 }
 }  // namespace
 
-std::string DeviceInfo::describe() const
+std::string ClDeviceInfo::describe() const
 {
   char buf[512];
   std::snprintf(
@@ -98,9 +98,9 @@ std::string DeviceInfo::describe() const
   return buf;
 }
 
-std::vector<DeviceInfo> ClRuntime::enumerate()
+std::vector<ClDeviceInfo> ClRuntime::enumerate()
 {
-  std::vector<DeviceInfo> out;
+  std::vector<ClDeviceInfo> out;
   cl_uint np = 0;
   if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) return out;
   std::vector<cl_platform_id> plats(np);
@@ -286,4 +286,4 @@ double ClRuntime::timeMs(
   return ts[ts.size() / 2];
 }
 
-}  // namespace gk
+}  // namespace infvino

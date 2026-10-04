@@ -1,7 +1,7 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
 // 设备信息（OpenCL）。替代原 OpenVINO 的设备探测：不再硬编码 GPU，
-// 由 gk::ClRuntime 自动选择（优先 GPU 平台，无 GPU 时退到任一可用设备）。
+// 由 infvino::ClRuntime 自动选择（优先 GPU 平台，无 GPU 时退到任一可用设备）。
 #ifndef INFVINO__DEVICE_HPP_
 #define INFVINO__DEVICE_HPP_
 
@@ -26,7 +26,7 @@ struct DeviceInfo
 };
 
 /** @brief 由已选中的运行设备 + 用户请求构造 DeviceInfo。 */
-DeviceInfo describeDevice(const gk::DeviceInfo & used, const std::string & requested);
+DeviceInfo describeDevice(const ClDeviceInfo & used, const std::string & requested);
 
 }  // namespace infvino
 

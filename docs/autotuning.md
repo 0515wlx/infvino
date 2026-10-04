@@ -51,7 +51,7 @@ OpenVINO GPU plugin 的自动调优由四层组成，infvino 逐一对应：
 |---|---|---|
 | `ParamsKey` + device-feature key（`GetAllImplementations`）| 按 op 参数与设备能力**筛选可用实现** | `OpSignature` + `ClRuntime::DeviceInfo` 能力位 |
 | kernel 实现的 `autoTuneOptions`（`GetAutoTuneOptions` / `GetTunedKernelsDataByIndex`）| 每个实现**枚举候选配置** | `Tiles.hpp` 的 `candidates*()` |
-| `TuningCache`（JSON，`computeUnits → kType → params_hash → (kernel, index)`）| **离线调优缓存**，按设备 key | `gk::TuningCache`（§3） |
+| `TuningCache`（JSON，`computeUnits → kType → params_hash → (kernel, index)`）| **离线调优缓存**，按设备 key | `infvino::TuningCache`（§3） |
 | `JIT`/`jitter` + kernels cache | 编译期特化 + 运行时 kernel 缓存 | `ClRuntime::buildKernel` 缓存 + `PlanModel::getKernel` |
 
 关键设计差异（保留 infvino 的强项）：

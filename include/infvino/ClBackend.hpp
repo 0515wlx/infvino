@@ -1,6 +1,6 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
-// ClBackend —— 基于自研 OpenCL kernel（gk::PlanModel）的推理后端。
+// ClBackend —— 基于自研 OpenCL kernel（infvino::PlanModel）的推理后端。
 // 不再依赖 OpenVINO。输入为预处理后的 f32 NCHW blob，输出为 f32 张量。
 #ifndef INFVINO__CL_BACKEND_HPP_
 #define INFVINO__CL_BACKEND_HPP_
@@ -41,7 +41,7 @@ public:
   double             lastInferMs() const { return last_infer_ms_; }
 
 private:
-  std::unique_ptr<gk::PlanModel>    model_;
+  std::unique_ptr<infvino::PlanModel>    model_;
   std::vector<int64_t>              input_dims_;
   std::vector<std::vector<int64_t>> output_shapes_;
   DeviceInfo                        device_;

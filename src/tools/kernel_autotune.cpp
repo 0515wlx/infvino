@@ -25,7 +25,7 @@ namespace
 // 的是 tuning.json（PlanModel 运行时查表）。这样 bake 不会破坏 plan 语义。
 bool bakePlan(
   const std::string & plan_in, const std::string & plan_out,
-  const std::map<std::string, gk::TuningEntry> & done)
+  const std::map<std::string, infvino::TuningEntry> & done)
 {
   std::ifstream in(plan_in);
   if (!in) return false;
@@ -94,10 +94,10 @@ int main(int argc, char ** argv)
     if (!cache_path.empty()) setenv("INFVINO_TUNING_CACHE", cache_path.c_str(), 1);
 
     const std::string kdir = kernel_dir.empty() ? INFVINO_KERNEL_DIR : kernel_dir;
-    gk::PlanModel model(plan_path, kdir, -1, 0, /*profiling=*/true);
+    infvino::PlanModel model(plan_path, kdir, -1, 0, /*profiling=*/true);
 
     std::printf("device: %s\n", model.device().describe().c_str());
-    std::printf("device key: %s\n", gk::TuningCache::deviceKey(model.device()).c_str());
+    std::printf("device key: %s\n", infvino::TuningCache::deviceKey(model.device()).c_str());
 
     if (list)
     {

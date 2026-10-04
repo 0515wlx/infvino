@@ -56,8 +56,8 @@ int main(int argc, char ** argv)
   int Cin = 0, Cout = 0, H = 0, W = 0, stride = -1, pad = -1;
   int B0 = 1, B1 = 1, outer = 0, axdim = 0, inner = 1;
   int dwK = 3, act = 0;
-  gk::Tiles tiles;
-  gk::Conv3x3Cfg conv;
+  infvino::Tiles tiles;
+  infvino::Conv3x3Cfg conv;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -89,8 +89,8 @@ int main(int argc, char ** argv)
     else if (a == "--input-w") in_w = next();
     else if (a == "--input-bias") in_bias = next();
     else if (a == "--dump") dump = next();
-    else if (a == "--tiles") tiles = gk::parseTiles(next());
-    else if (a == "--conv") conv = gk::parseConv(next());
+    else if (a == "--tiles") tiles = infvino::parseTiles(next());
+    else if (a == "--conv") conv = infvino::parseConv(next());
     else if (a == "--ov") conv.OV = 1;
     else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
   }
@@ -98,7 +98,7 @@ int main(int argc, char ** argv)
   if (pad >= 0) conv.PAD = pad;
 
   try {
-    gk::ClRuntime rt(kernel_dir);
+    infvino::ClRuntime rt(kernel_dir);
 
     if (op == "gemm") {
       if (M <= 0 || N <= 0 || K <= 0) throw std::runtime_error("need --m --n --k");
@@ -122,7 +122,7 @@ int main(int argc, char ** argv)
         static_cast<size_t>((N + tiles.BN - 1) / tiles.BN) * lws[0],
         static_cast<size_t>((M + tiles.BM - 1) / tiles.BM) * lws[1]};
       for (int i = 0; i < iters; ++i)
-        gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
       rt.finish();
       if (!dump.empty()) {
         std::vector<uint16_t> hC(static_cast<size_t>(M) * N);
@@ -162,7 +162,7 @@ int main(int argc, char ** argv)
         static_cast<size_t>((N + tiles.BN - 1) / tiles.BN) * lws[0],
         static_cast<size_t>((M + tiles.BM - 1) / tiles.BM) * lws[1]};
       for (int i = 0; i < iters; ++i)
-        gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
       rt.finish();
       if (!dump.empty()) {
         std::vector<uint16_t> hC(static_cast<size_t>(M) * N);
@@ -195,7 +195,7 @@ int main(int argc, char ** argv)
       const size_t lws[1] = {16};
       const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
       for (int i = 0; i < iters; ++i)
-        gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws);
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws);
       rt.finish();
       if (!dump.empty()) {
         std::vector<uint16_t> hC(static_cast<size_t>(Cout));
@@ -257,7 +257,7 @@ int main(int argc, char ** argv)
           static_cast<size_t>((Wout + obw - 1) / obw),
           static_cast<size_t>((Hout + obh - 1) / obh),
           static_cast<size_t>((((Cout + 1) / 2) + 15) / 16) * 16};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
         rt.finish();
         if (!dump.empty()) {
           std::vector<uint16_t> hY(static_cast<size_t>(Cout) * Hout * Wout);
@@ -300,7 +300,7 @@ int main(int argc, char ** argv)
         static_cast<size_t>((Hout + conv.TY - 1) / conv.TY) * lws[1],
         static_cast<size_t>((Cout + conv.CB - 1) / conv.CB)};
       for (int i = 0; i < iters; ++i)
-        gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
       rt.finish();
       if (!dump.empty()) {
         std::vector<uint16_t> hY(static_cast<size_t>(Cout) * Hout * Wout);
@@ -337,15 +337,15 @@ int main(int argc, char ** argv)
       };
       if (kern == "bmm2") {
         const size_t g[3] = {(size_t)N, (size_t)M, (size_t)B0 * B1};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
       } else if (kern == "bmm_t") {
         const int TM = optInt("-DBMM_TM=", 4), TN = optInt("-DBMM_TN=", 8);
         const size_t g[3] = {(size_t)((N + TN - 1) / TN), (size_t)((M + TM - 1) / TM),
                              (size_t)B0 * B1};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
       } else {
         const size_t g[1] = {(size_t)B0 * B1 * M * N};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
       }
       rt.finish();
       if (!dump.empty()) {
@@ -376,10 +376,10 @@ int main(int argc, char ** argv)
                                                : std::atoi(opts.c_str() + p + std::strlen("-DSM_WGS="));
         const size_t lws[2] = {(size_t)wgs, 1};
         const size_t gws[2] = {(size_t)outer * wgs, (size_t)inner};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws);
       } else {
         const size_t g[1] = {(size_t)outer * inner};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
       }
       rt.finish();
       if (!dump.empty()) {
@@ -445,7 +445,7 @@ int main(int argc, char ** argv)
         clSetKernelArg(kpad, 6, sizeof(wpad), &wpad);
         clSetKernelArg(kpad, 7, sizeof(P), &P);
         const size_t gp[3] = {(size_t)W, (size_t)H, (size_t)Cin};
-        gk::ClRuntime::enqueueND(rt.queue(), kpad, 3, gp, nullptr);
+        infvino::ClRuntime::enqueueND(rt.queue(), kpad, 3, gp, nullptr);
         clReleaseKernel(kpad);
       }
       clSetKernelArg(k, 0, sizeof(dXin), &dXin);
@@ -464,10 +464,10 @@ int main(int argc, char ** argv)
                          : std::atoi(o.c_str() + p + std::strlen("-DDW_TW="));
         const size_t g[3] = {static_cast<size_t>((Wo + tw - 1) / tw),
                              static_cast<size_t>(Ho), static_cast<size_t>(Cin)};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 3, g, nullptr);
       } else {
         const size_t g[1] = {static_cast<size_t>(Cin) * Ho * Wo};
-        for (int i = 0; i < iters; ++i) gk::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
+        for (int i = 0; i < iters; ++i) infvino::ClRuntime::enqueueND(rt.queue(), k, 1, g, nullptr);
       }
       rt.finish();
       if (!dump.empty()) {

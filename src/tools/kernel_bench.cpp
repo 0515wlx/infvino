@@ -47,7 +47,7 @@ void fillRandom(std::vector<uint16_t> & v, uint32_t seed)
 {
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> dis(-0.5f, 0.5f);
-  for (auto & x : v) x = gk::f32_to_f16(dis(rng));
+  for (auto & x : v) x = infvino::f32_to_f16(dis(rng));
 }
 
 // 相对误差（不使用余弦）：mean_rel = mean|diff|/mean|ref|, max_rel = max|diff|/max|ref|.
@@ -66,8 +66,8 @@ Accuracy verifyGemm(
     for (int c = 0; c < N; ++c) {
       float acc = 0.f;
       for (int t = 0; t < K; ++t)
-        acc += gk::f16_to_f32(A[(size_t)r * K + t]) * gk::f16_to_f32(B[(size_t)t * N + c]);
-      const double got = gk::f16_to_f32(C[(size_t)r * N + c]);
+        acc += infvino::f16_to_f32(A[(size_t)r * K + t]) * infvino::f16_to_f32(B[(size_t)t * N + c]);
+      const double got = infvino::f16_to_f32(C[(size_t)r * N + c]);
       const double d = std::fabs(got - acc);
       sumabs += d;
       sumref += std::fabs(static_cast<double>(acc));
@@ -80,7 +80,7 @@ Accuracy verifyGemm(
   return {sumabs / (sumref + 1e-12), maxabs / (refmax + 1e-12), maxabs};
 }
 
-int benchGemm(gk::ClRuntime & rt, const gk::Tiles & t, const Shape & s, int iters, bool verify)
+int benchGemm(infvino::ClRuntime & rt, const infvino::Tiles & t, const Shape & s, int iters, bool verify)
 {
   const int M = s.M, N = s.N, K = s.K;
   if (M % t.BM || N % t.BN)
@@ -117,7 +117,7 @@ int benchGemm(gk::ClRuntime & rt, const gk::Tiles & t, const Shape & s, int iter
     static_cast<size_t>((M + t.BM - 1) / t.BM) * lws[1]};
 
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
   const double flops = 2.0 * static_cast<double>(M) * N * K;
   const double ops = rt.opsPerEuCycle(flops, med);
 
@@ -141,7 +141,7 @@ int benchGemm(gk::ClRuntime & rt, const gk::Tiles & t, const Shape & s, int iter
 }
 
 // Specialized small-GEMM: lane-over-K split-K with sub-group reduction (R32).
-int benchGemmSk(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const Shape & s, int iters, bool verify)
+int benchGemmSk(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, const Shape & s, int iters, bool verify)
 {
   const int M = s.M, N = s.N, K = s.K;
   const int TM = c.TM, TN = c.TN, SG = c.SG, UK = c.UNROLL;
@@ -178,7 +178,7 @@ int benchGemmSk(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const Shape & s, i
     static_cast<size_t>((N + TN - 1) / TN) * lws[0],
     static_cast<size_t>((M + TM - 1) / TM)};
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
   const double flops = 2.0 * static_cast<double>(M) * N * K;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
@@ -198,7 +198,7 @@ int benchGemmSk(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const Shape & s, i
 // R32: 纯 launch 开销探针 —— 连续入队 N 个极小 kernel（同一 buffer，in-order 队列
 // 隐含依赖），分别量 host 入队、GPU busy 之和、以及 wall。用于回答「每 dispatch 的
 // 非重叠开销到底在 host 还是 GPU 前端」。
-int benchChain(gk::ClRuntime & rt, int iters)
+int benchChain(infvino::ClRuntime & rt, int iters)
 {
   if (iters < 1) iters = 1;
   const char * src = "__kernel void nop_k(__global int * a){ int x=get_global_id(0);"
@@ -217,7 +217,7 @@ int benchChain(gk::ClRuntime & rt, int iters)
   clSetKernelArg(k, 0, sizeof(d), &d);
   const size_t gws[1] = {N};
   for (int i = 0; i < 5; ++i) {
-    cl_event e = gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr);
+    cl_event e = infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr);
     clWaitForEvents(1, &e);
     clReleaseEvent(e);
   }
@@ -227,7 +227,7 @@ int benchChain(gk::ClRuntime & rt, int iters)
   double host_us = 0.0;
   for (int i = 0; i < iters; ++i) {
     const auto h0 = std::chrono::steady_clock::now();
-    evs.push_back(gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr));
+    evs.push_back(infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, nullptr));
     host_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count();
   }
   const auto t1 = std::chrono::steady_clock::now();
@@ -261,7 +261,7 @@ struct ConvShape
   std::string label;
 };
 
-int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s, int iters, bool verify)
+int benchConv(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const ConvShape & s, int iters, bool verify)
 {
   const int Hout = (s.H + 2 * c.PAD - 3) / c.STRIDE + 1;
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
@@ -288,9 +288,9 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
   std::vector<uint16_t> hWt((size_t)s.Cout * s.Cin * 9), hY((size_t)s.Cout * Hout * Wout);
   std::mt19937 rng123(11), rng456(22);
   std::uniform_real_distribution<float> dum(-0.5f, 0.5f), dud(-0.2f, 0.2f);
-  for (auto & v : hX) v = gk::f32_to_f16(dum(rng123));
-  for (auto & v : hWt) v = gk::f32_to_f16(dud(rng456));
-  for (auto & v : hB) v = gk::f32_to_f16(dud(rng456));
+  for (auto & v : hX) v = infvino::f32_to_f16(dum(rng123));
+  for (auto & v : hWt) v = infvino::f32_to_f16(dud(rng456));
+  for (auto & v : hB) v = infvino::f32_to_f16(dud(rng456));
 
   const size_t wbytes = c.OV
     ? (size_t)((s.Cout + 31) / 32) * s.Cin * 9 * 32 * 2
@@ -379,7 +379,7 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
          : static_cast<size_t>((Cout + c.CB - 1) / c.CB)};
 
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
@@ -395,19 +395,19 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
     for (int oc = 0; oc < Cout; ++oc)
       for (int oy = 0; oy < Hout; ++oy)
         for (int ox = 0; ox < Wout; ++ox) {
-          float acc = gk::f16_to_f32(hB[oc]);
+          float acc = infvino::f16_to_f32(hB[oc]);
           for (int ci = 0; ci < Cin; ++ci)
             for (int kh = 0; kh < 3; ++kh)
               for (int kw = 0; kw < 3; ++kw) {
                 int yy = oy * c.STRIDE - c.PAD + kh, xx = ox * c.STRIDE - c.PAD + kw;
                 if (yy >= 0 && yy < H && xx >= 0 && xx < W)
-                  acc += gk::f16_to_f32(hX[((size_t)ci * H + yy) * W + xx]) *
-                         gk::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
+                  acc += infvino::f16_to_f32(hX[((size_t)ci * H + yy) * W + xx]) *
+                         infvino::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
               }
           ref[((size_t)oc * Hout + oy) * Wout + ox] = acc;
         }
     for (size_t i = 0; i < ref.size(); ++i) {
-      const double got = gk::f16_to_f32(hY[i]);
+      const double got = infvino::f16_to_f32(hY[i]);
       const double d = std::fabs(got - ref[i]);
       sumabs += d;
       sumref += std::fabs(static_cast<double>(ref[i]));
@@ -426,7 +426,7 @@ int benchConv(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s,
 // Round 25: blocked conv — OV `convolution_gpu_bfyx_f16` port (kernels/conv_blk.cl).
 // Input is in b_fs_yx_fsv16 ([Cin/16][H][W][16]), weights in os_is_yx_isv16_osv16
 // ([Cout/16][Cin/16][3][3][16 isv][16 osv]), output plain bfyx.  OBW = c.TX.
-int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape & s, int iters, bool verify)
+int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const ConvShape & s, int iters, bool verify)
 {
   const int Hout = (s.H + 2 * c.PAD - 3) / c.STRIDE + 1;
   const int Wout = (s.W + 2 * c.PAD - 3) / c.STRIDE + 1;
@@ -444,9 +444,9 @@ int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape &
       hWt((size_t)Cout * Cin * 9), hY((size_t)Cout * Hout * Wout);
   std::mt19937 rngX(11), rngW(22);
   std::uniform_real_distribution<float> dum(-0.5f, 0.5f), dud(-0.2f, 0.2f);
-  for (auto & v : hX) v = gk::f32_to_f16(dum(rngX));
-  for (auto & v : hWt) v = gk::f32_to_f16(dud(rngW));
-  for (auto & v : hB) v = gk::f32_to_f16(dud(rngW));
+  for (auto & v : hX) v = infvino::f32_to_f16(dum(rngX));
+  for (auto & v : hWt) v = infvino::f32_to_f16(dud(rngW));
+  for (auto & v : hB) v = infvino::f32_to_f16(dud(rngW));
 
   // input bfyx -> b_fs_yx_fsv16
   std::vector<uint16_t> hXb((size_t)icb * s.H * s.W * 16, 0);
@@ -488,7 +488,7 @@ int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape &
     static_cast<size_t>(((Wout + OBW - 1) / OBW) * Hout),
     static_cast<size_t>(((Cout + 15) / 16) * 16), 1};
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Hout * Wout * Cin * 9;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
@@ -508,18 +508,18 @@ int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape &
     for (int oc = 0; oc < Cout; ++oc)
       for (int oy = 0; oy < Hout; ++oy)
         for (int ox = 0; ox < Wout; ++ox) {
-          float acc = gk::f16_to_f32(hB[oc]);
+          float acc = infvino::f16_to_f32(hB[oc]);
           for (int ci = 0; ci < Cin; ++ci)
             for (int kh = 0; kh < 3; ++kh)
               for (int kw = 0; kw < 3; ++kw) {
                 int yy = oy * c.STRIDE - c.PAD + kh, xx = ox * c.STRIDE - c.PAD + kw;
                 if (yy >= 0 && yy < s.H && xx >= 0 && xx < s.W)
-                  acc += gk::f16_to_f32(hX[((size_t)ci * s.H + yy) * s.W + xx]) *
-                         gk::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
+                  acc += infvino::f16_to_f32(hX[((size_t)ci * s.H + yy) * s.W + xx]) *
+                         infvino::f16_to_f32(hWt[((size_t)oc * Cin + ci) * 9 + kh * 3 + kw]);
               }
           const double r = ref_act(acc);
           const size_t oidx = ((size_t)oc * Hout + oy) * Wout + ox;
-          const double got = gk::f16_to_f32(hY[oidx]);
+          const double got = infvino::f16_to_f32(hY[oidx]);
           const double d = std::fabs(got - r);
           sumabs += d; sumref += std::fabs(r);
           maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs(r));
@@ -534,7 +534,7 @@ int benchConvBlk(gk::ClRuntime & rt, const gk::Conv3x3Cfg & c, const ConvShape &
 }
 
 // Specialized 1x1 conv (pointwise) kernel: fused bias + activation.
-int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
+int benchConv1x1(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
 {
   const int Cin = s.Cin, Cout = s.Cout, HW = s.H * s.W;
   cl_kernel k;
@@ -547,9 +547,9 @@ int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape &
   std::vector<uint16_t> hW((size_t)Cout * Cin), hX((size_t)Cin * HW), hB((size_t)Cout), hY((size_t)Cout * HW);
   std::mt19937 rngW(11), rngX(22), rngB(33);
   std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
-  for (auto & v : hW) v = gk::f32_to_f16(disW(rngW));
-  for (auto & v : hX) v = gk::f32_to_f16(disX(rngX));
-  for (auto & v : hB) v = gk::f32_to_f16(disB(rngB));
+  for (auto & v : hW) v = infvino::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = infvino::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = infvino::f32_to_f16(disB(rngB));
 
   cl_mem dW = rt.alloc((size_t)Cout * Cin * 2, CL_MEM_READ_ONLY);
   cl_mem dX = rt.alloc((size_t)Cin * HW * 2, CL_MEM_READ_ONLY);
@@ -581,7 +581,7 @@ int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape &
     static_cast<size_t>((Cout + c.TM - 1) / c.TM)};
 
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 2, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Cin * (double)HW;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
@@ -594,10 +594,10 @@ int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape &
     double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
     for (int oc = 0; oc < Cout; ++oc)
       for (int n = 0; n < HW; ++n) {
-        float acc = gk::f16_to_f32(hB[oc]);
+        float acc = infvino::f16_to_f32(hB[oc]);
         for (int ci = 0; ci < Cin; ++ci)
-          acc += gk::f16_to_f32(hW[(size_t)oc * Cin + ci]) * gk::f16_to_f32(hX[(size_t)ci * HW + n]);
-        const double got = gk::f16_to_f32(hY[(size_t)oc * HW + n]);
+          acc += infvino::f16_to_f32(hW[(size_t)oc * Cin + ci]) * infvino::f16_to_f32(hX[(size_t)ci * HW + n]);
+        const double got = infvino::f16_to_f32(hY[(size_t)oc * HW + n]);
         const double d = std::fabs(got - acc);
         sumabs += d; sumref += std::fabs((double)acc);
         maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs((double)acc));
@@ -612,7 +612,7 @@ int benchConv1x1(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape &
 }
 
 // Specialized split-K GEMV for 1x1 conv / fc with HW==1 (fused bias + activation).
-int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
+int benchConv1x1Gemv(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
 {
   const int Cin = s.Cin, Cout = s.Cout;
   cl_kernel k;
@@ -625,9 +625,9 @@ int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvSha
   std::vector<uint16_t> hW((size_t)Cout * Cin), hX((size_t)Cin), hB((size_t)Cout), hY((size_t)Cout);
   std::mt19937 rngW(11), rngX(22), rngB(33);
   std::uniform_real_distribution<float> disW(-0.5f, 0.5f), disX(-0.5f, 0.5f), disB(-0.2f, 0.2f);
-  for (auto & v : hW) v = gk::f32_to_f16(disW(rngW));
-  for (auto & v : hX) v = gk::f32_to_f16(disX(rngX));
-  for (auto & v : hB) v = gk::f32_to_f16(disB(rngB));
+  for (auto & v : hW) v = infvino::f32_to_f16(disW(rngW));
+  for (auto & v : hX) v = infvino::f32_to_f16(disX(rngX));
+  for (auto & v : hB) v = infvino::f32_to_f16(disB(rngB));
 
   cl_mem dW = rt.alloc((size_t)Cout * Cin * 2, CL_MEM_READ_ONLY);
   cl_mem dX = rt.alloc((size_t)Cin * 2, CL_MEM_READ_ONLY);
@@ -650,7 +650,7 @@ int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvSha
   const size_t lws[1] = {16};
   const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws); }, 3, iters);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Cin;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
@@ -661,10 +661,10 @@ int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvSha
     rt.read(dY, (size_t)Cout * 2, hY.data());
     double sumabs = 0, sumref = 0, maxabs = 0, refmax = 0;
     for (int oc = 0; oc < Cout; ++oc) {
-      float acc = gk::f16_to_f32(hB[oc]);
+      float acc = infvino::f16_to_f32(hB[oc]);
       for (int ci = 0; ci < Cin; ++ci)
-        acc += gk::f16_to_f32(hW[(size_t)oc * Cin + ci]) * gk::f16_to_f32(hX[ci]);
-      const double got = gk::f16_to_f32(hY[oc]);
+        acc += infvino::f16_to_f32(hW[(size_t)oc * Cin + ci]) * infvino::f16_to_f32(hX[ci]);
+      const double got = infvino::f16_to_f32(hY[oc]);
       const double d = std::fabs(got - acc);
       sumabs += d; sumref += std::fabs((double)acc);
       maxabs = std::max(maxabs, d); refmax = std::max(refmax, std::fabs((double)acc));
@@ -678,7 +678,7 @@ int benchConv1x1Gemv(gk::ClRuntime & rt, const gk::Conv1x1Cfg & c, const ConvSha
   return 0;
 }
 
-int benchBandwidth(gk::ClRuntime & rt, size_t mb, int iters)
+int benchBandwidth(infvino::ClRuntime & rt, size_t mb, int iters)
 {
   // 安全上限：iGPU 共享 host 内存，in+out=2x，再加 host 侧缓冲，过大直接 OOM/死机。
   if (mb > 256) {
@@ -703,8 +703,8 @@ int benchBandwidth(gk::ClRuntime & rt, size_t mb, int iters)
   clSetKernelArg(kread, 2, sizeof(nn), &nn);
   const size_t gws = n, lws = 256;
 
-  const double tc = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kcopy, 1, &gws, &lws); }, 3, iters);
-  const double tr = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kread, 1, &gws, &lws); }, 3, iters);
+  const double tc = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), kcopy, 1, &gws, &lws); }, 3, iters);
+  const double tr = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), kread, 1, &gws, &lws); }, 3, iters);
   const double gb = static_cast<double>(n) * 4 / 1e9;
   std::printf("  copy : %.3f ms -> %.1f GB/s (read+write)\n", tc, 2 * gb / (tc * 1e-3));
   std::printf("  read : %.3f ms -> %.1f GB/s (read only)\n", tr, gb / (tr * 1e-3));
@@ -721,7 +721,7 @@ int benchBandwidth(gk::ClRuntime & rt, size_t mb, int iters)
 
 // Report per-dependent-FMA latency. For DEPTH=1 the loop is one chain, so
 // cycles/iter is the FMA latency; for large DEPTH it approaches 1 (throughput).
-int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters, int fi, int sg)
+int benchFma(infvino::ClRuntime & rt, const std::string & width, int depth, int iters, int fi, int sg)
 {
   std::string kname;
   int lanes = 1;
@@ -755,7 +755,7 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
     clSetKernelArg(k, 1, sizeof(a), &a);
     clSetKernelArg(k, 2, sizeof(b), &b);
   } else {
-    const uint16_t ah = gk::f32_to_f16(a), bh = gk::f32_to_f16(b);
+    const uint16_t ah = infvino::f32_to_f16(a), bh = infvino::f32_to_f16(b);
     clSetKernelArg(k, 0, sizeof(out), &out);
     clSetKernelArg(k, 1, sizeof(ah), &ah);
     clSetKernelArg(k, 2, sizeof(bh), &bh);
@@ -764,7 +764,7 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
   const size_t lws = 64;
   const size_t gws = 64 * 512;  // plenty of work-items to fill the EUs
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
   // Aggregate FPU throughput of the whole device (the number comparable to the
   // gemm ops/EU/cyc): FLOPs = work-items x iters x depth x lanes x 2.
   const double flops = 2.0 * static_cast<double>(gws) * ITERS * depth * lanes;
@@ -786,7 +786,7 @@ int benchFma(gk::ClRuntime & rt, const std::string & width, int depth, int iters
 // Round 27: occupancy / register-pressure probe (see micro.cl:fma_cyc). Sweeps
 // the grid size and reports aggregate ops/EU/cyc and per-mad cycles; the plateau
 // is 32*T_res/L, the knee is where the EUs fill up.
-int benchOcc(gk::ClRuntime & rt, int depth, int sg, const std::string & width)
+int benchOcc(infvino::ClRuntime & rt, int depth, int sg, const std::string & width)
 {
   const bool hi = (width == "h8");            // high-ILP variant
   const int eff_depth = hi ? 8 : depth;
@@ -798,14 +798,14 @@ int benchOcc(gk::ClRuntime & rt, int depth, int sg, const std::string & width)
   try { k = rt.buildKernel("micro", kname, opts); }
   catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
   cl_mem out = rt.alloc(16 * 8, CL_MEM_WRITE_ONLY);
-  const uint16_t ah = gk::f32_to_f16(1.0001f), bh = gk::f32_to_f16(1e-4f);
+  const uint16_t ah = infvino::f32_to_f16(1.0001f), bh = infvino::f32_to_f16(1e-4f);
   clSetKernelArg(k, 0, sizeof(out), &out);
   clSetKernelArg(k, 1, sizeof(ah), &ah);
   clSetKernelArg(k, 2, sizeof(bh), &bh);
   std::printf("  occ %s depth=%-3d sg=%-2d ITERS=%d\n", kname, eff_depth, sg, ITERS);
   for (int nwg : {8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 384, 512}) {
     const size_t lws = 64, gws = static_cast<size_t>(nwg) * 64;
-    const double med = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 7);
+    const double med = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 7);
     // h8: each "mad" is a half8 vector (8 packed halfs/lane) = 8x the FLOPs.
     const double fl = hi ? 8.0 : 1.0;
     const double flops = 2.0 * static_cast<double>(gws) * ITERS * eff_depth * fl;
@@ -820,7 +820,7 @@ int benchOcc(gk::ClRuntime & rt, int depth, int sg, const std::string & width)
 }
 
 // Pointer chase: latency per access vs working-set size (bytes).
-int benchMemLat(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+int benchMemLat(infvino::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 {
   cl_kernel k = rt.buildKernel("micro", "mem_chase", "-cl-mad-enable");
   for (size_t kb : sizes_kb) {
@@ -843,7 +843,7 @@ int benchMemLat(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi
     // over-subscribed (each work-item is a serial dependent chain).
     const size_t lws = 64, gws = 64 * 4;
     const double med = rt.timeMs(
-      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 1, fi);
+      [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 1, fi);
     const double ns_per_acc = med * 1e6 / iters;
     const double cyc = ns_per_acc * rt.info().clock_mhz * 1e-3;
     std::printf("  memlat %6zu KB  %8.3f ms  %6.2f ns/access  %6.1f cyc/access\n",
@@ -859,7 +859,7 @@ int benchMemLat(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi
 // traffic is exactly 2 x footprint per pass (1 read + 1 write). Sweeping the
 // footprint reveals the cache tiers: fast while it fits in a level, then it
 // drops to the next level's bandwidth.
-int benchMemBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+int benchMemBw(infvino::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 {
   cl_kernel k = rt.buildKernel("stream", "copy_u32", "-cl-mad-enable");
   for (size_t kb : sizes_kb) {
@@ -877,7 +877,7 @@ int benchMemBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
     const size_t lws = 256;
     const size_t gws = ((n + lws - 1) / lws) * lws;
     const double med = rt.timeMs(
-      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+      [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
     const double bytes = static_cast<double>(n) * 4.0 * 2.0;  // read + write
     std::printf("  membw %6zu KB  %8.3f ms  %7.1f GB/s (copy: read+write)\n",
                 kb, med, bytes / (med * 1e-3) / 1e9);
@@ -889,7 +889,7 @@ int benchMemBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 }
 
 // R30c: read-vs-write asymmetry at a given footprint (DRAM when large).
-int benchReadWrite(gk::ClRuntime & rt, size_t mb, int fi)
+int benchReadWrite(infvino::ClRuntime & rt, size_t mb, int fi)
 {
   const size_t n = mb * 1024 * 1024 / 4;  // float elements
   cl_kernel kw = rt.buildKernel("stream_rw", "wr_only", "-cl-mad-enable");
@@ -909,9 +909,9 @@ int benchReadWrite(gk::ClRuntime & rt, size_t mb, int fi)
   const size_t gs = ((nout + lws - 1) / lws) * lws;
   clSetKernelArg(ks, 0, sizeof(in), &in); clSetKernelArg(ks, 1, sizeof(out), &out);
   clSetKernelArg(ks, 2, sizeof(nout), &nout); clSetKernelArg(ks, 3, sizeof(C), &C);
-  const double tw = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kw, 1, &gws, &lws); }, 2, fi);
-  const double tr = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), kr, 1, &gws, &lws); }, 2, fi);
-  const double ts = rt.timeMs([&] { return gk::ClRuntime::enqueueND(rt.queue(), ks, 1, &gs, &lws); }, 2, fi);
+  const double tw = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), kw, 1, &gws, &lws); }, 2, fi);
+  const double tr = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), kr, 1, &gws, &lws); }, 2, fi);
+  const double ts = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), ks, 1, &gs, &lws); }, 2, fi);
   const double wb = (double)n * 4 / 1e9;
   std::printf("  rw %zu MB  write-only %.3f ms %6.1f GB/s | read-only %.3f ms %6.1f GB/s | "
               "rd_sum(C=%u) %.3f ms (read %6.1f + write %4.1f GB/s)\n",
@@ -924,7 +924,7 @@ int benchReadWrite(gk::ClRuntime & rt, size_t mb, int fi)
 
 // Read-only bandwidth vs footprint with an internal pass loop, so even small
 // footprints keep the launch long enough to be bandwidth-bound (L1/LLC tiers).
-int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
+int benchScanBw(infvino::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 {
   cl_kernel k = rt.buildKernel("micro", "scan_rep", "-cl-mad-enable");
   for (size_t kb : sizes_kb) {
@@ -943,7 +943,7 @@ int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi
     clSetKernelArg(k, 4, sizeof(passes), &passes);
     const size_t lws = 256, gws = 256 * 64;  // more work-items -> more loads in flight
     const double med = rt.timeMs(
-      [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+      [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
     const double bytes = static_cast<double>(n) * 4.0 * passes;
     std::printf("  scanbw %6zu KB  %8.3f ms  %7.1f GB/s (read only)\n",
                 kb, med, bytes / (med * 1e-3) / 1e9);
@@ -955,7 +955,7 @@ int benchScanBw(gk::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi
 }
 
 // SLM (on-die scratchpad) read bandwidth at a given per-WG allocation.
-int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::string & width,
+int benchSlmBw(infvino::ClRuntime & rt, int slm_kb, int iters, int fi, const std::string & width,
                int mode, int nwg)
 {
   std::string ksrc = (width == "v4") ? "slm_bw_v4" : "slm_bw";
@@ -973,7 +973,7 @@ int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::str
   clSetKernelArg(k, 1, sizeof(it), &it);
   const size_t lws = 64, gws = 64 * static_cast<size_t>(nwg);
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
   // Bytes per work-item per iteration: base kernels do 4 x 4B, conf-mode does
   // 4B per load; MODE 3/4 read one uint4 = 16B. Count them.
   double bpw = 16.0;
@@ -987,7 +987,7 @@ int benchSlmBw(gk::ClRuntime & rt, int slm_kb, int iters, int fi, const std::str
 }
 
 // Work-group barrier + SLM round-trip cost (Round 12).
-int benchBarrier(gk::ClRuntime & rt, int wg, int nwg, int iters, int mode)
+int benchBarrier(infvino::ClRuntime & rt, int wg, int nwg, int iters, int mode)
 {
   cl_kernel k;
   try { k = rt.buildKernel("micro", "barrier_cost",
@@ -999,7 +999,7 @@ int benchBarrier(gk::ClRuntime & rt, int wg, int nwg, int iters, int mode)
   clSetKernelArg(k, 1, sizeof(it), &it);
   const size_t lws = static_cast<size_t>(wg), gws = static_cast<size_t>(wg) * static_cast<size_t>(nwg);
   const double med = rt.timeMs(
-    [&] { return gk::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 3);
+    [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 3);
   const double total_cyc = med * 1e-3 * rt.info().clock_mhz * 1e6;
   std::printf("  barrier wg=%-4d nwg=%-3d mode=%d  %8.3f ms  %6.1f cyc/iter\n",
               wg, nwg, mode, med, total_cyc / iters);
@@ -1013,9 +1013,9 @@ int benchBarrier(gk::ClRuntime & rt, int wg, int nwg, int iters, int mode)
 int main(int argc, char ** argv)
 {
   std::string op = "gemm", kernel_dir = INFVINO_KERNEL_DIR;
-  gk::Tiles tiles;
-  gk::Conv3x3Cfg conv;
-  gk::Conv1x1Cfg c1x1;
+  infvino::Tiles tiles;
+  infvino::Conv3x3Cfg conv;
+  infvino::Conv1x1Cfg c1x1;
   std::vector<ConvShape> conv_shapes;
   std::vector<Shape> shapes;
   int iters = 100;
@@ -1030,7 +1030,7 @@ int main(int argc, char ** argv)
     const std::string a = argv[i];
     auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
     if (a == "--list-devices") {
-      for (const auto & d : gk::ClRuntime::enumerate()) std::printf("  %s\n", d.describe().c_str());
+      for (const auto & d : infvino::ClRuntime::enumerate()) std::printf("  %s\n", d.describe().c_str());
       return 0;
     } else if (a == "--op") {
       op = next();
@@ -1043,11 +1043,11 @@ int main(int argc, char ** argv)
     } else if (a == "--verify") {
       verify = true;
     } else if (a == "--tiles") {
-      tiles = gk::parseTiles(next());
+      tiles = infvino::parseTiles(next());
     } else if (a == "--conv") {
-      conv = gk::parseConv(next());
+      conv = infvino::parseConv(next());
     } else if (a == "--conv1x1") {
-      c1x1 = gk::parseConv1x1(next());
+      c1x1 = infvino::parseConv1x1(next());
     } else if (a == "--conv-shape") {
       auto v = parseInts(next());
       if (v.size() != 4) { std::fprintf(stderr, "--conv-shape needs Cin,Cout,H,W\n"); return 2; }
@@ -1085,7 +1085,7 @@ int main(int argc, char ** argv)
     }
   }
 
-  gk::ClRuntime rt(kernel_dir);
+  infvino::ClRuntime rt(kernel_dir);
   std::printf("device     : %s\n", rt.info().describe().c_str());
   std::printf("peak FP16  : %.1f GFLOP/s (EU x clk x 32)\n\n", rt.info().peak_fp16_gflops);
 

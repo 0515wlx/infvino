@@ -28,7 +28,7 @@
 #include "infvino/ClRuntime.hpp"
 #include "infvino/Tuning.hpp"
 
-namespace gk
+namespace infvino
 {
 
 /**
@@ -36,7 +36,7 @@ namespace gk
  *
  * 典型用法：
  * @code
- *   gk::PlanModel model("models/yolov8n-pose.plan");
+ *   infvino::PlanModel model("models/yolov8n-pose.plan");
  *   model.setInput(fp16_input);       // inputNumel() 个 fp16
  *   model.run();
  *   std::vector<uint16_t> out(model.outputNumel(0));
@@ -85,7 +85,7 @@ public:
   size_t tensorNumel(const std::string & name) const;
 
   const ClRuntime &   runtime() const { return rt_; }
-  const DeviceInfo &  device() const { return rt_.info(); }
+  const ClDeviceInfo &  device() const { return rt_.info(); }
 
   /** @brief 调优缓存（只读；由构造时按 INFVINO_TUNING_CACHE / config/tuning.json 加载）。*/
   const TuningCache & tuning() const { return tuning_; }
@@ -328,6 +328,6 @@ private:
   TuningCache tuning_;
 };
 
-}  // namespace gk
+}  // namespace infvino
 
 #endif  // INFVINO__PLAN_MODEL_HPP_

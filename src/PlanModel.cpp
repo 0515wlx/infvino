@@ -17,7 +17,7 @@
 #include "infvino/Tiles.hpp"
 #include "infvino/Autotuner.hpp"
 
-namespace gk
+namespace infvino
 {
 
 namespace
@@ -3094,4 +3094,4 @@ int PlanModel::onlineTuneMissing(int budget, int iters, const std::vector<std::s
   }
 }
 
-}  // namespace gk
+}  // namespace infvino

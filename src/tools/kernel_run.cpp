@@ -1,7 +1,7 @@
 // Copyright (c) 2026 HEU-Wings-of-Dream. All Rights Reserved.
 //
 // kernel_run —— 执行一份“算子计划”（由 scripts/onnx2plan.py 生成）的开发/调试 CLI。
-// 库内生产路径由 gk::PlanModel 承担；本工具额外支持 --report / --iters / 文件 dump。
+// 库内生产路径由 infvino::PlanModel 承担；本工具额外支持 --report / --iters / 文件 dump。
 //
 //   kernel_run --plan plan.txt [--input in.bin] [--output out.bin]
 //              [--out-dir DIR] [--iters N] [--report] [--kernel-dir DIR]
@@ -59,7 +59,7 @@ int main(int argc, char ** argv)
   try
   {
     const std::string kdir = kernel_dir.empty() ? INFVINO_KERNEL_DIR : kernel_dir;
-    gk::PlanModel     model(plan_path, kdir, -1, 0, report);
+    infvino::PlanModel     model(plan_path, kdir, -1, 0, report);
 
     std::vector<uint16_t> in(static_cast<size_t>(model.inputNumel()), 0);
     if (!input_path.empty() && !readFile(input_path, in))

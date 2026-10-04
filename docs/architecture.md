@@ -69,7 +69,7 @@ output <name>                        # 可多行
 
 ## 5. 设备（OpenCL）
 
-`gk::ClRuntime` 枚举平台/设备，默认**优先含 GPU 的平台**，无 GPU 时退回任一可用设备；
+`infvino::ClRuntime` 枚举平台/设备，默认**优先含 GPU 的平台**，无 GPU 时退回任一可用设备；
 `DeviceInfo` 记录 `available / requested / resolved / fell_back_to_cpu`。
 
 > Xe-LP(Gen12) 的实际 cache 层级与 EU 寄存器（128 GRF/线程、ARF 专用寄存器、无通用 L1、
