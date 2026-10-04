@@ -84,6 +84,34 @@ int main()
   bool has3d = false;
   for (const auto & c : copyc) if (c.kernel == "copy_c2") has3d = true;
   CHECK(has3d, "copy_c candidate set includes the 2-D grid variant");
+  // --- R33: native conv3x3 的 CINC 候选（Cin%16!=0 时才有 CINC=8）---
+  {
+    const auto sig8 = OpSignature::conv3x3(160, 160, 1, 1, 8, 16, 1);
+    bool hasCinc8 = false, hasCinc16 = false;
+    for (const auto & c : candidatesConv3x3(sig8))
+      if (c.kernel == "conv3x3_f16") {
+        if (c.config.find("CINC8") != std::string::npos) hasCinc8 = true;
+        if (c.config.find("CINC16") != std::string::npos) hasCinc16 = true;
+      }
+    CHECK(hasCinc8, "R33: Cin%16!=0 -> native candidate set includes CINC8");
+    CHECK(hasCinc16, "R33: native candidate set keeps CINC16");
+    const auto sig16 = OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1);
+    bool cinc8OnAligned = false;
+    for (const auto & c : candidatesConv3x3(sig16))
+      if (c.kernel == "conv3x3_f16" && c.config.find("CINC8") != std::string::npos)
+        cinc8OnAligned = true;
+    CHECK(!cinc8OnAligned, "R33: Cin%16==0 -> no redundant CINC8 candidate");
+    // R34: 小 Cin（stem）枚举精确 CINC 与 CINC=4
+    const auto stem = OpSignature::conv3x3(320, 320, 2, 1, 3, 16, 1);
+    bool hasCinc3 = false, hasCinc4 = false;
+    for (const auto & c : candidatesConv3x3(stem))
+      if (c.kernel == "conv3x3_f16") {
+        if (c.config.find("CINC3 ") != std::string::npos) hasCinc3 = true;
+        if (c.config.find("CINC4 ") != std::string::npos) hasCinc4 = true;
+      }
+    CHECK(hasCinc3, "R34: stem Cin=3 -> native candidate set includes exact CINC3");
+    CHECK(hasCinc4, "R34: stem Cin=3 -> native candidate set includes CINC4 fallback");
+  }
   CHECK(expectedOps(ew1, d) > 0.0, "small-op expected_ops is positive");
 
   // --- Round 30: 剩余 kernel 的内存 roofline 中间标准 ---

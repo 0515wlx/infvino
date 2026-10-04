@@ -88,23 +88,39 @@ std::vector<Candidate> candidatesConv3x3(const OpSignature & sig)
   //（含 stride=2），让调优器按 size 在「lane=通道 OV」与「lane=空间 SLM native」之间选。
   // R22 起 OV 通常赢，但小通道 shape 上 native 偶尔更优（如 40×40 Cin32 Cout64、
   // 160×160 Cin16 Cout16）；R23 记录 stride-2 native 用 TX=40 可 build。
+  // R33/R34: CINC（输入通道 chunk）也纳入候选，专门消除「短 Cin / Cin 不对齐」的填充浪费：
+  //   - CINC=16 在 Cin%16!=0 时最后一个 chunk 半空——如 160×160 8→16 的 Cin=8，一半的
+  //     mad 打在零填充通道上；R33 实测 CINC=8 让该层 3.73→5.41 ops/EU/cyc（+45%）。
+  //   - 小 Cin（≤16）时用**精确 Cin** 做 chunk（如 stem Cin=3），把填充压到 0；CINC=4 作为
+  //     exact 太小时的兜底。数值逐位一致（只改 chunk 切分，不改算术顺序）。
+  // 集合有界（每个 (TX,CB) 至多 4 个 CINC），避免 sweep 时无谓的 JIT 放大。
+  std::vector<int> cincs = {16};
+  if (sig.Cin > 0) {
+    if (sig.Cin % 16 != 0) cincs.push_back(8);
+    if (sig.Cin <= 16) cincs.push_back(sig.Cin);
+    if (sig.Cin <= 8 && sig.Cin != 4) cincs.push_back(4);
+    std::sort(cincs.begin(), cincs.end());
+    cincs.erase(std::unique(cincs.begin(), cincs.end()), cincs.end());
+  }
   for (int tx : {40, 20}) {
     if (sig.W > 0 && tx > sig.W) continue;
     for (int cb : {32, 16}) {
-      Conv3x3Cfg cfg;
-      cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = 16;
-      cfg.STRIDE = sig.stride; cfg.PAD = sig.pad; cfg.ACT = sig.act;
-      cfg.SG = 16; cfg.WC = 1;
-      std::string opts = cfg.options();
-      if (sig.W > 0 && sig.H > 0 && sig.W % tx == 0 && sig.H % 8 == 0) opts += " -DFIT_WH=1";
-      if (sig.Cin > 0 && sig.Cin % 16 == 0) opts += " -DFIT_CIN=1";
-      if (sig.Cout > 0 && sig.Cout % cb == 0) opts += " -DFIT_CB=1";
-      Candidate c;
-      c.kernel = "conv3x3_f16";
-      c.source = "conv";
-      c.options = opts;
-      c.config = cfg.label();
-      out.push_back(std::move(c));
+      for (int cinc : cincs) {
+        Conv3x3Cfg cfg;
+        cfg.TX = tx; cfg.TY = 8; cfg.TM = 1; cfg.CB = cb; cfg.CINC = cinc;
+        cfg.STRIDE = sig.stride; cfg.PAD = sig.pad; cfg.ACT = sig.act;
+        cfg.SG = 16; cfg.WC = 1;
+        std::string opts = cfg.options();
+        if (sig.W > 0 && sig.H > 0 && sig.W % tx == 0 && sig.H % 8 == 0) opts += " -DFIT_WH=1";
+        if (sig.Cin > 0 && sig.Cin % cinc == 0) opts += " -DFIT_CIN=1";
+        if (sig.Cout > 0 && sig.Cout % cb == 0) opts += " -DFIT_CB=1";
+        Candidate c;
+        c.kernel = "conv3x3_f16";
+        c.source = "conv";
+        c.options = opts;
+        c.config = cfg.label();
+        out.push_back(std::move(c));
+      }
     }
   }
   return out;

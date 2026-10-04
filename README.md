@@ -145,6 +145,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round24-analysis.md`](docs/round24-analysis.md) | **R24 conv3×3 逐 size 瓶颈分析**：ISA 配额证据 / 中间标准修正 / 两通路接入 |
 | [`docs/round25-ovblocked.md`](docs/round25-ovblocked.md) | **R25 OV 阻塞式 conv 完整移植**：逐 size 对照 / 第三条 autotune 通路 |
 | [`docs/round30-smallops.md`](docs/round30-smallops.md) | **R30 剩余 kernel（非 conv/gemm）的物理模型**：内存 roofline / ISA 配额 / 哪堵墙 |
+| [`docs/round33-conv3x3-headroom.md`](docs/round33-conv3x3-headroom.md) | **R33 conv3×3 剩余空间**：三通路逐配额重算 / 「赢 OV」的两块区域 / CINC 候选（+45%，逐位一致） |
 | [`docs/openvino-gap-analysis.md`](docs/openvino-gap-analysis.md) | **infvino vs OpenVINO GPU 差距分析**：逐维对标 / 强项 / 学习清单（P0–P3） |
 | [`docs/memory-reuse-design.md`](docs/memory-reuse-design.md) | **P0 激活内存池设计 + R-P0 实测**：生存期复用 / 视图并集 / 墙钟收益 |
 | [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
@@ -247,6 +248,14 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 > 其余 host），实测 GPU busy 只占墙钟 **52%（mb）–74%（y8）**，缺口由
 > `clEnqueueNDRangeKernel` 与 `setArg`/簿记两块平分。见
 > [`docs/benchmark.md`](docs/benchmark.md) §2.4。
+>
+> **R33（conv3×3 剩余空间 + CINC 候选）**：按三条通路各自的 ISA 配额重算 `ratio`，指出
+> 调优表对 blk/native 的 `expected` 口径失真；"赢 OV" 的窄通道区（native，真 ratio
+> 0.23–0.42）候选集过窄——把 `CINC` 纳入 native 候选后，`160×160 s1 8→16`（Cin=8）
+> **3.73→5.41 ops/EU/cyc（+45%）、数值逐位一致**，调优器端到端已选 `CINC8`。
+> **R34**：CINC 泛化到小 `Cin`（精确 `CINC=Cin`），stem `320×320 s2 3→16` **2.97→3.56（+20%）**；
+> 同时复核主导层 `40×40/80×80 C64` 已触顶（`OBW=10/12`、`kd` unroll 均无收益）。
+> 详见 [`docs/round33-conv3x3-headroom.md`](docs/round33-conv3x3-headroom.md)。
 
 ## 状态
 
