@@ -3905,7 +3905,34 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       while (keep < cs.cands.size() && cs.cands[keep].ms <= cut) ++keep;
       cs.cands.resize(keep);
     }
-    if (static_cast<int>(cs.cands.size()) > topK) cs.cands.resize(static_cast<size_t>(topK));
+    // R45: 短名单 = 隔离 top-K **∪ 每个 kernel 族的最优**。隔离 top-K 可能整体漏掉某个族
+    // （R43：conv1x1_blk 因 reorder 在隔离期落后，若前 K 全被 gemm 变体占据就会被漏掉）；
+    // 每族保留一个代表，保证「整网翻盘」的族始终在搜索空间里。额外族数封顶 kExtraFamilies。
+    if (!cs.cands.empty())
+    {
+      const int kExtraFamilies = 4;
+      std::vector<TuningEntry> sel;
+      std::vector<std::string> fams;
+      auto famOf = [](const TuningEntry & e) {
+        // 归一化到「族」：去掉配置后缀，只保留 kernel 名（已是族/变体粒度）。
+        return e.kernel;
+      };
+      const int base = std::min<int>(topK, static_cast<int>(cs.cands.size()));
+      for (int i = 0; i < base; ++i) { sel.push_back(cs.cands[i]); fams.push_back(famOf(cs.cands[i])); }
+      int extra = 0;
+      for (const auto & c : cs.cands)
+      {
+        if (extra >= kExtraFamilies) break;
+        const std::string f = famOf(c);
+        if (std::find(fams.begin(), fams.end(), f) != fams.end()) continue;
+        sel.push_back(c);
+        fams.push_back(f);
+        ++extra;
+      }
+      cs.cands = std::move(sel);
+    }
+    else if (static_cast<int>(cs.cands.size()) > topK)
+      cs.cands.resize(static_cast<size_t>(topK));
     Target t;
     t.cs = cs;
     t.nodes = std::move(nodes);

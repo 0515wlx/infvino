@@ -602,4 +602,19 @@ R31 增加了 `depthwise_vp`（零边 `depthwise_pad` + 无边界卷积）候选
 - **边界**：默认关闭；目前覆盖 `conv3x3/conv1x1/depthwise`（`choiceEntry` 驱动）；
   结果仍写回**签名级**共享缓存（跨 plan 稀释问题列为体系缺陷 #4）。
 
+### 13.1 R45：把 R44 的缺陷清单按 P0–P2 落地
+
+完整记录见 [`round45-perplan-and-search.md`](round45-perplan-and-search.md)。要点：
+
+- **P0**：`choiceEntry` 统一 `gemm/conv1x1_cat4/小算子`（per-node 覆盖对所有可调族生效）；
+  **per-plan 选择覆盖** `plan_overrides_`（`<plan>.tuning.json`，key=节点输出名），
+  `choiceEntry` 最高优先消费——全局最优成为计划级工件，不与跨模型共享的 `tuning.json` 冲突。
+- **P1**：`kernel_src_hash` 源指纹守卫（源码变化告警 / `INFVINO_TUNING_STRICT=1` 作废）；
+  候选跳过率 >20% 告警；`scripts/autotune.py --global --lock`（分批 + 锁频 + HANG 自检）。
+- **P2**：隔离扫描末尾对 top-K 复测；整网短名单 = **隔离 top-K ∪ 每族最优**（防漏族）；
+  噪声地板 1%（采样极差只告警）；`--global-budget` / `--global-margin`（margin 默认关，⚠️
+  隔离名次不预测整网名次）。
+- **offline 融合**：`config/tuning.json`（可移植隔离默认）+ `<plan>.tuning.json`（本图全局）
+  两级缓存；回退 = 删/换工件，运行时零感知、免重搜。
+
 

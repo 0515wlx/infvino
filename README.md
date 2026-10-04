@@ -157,6 +157,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/memory-reuse-design.md`](docs/memory-reuse-design.md) | **P0 激活内存池设计 + R-P0 实测**：生存期复用 / 视图并集 / 墙钟收益 |
 | [`docs/register-model.md`](docs/register-model.md) | **7 线程 EU 寄存器限制的完整模型**：tile/ops 天花板推导 + 使用清单 |
 | [`docs/round44-global-objective.md`](docs/round44-global-objective.md) | **R44 autotune 目标函数修正 + 体系缺陷倒查**：隔离 min → 整网 busy 坐标下降回验（`--global`）；分层列出目标/表示/测量/安全/指标五类漏洞 |
+| [`docs/round45-perplan-and-search.md`](docs/round45-perplan-and-search.md) | **R45 P0–P2 落地 + 整网搜索/offline 探索**：per-plan 选择覆盖、`choiceEntry` 统一、kernel 源指纹守卫、噪声地板/预算/top-K∪每族代表；两级缓存融合与回退快路径 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -334,6 +335,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] `scripts/kernel_diag.sh`：一命令跑 feed/store 隔离探针 + `hard_ratio` + 墙判决（R41/R43 归因工具化）
 - [x] 联合 (族,布局) 不动点从 conv3x3 **推广到 conv1x1/depthwise**（去保守计费、`choiceEntry`/`nodeFamily` 统一、修 conv1x1 输入下标）；三模型 retune 后 `#blk/#non/#reorder` 就位、`model_check`/`reuse_check` PASS，busy y8 **−0.9%** / y11 **−1.3%** / mb +1.6%；**发现「隔离 bench ≠ 流水线表现」**（候选选择目标函数问题）（`docs/round43-...md`）
 - [x] **修 autotune 目标函数**（R44）：从「单节点隔离 `min(ms)`」改为「整网 busy 坐标下降回验」——保留隔离 top-K 短名单，在真实 plan 上逐签名回验、只有降低端到端 busy 才接受（`kernel_autotune --global`，默认关）；轻量 GPU 机制自验通过；并**分层倒查调优体系缺陷**（per-plan 选择存储缺失、`choiceEntry` 接入不统一、数值契约未进缓存 ABI、候选静默跳过、内存族 ceiling 偏低等）（`docs/round44-global-objective.md`）
+- [x] **R45 P0–P2**：`choiceEntry` 统一所有可调族；**per-plan 选择覆盖**（`<plan>.tuning.json`，两级缓存让位置相关全局最优不被跨模型覆盖）；kernel 源指纹守卫（`INFVINO_TUNING_STRICT` 可强制作废）；候选跳过率/离散度告警；隔离 top-K 复测、整网短名单 = **top-K ∪ 每族代表**（隔离 top-K 可能整体漏掉某族）、噪声地板、`--global-budget`；`autotune.py --global --lock` 安全驱动（`docs/round45-perplan-and-search.md`）
 - [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）
