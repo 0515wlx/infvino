@@ -3066,7 +3066,14 @@ int PlanModel::refreshExpected(const std::vector<std::string> & ops)
     // global middle standard for families without one.
     e.expected = expectedOps(sig, rt_.info());
     const KernelFamily * fam = familyByName(e.kernel);
-    if (fam && fam->ceiling) e.expected = fam->ceiling(sig, rt_.info());
+    if (fam && fam->ceiling)
+    {
+      const double famCeil = fam->ceiling(sig, rt_.info());
+      // R47-L3: conv/gemm 软标尺同时受「族计算上限」与「内存 roofline（含 L3 断崖）」约束。
+      const bool memBind = (sig.op == "conv3x3" || sig.op == "gemm" || sig.op == "conv1x1" ||
+                            sig.op == "conv1x1_cat4");
+      e.expected = memBind ? std::min(e.expected, famCeil) : famCeil;
+    }
     e.hard_ceiling = (fam && fam->hardCeiling) ? fam->hardCeiling(sig, rt_.info()) : e.expected;
     if (e.hard_ceiling <= 0.0) e.hard_ceiling = e.expected;
     if (e.expected > 0.0) e.ratio = e.ops / e.expected;

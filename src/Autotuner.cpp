@@ -60,7 +60,14 @@ TuningEntry autotuneOp(
   auto applyStandard = [&](TuningEntry & e) {
     const KernelFamily * f = familyByName(e.kernel);
     e.expected = expectedOps(sig, rt.info());
-    if (f && f->ceiling) e.expected = f->ceiling(sig, rt.info());
+    if (f && f->ceiling)
+    {
+      const double famCeil = f->ceiling(sig, rt.info());
+      // R47-L3: conv/gemm 软标尺同时受「族计算上限」与「内存 roofline（含 L3 断崖）」约束。
+      const bool memBind = (sig.op == "conv3x3" || sig.op == "gemm" || sig.op == "conv1x1" ||
+                            sig.op == "conv1x1_cat4");
+      e.expected = memBind ? std::min(e.expected, famCeil) : famCeil;
+    }
     e.hard_ceiling = (f && f->hardCeiling) ? f->hardCeiling(sig, rt.info()) : e.expected;
     if (e.expected <= 0.0) e.expected = e.hard_ceiling;
     e.ratio = e.expected > 0 ? e.ops / e.expected : 0.0;

@@ -374,10 +374,15 @@ double gridFactor(long n_wg, int eu)
 // 它单调、按 shape 自洽，能直接读出「离物理上限多远」。
 // ---------------------------------------------------------------------------
 struct BwPoint { double bytes; double gbps; };
+// R47-L3: 锁频重测的 copy(read+write) 带宽-足迹曲线（本次会话；比 R30 旧曲线准且覆盖到 16MB）。
+// 膝点在 3→4MB（L3≈3.75MB）：145 → 111 → **56** → 35 → 28 → 22 → 20 GB/s。
 const BwPoint kBwCurve[] = {
   {4e3, 3.0}, {16e3, 8.1}, {64e3, 22.7}, {256e3, 46.4}, {512e3, 63.3},
-  {1e6, 89.7}, {2e6, 62.4}, {4e6, 44.6}, {8e6, 21.0}};
+  {1e6, 145.4}, {2e6, 138.8}, {3e6, 111.5}, {4e6, 56.1}, {5e6, 35.5},
+  {6e6, 28.2}, {8e6, 22.2}, {12e6, 20.7}, {16e6, 20.3}};
 constexpr double kSmallLaunchUs = 3.5;
+// R47-L3: 有效 L3 容量（由膝点推断；用于图级溢出估计）。
+constexpr double kL3Bytes = 3.75e6;
 
 // 由足迹插值 copy 带宽（log-log 线性；端点外取端点值）。
 double copyBwGbps(double footprint)
@@ -395,6 +400,18 @@ double copyBwGbps(double footprint)
     }
   }
   return 20.0;
+}
+
+// R47-L3: 通用内存 roofline（ops/EU/cyc 量纲，flops/(EU·clk·t)）。把「足迹跨 L3 断崖」
+// 显式建模进上限：t = launch + bytes/BW(footprint)。比 single-BW roofline 更接近真实，
+// 且在 L3 断崖处自然给出更低的「可达上限」。
+double memRooflineOps(double flops, double bytes, int eu, double clkMhz, double launchUs)
+{
+  if (flops <= 0.0 || bytes <= 0.0) return 1e30;
+  const double bw = copyBwGbps(bytes) * 1e9;
+  const double t = launchUs * 1e-6 + bytes / bw;
+  if (t <= 0.0) return 1e30;
+  return flops / (static_cast<double>(eu) * clkMhz * 1e6 * t);
 }
 
 // 内存受限算子的期望 proxy（= 2·out 元素 / EU / cyc，与 autotune 的 `ops` 同量纲）。
@@ -415,6 +432,7 @@ double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
 double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
 {
   const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
+  const double clk = dev.clock_mhz > 0 ? static_cast<double>(dev.clock_mhz) : 1300.0;
 
   if (s.op == "conv3x3") {
     // R24 修正：**不再把上限定成实测**。移植的 OV 内循环 ISA 是 288 packed mad /
@@ -434,6 +452,15 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
     double e = kPeakOpsPerEuCycle * kConvOvMadFraction * amort;
     e *= std::max(0.25, gridFactor(n_wg, eu));
     e = std::min(e, kConvOvIssueCeiling);
+    // R47-L3: 叠加内存 roofline（足迹跨 L3 断崖的层会被正确压到内存墙之下）。
+    {
+      const double flops = 2.0 * s.Cout * s.H * s.W * s.Cin * 9.0;
+      const double span = s.stride >= 2 ? static_cast<double>(s.stride) : 1.0;
+      const double inBytes = 2.0 * s.Cin * (s.H * span) * (s.W * span);
+      const double outBytes = 2.0 * s.Cout * s.H * s.W;
+      const double wBytes = 2.0 * s.Cout * s.Cin * 9.0;
+      e = std::min(e, memRooflineOps(flops, inBytes + outBytes + wBytes, eu, clk, 0.0));
+    }
     return std::max(1.0, e);
   }
 
@@ -448,6 +475,13 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
     double e = 13.7;  // 整核 compute+staging 上限（R14）
     e *= std::min(1.0, static_cast<double>(grid) / 64.0);   // 波量化：~64 WG 喂饱 80 EU
     e *= static_cast<double>(s.K) / (static_cast<double>(s.K) + 64.0);  // 短 K 的 prologue 亏
+    // R47-L3: 叠加内存 roofline（大 spatial / 窄 K 的 GEMM 会撞 DRAM 墙）。
+    {
+      const double flops = 2.0 * s.M * s.N * s.K;
+      const double bytes = 2.0 * (static_cast<double>(s.M) * s.K + static_cast<double>(s.K) * s.N +
+                                  static_cast<double>(s.M) * s.N);
+      e = std::min(e, memRooflineOps(flops, bytes, eu, clk, 0.0));
+    }
     return std::max(0.5, e);
   }
 
@@ -464,8 +498,6 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
     }
     return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev);
   }
-
-  const double clk = dev.clock_mhz > 0 ? static_cast<double>(dev.clock_mhz) : 1300.0;
 
   if (s.op == "depthwise" || s.op == "conv_general") {
     // R30：depthwise 的物理墙**不是** FMA，而是地址/边界谓词指令。反汇编
