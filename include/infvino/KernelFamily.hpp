@@ -79,6 +79,20 @@ struct KernelFamily
   std::function<double(const OpSignature &, const ClDeviceInfo &)> hardCeiling;
 };
 
+/**
+ * @brief R48 §3.1: 候选预算（抗 IGC JIT / GPU HANG 的候选规模上限）。
+ *
+ * 候选数增长会放大 IGC JIT 暴露量与 GPU HANG 风险（历史主因）。注册表在
+ * `candidatesFromRegistry` 末尾做**确定性**截断：
+ *   * 每族配额：单族超过 `kFamilyCandidateQuota` 时按等距采样保留（含首尾）；
+ *   * 每签名上限：各族候选按**轮转**交错后取前 `kSigCandidateCap` 个，保证
+ *     「跨瓶颈类别」的多样性不被强势族挤掉。
+ * 环境变量 `INFVINO_FAMILY_QUOTA` / `INFVINO_SIG_CAP` 可覆盖（0 = 不限）；
+ * `INFVINO_CAND_STATS=1` 打印每签名的候选数/截断。D1–D6 新候选必须在此预算内声明。
+ */
+constexpr int kFamilyCandidateQuota = 32;
+constexpr int kSigCandidateCap = 64;
+
 /** @brief 全部已注册的算子族（单一真相源）。 */
 const std::vector<KernelFamily> & kernelFamilies();
 

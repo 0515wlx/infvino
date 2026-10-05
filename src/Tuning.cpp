@@ -265,6 +265,14 @@ TuningCache TuningCache::load(const std::string & path)
     e.iters    = std::atoi(findField(body, "iters", &f7).c_str());
     e.device_id = findField(body, "device_id", &f7);
     e.source    = findField(body, "source", &f7);
+    // R48 §3.2: 数值契约（向后兼容：旧缓存无此字段 -> 视为逐位一致）。
+    {
+      bool fe = false, ft = false;
+      const std::string ex = findField(body, "numeric_exact", &fe);
+      if (fe) e.exact = (ex == "false" || ex == "0") ? false : true;
+      const std::string tl = findField(body, "numeric_tol", &ft);
+      if (ft) e.tol = std::atof(tl.c_str());
+    }
     if (f1) c.entries_[key] = e;
     i = j;
   }
@@ -317,7 +325,9 @@ bool TuningCache::save(const std::string & path) const
       << "\"hard_ratio\": " << e.hard_ratio << ", "
       << "\"iters\": " << e.iters << ", "
       << "\"device_id\": \"" << jsonEscape(e.device_id) << "\", "
-      << "\"source\": \"" << jsonEscape(e.source) << "\""
+      << "\"source\": \"" << jsonEscape(e.source) << "\", "
+      << "\"numeric_exact\": " << (e.exact ? "true" : "false") << ", "
+      << "\"numeric_tol\": " << e.tol
       << "}" << (++n < entries_.size() ? "," : "") << "\n";
   }
   f << "  }\n}\n";

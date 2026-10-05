@@ -82,6 +82,10 @@ struct TuningEntry
   int    iters = 0;
   std::string device_id;
   std::string source;        // "tuned" / "heuristic"
+  // R48 §3.2: 数值契约（从胜出候选带上来）。exact=true 表示仍逐位一致；否则 tol 为该
+  // 候选允许的 mean_rel 上限，model_check 据此**按候选**放宽端到端验收口径。
+  bool   exact = true;
+  double tol = 0.0;
 };
 
 /**

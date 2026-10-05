@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <string>
 
 #include "infvino/Autotuner.hpp"
@@ -50,6 +52,7 @@ int main()
   e.kernel = "conv3x3_ov"; e.config = "OBW=8,OBH=1"; e.options = "-DOBW=8 -DOBH=1";
   e.ms = 0.123; e.ops = 8.4; e.expected = 12.0; e.ratio = 0.70; e.iters = 12;
   e.device_id = out.deviceId(); e.source = "tuned";
+  e.exact = false; e.tol = 0.05;   // R48: 数值契约标记 round-trip
   out.put(a, e);
   CHECK(out.save(path), "cache save");
   TuningCache in = TuningCache::load(path);
@@ -62,6 +65,8 @@ int main()
     CHECK(le->options == "-DOBW=8 -DOBH=1", "cache options round-trip");
     CHECK(le->iters == 12, "cache iters round-trip");
     CHECK(le->ratio > 0.69 && le->ratio < 0.71, "cache ratio round-trip");
+    CHECK(le->exact == false, "R48: numeric contract (exact=false) round-trip");
+    CHECK(le->tol > 0.049 && le->tol < 0.051, "R48: numeric tol round-trip");
   }
   in.setDeviceId("different_device_eu16_clk300");
   CHECK(in.lookup(a) == nullptr, "device key mismatch -> miss（回退启发式）");
@@ -145,6 +150,29 @@ int main()
   TuningCache disabled;
   disabled.setEnabled(false);
   CHECK(disabled.lookup(a) == nullptr, "disabled cache always misses");
+
+  // --- R48 M0: 候选预算（确定性截断 + 环境覆盖）---
+  {
+    const auto bigSig = OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1);
+    const auto full = candidatesConv3x3(bigSig);
+    CHECK(full.size() > 4, "R48: uncapped candidate set is non-trivial");
+    setenv("INFVINO_SIG_CAP", "4", 1);
+    const auto capd = candidatesConv3x3(bigSig);
+    CHECK(capd.size() == 4, "R48: per-signature cap truncates candidate set");
+    std::set<std::string> fams;
+    for (const auto & c : capd) fams.insert(c.kernel);
+    CHECK(fams.size() >= 2, "R48: budget preserves cross-family diversity (round-robin)");
+    unsetenv("INFVINO_SIG_CAP");
+    setenv("INFVINO_FAMILY_QUOTA", "2", 1);
+    const auto q = candidatesConv3x3(bigSig);
+    std::map<std::string, int> qc;
+    for (const auto & c : q) qc[c.kernel]++;
+    bool qok = true;
+    for (const auto & kv : qc) if (kv.second > 2) qok = false;
+    CHECK(qok, "R48: per-family quota enforced");
+    CHECK(q.size() < full.size(), "R48: per-family quota shrinks the set");
+    unsetenv("INFVINO_FAMILY_QUOTA");
+  }
 
   std::printf("\n%s (%d failures)\n", g_fail ? "TUNING TEST FAILED" : "TUNING TEST PASSED", g_fail);
   return g_fail ? 1 : 0;

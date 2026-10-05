@@ -115,6 +115,8 @@ TuningEntry autotuneOp(
     me.iters = iters;
     me.device_id = best.device_id;
     me.source = "candidate";
+    me.exact = c.exact;   // R48: 数值契约随候选记录
+    me.tol = c.tol;
     if (dbg)
       std::fprintf(stderr, "  [cand] %-18s %-42s %8.4f ms  ops=%6.2f  spread=%+.0f%%\n",
                    c.kernel.c_str(), c.options.c_str(), ms, me.ops, sp * 100.0);
@@ -156,6 +158,8 @@ TuningEntry autotuneOp(
       best.options = all[0].e.options;
       best.ms = all[0].e.ms;
       best.ops = all[0].e.ops;
+      best.exact = all[0].e.exact;   // R48: 数值契约随胜出候选带上来
+      best.tol = all[0].e.tol;
     }
     if (winnerSpread > kSpreadWarn && !best.kernel.empty())
       std::fprintf(stderr,

@@ -121,3 +121,23 @@
 - **L3 模型**：[`round47-l3-model.md`](round47-l3-model.md) 的占用/带宽曲线用于 D1 的 tiling 目标。
 - **reorder 负收益**：[`round47-full-flow-findings.md`](round47-full-flow-findings.md) §4.1/§4.6 是 D4 的动机。
 - **分段/预算**：[`profiling-budget.md`](profiling-budget.md) 的三态口径用于验收。
+
+---
+
+## 7. 进展（首轮：M0 + D1 首个候选）
+
+见 [`round48-candidate-expansion-findings.md`](round48-candidate-expansion-findings.md)。
+
+- **M0 已落地**：候选预算（每签名上限 + 族配额，确定性截断 + 审计命令
+  `kernel_autotune --candidates`）、数值契约标记（`Candidate`/`TuningEntry`/缓存 JSON +
+  `model_check` 按候选放宽）、L3/占用模型解析新 tiling 几何。`tuning_test` PASS。
+- **D1 首个候选已落地**：`conv1x1_blk` 的 `-DY_BLOCK`（输出行 tiling，逐位一致）。
+  yolo 大 spatial 精确签名隔离 min 比最优既有候选快 **1.0–1.3×**（vs XB4/YB1 基线
+  1.2–1.6×）；小 H 变慢（按场景分族）。
+- **整网外部稳态 A/B 已完成（见 findings §6）**：yolo **−0.2%**、mb **+0.2%**，均噪声内
+  → **收益未确认**。根因（findings §6.2）：大 spatial 1×1 上 **NCHW GEMM 本就快于 blocked**
+  （1.1–1.6×），YB 无从被选中——与 reorder 无关。
+- **系统设计倒查（见 findings §7）**：reorder 税真实存在（mb ~6% busy、19 次/帧），但根因是
+  **布局图被 NCHW 的 conv3x3 主族切碎**（conv3x3_blk ISA 16.9 < ov 20.3，永不持久化），
+  转换只能以独立 pass 出现。**建议把 D4（reorder 融合）提前，暂缓 D1/D2/D3/D6**。
+- `config/tuning.json` 未改动；当前工作未 commit（待决策）。

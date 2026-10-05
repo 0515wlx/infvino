@@ -47,6 +47,13 @@
 #ifndef SLM_DIV         // split-K across sub-groups inside the work-group
 #define SLM_DIV 1
 #endif
+// R48 D1: 输出空间 tiling —— 每个 work-item 处理 Y_BLOCK 个连续输出行，权重（寄存器里
+// 的 wei[16]）跨行复用，把权重读指令摊薄到 Y_BLOCK 个输出行上。原版每行每 K 步都重读
+// 权重，是 blocked 1x1 的发射/带宽主项（Cout/X_BLOCK 倍于输入读）。数值上与 Y_BLOCK=1
+// **逐位一致**（每个输出的 K 累加顺序不变）。
+#ifndef Y_BLOCK
+#define Y_BLOCK 1
+#endif
 #ifndef ACT             // 1x1 act codes (same as kernels/conv1x1.cl):
 #define ACT 0           //  1=SiLU 2=ReLU 3=HardSwish 4=HardSigmoid 5=Sigmoid 0=none
 #endif
@@ -131,12 +138,12 @@ __kernel void conv1x1_blk(
   const int X_BLOCKS = (W + X_BLOCK - 1) / X_BLOCK;
   const int xy = get_global_id(0);
   const int x0 = (xy % X_BLOCKS) * X_BLOCK;
-  const int y  = xy / X_BLOCKS;
+  const int y0 = (xy / X_BLOCKS) * Y_BLOCK;   // R48 D1: 输出行 tiling 的起始行
 
   const int ic_blocks = (Cin + FS - 1) / FS;
   const int input_y_pitch  = FS * W;
   const int input_fs_pitch = FS * W * H;
-  const int input_offset   = y * input_y_pitch + x0 * FS;
+  const int input_xoff     = x0 * FS;
 
   const int filter_os_pitch = FS * FS * ic_blocks;
   const int filter_offset   = feature_block * filter_os_pitch;
@@ -147,11 +154,13 @@ __kernel void conv1x1_blk(
   typedef half vec_t;
 #endif
 
-#if SLM_DIV == 1
-  vec_t dst = (vec_t)0;
-#else
-  __local vec_t partial_summ[SG * SLM_DIV];
-  vec_t dst = (vec_t)0;
+  // R48 D1: Y_BLOCK 个独立累加器（每个输出行一个）。
+  vec_t dst[Y_BLOCK];
+#pragma unroll
+  for (int r = 0; r < Y_BLOCK; ++r) dst[r] = (vec_t)0;
+
+#if SLM_DIV > 1
+  __local vec_t partial_summ[Y_BLOCK * SG * SLM_DIV];
 #endif
 
 #if SLM_DIV > 1
@@ -168,24 +177,7 @@ __kernel void conv1x1_blk(
     const bool in_left = (gc >= Cin);
 #endif
 
-    VEC_T src = (VEC_T)0;
-    const int base = input_offset + k * input_fs_pitch;
-#if FIT_WH
-    // Aligned: one packed block read (lane l gets channel l, columns x0..x0+X-1).
-    if (!in_left) src = AS_V(BLOCK_READ((__global const ushort *)input + base));
-#else
-    if (!in_left && x0 + X_BLOCK <= W) {
-      src = AS_V(BLOCK_READ((__global const ushort *)input + base));
-    } else {
-#pragma unroll
-      for (int i = 0; i < X_BLOCK; ++i) {
-        const int xx = x0 + i;
-        src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
-      }
-    }
-#endif
-
-    // lane's own output channel: 16 input-channel weights (isv major, osv minor).
+    // R48 D1: 权重每 K 步只读一次，跨 Y_BLOCK 个输出行复用（原版每行重读）。
     const int woff = filter_offset + k * FS * FS;
     ushort8 w0 = intel_sub_group_block_read_us8((__global const ushort *)weights + woff);
     ushort8 w1 = intel_sub_group_block_read_us8((__global const ushort *)weights + woff + 8 * FS);
@@ -196,8 +188,30 @@ __kernel void conv1x1_blk(
     for (int j = 0; j < 8; ++j) wei[8 + j] = as_half(w1[j]);
 
 #pragma unroll
-    for (int id = 0; id < 16; ++id)
-      dst = mad(wei[id], GET_SRC(src, id), dst);
+    for (int r = 0; r < Y_BLOCK; ++r) {
+      const int y = y0 + r;
+      VEC_T src = (VEC_T)0;
+      if (y < H) {
+        const int base = y * input_y_pitch + input_xoff + k * input_fs_pitch;
+#if FIT_WH
+        // Aligned: one packed block read (lane l gets channel l, columns x0..x0+X-1).
+        if (!in_left) src = AS_V(BLOCK_READ((__global const ushort *)input + base));
+#else
+        if (!in_left && x0 + X_BLOCK <= W) {
+          src = AS_V(BLOCK_READ((__global const ushort *)input + base));
+        } else {
+#pragma unroll
+          for (int i = 0; i < X_BLOCK; ++i) {
+            const int xx = x0 + i;
+            src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
+          }
+        }
+#endif
+      }
+#pragma unroll
+      for (int id = 0; id < 16; ++id)
+        dst[r] = mad(wei[id], GET_SRC(src, id), dst[r]);
+    }
   }
 
   const int oc = feature_block * FS + sglid;
@@ -208,31 +222,38 @@ __kernel void conv1x1_blk(
 #endif
 
 #if SLM_DIV > 1
-  partial_summ[lid1] = dst;
+#pragma unroll
+  for (int r = 0; r < Y_BLOCK; ++r) partial_summ[r * SG * SLM_DIV + lid1] = dst[r];
   barrier(CLK_LOCAL_MEM_FENCE);
   if (feature_sub_block == 0) {
 #pragma unroll
-    for (int i = 1; i < SLM_DIV; ++i) dst += partial_summ[sglid + i * SG];
+    for (int r = 0; r < Y_BLOCK; ++r)
+#pragma unroll
+      for (int i = 1; i < SLM_DIV; ++i) dst[r] += partial_summ[r * SG * SLM_DIV + sglid + i * SG];
   } else {
     return;  // only sub-block 0 writes the output
   }
 #endif
 
-  if (bias != 0 && !oob) dst += (vec_t)(bias[oc]);  // broadcast bias
-
 #pragma unroll
-  for (int i = 0; i < X_BLOCK; ++i) {
-    const int ox = x0 + i;
-    if (ox >= W || oob) continue;
-    half v = c1x1blk_activate(dst[i]);
+  for (int r = 0; r < Y_BLOCK; ++r) {
+    const int y = y0 + r;
+    if (y >= H) continue;
+    if (bias != 0 && !oob) dst[r] += (vec_t)(bias[oc]);  // broadcast bias
+#pragma unroll
+    for (int i = 0; i < X_BLOCK; ++i) {
+      const int ox = x0 + i;
+      if (ox >= W || oob) continue;
+      half v = c1x1blk_activate(dst[r][i]);
 #if RES
-    if (residual != 0) v = v + residual[((size_t)oc * H + y) * W + ox];
+      if (residual != 0) v = v + residual[((size_t)oc * H + y) * W + ox];
 #endif
 #if OUT_FSV16
-    output[(((size_t)feature_block * H + y) * W + ox) * FS + sglid] = v;
+      output[(((size_t)feature_block * H + y) * W + ox) * FS + sglid] = v;
 #else
-    output[((size_t)oc * H + y) * W + ox] = v;
+      output[((size_t)oc * H + y) * W + ox] = v;
 #endif
+    }
   }
 }
 

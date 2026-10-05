@@ -240,25 +240,26 @@ struct Conv1x1BlkCfg
   int OUT_FSV16 = 0; // 1=输出 b_fs_yx_fsv16（接 blocked 链），0=bfyx
   int RES = 0;       // 1=在激活后加残差（NCHW [Cout][H][W]）
   int SG = 16;
+  int YB = 1;        // R48 D1: 每 WI 的输出行数（权重跨行复用）；1 = 原行为
 
   std::string options() const
   {
     std::ostringstream o;
     o << "-DX_BLOCK=" << XB << " -DSLM_DIV=" << SLM_DIV << " -DACT=" << ACT
       << " -DOUT_FSV16=" << OUT_FSV16 << " -DRES=" << RES << " -DSG=" << SG
-      << " -cl-mad-enable -cl-fast-relaxed-math";
+      << " -DY_BLOCK=" << YB << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
   std::string label() const
   {
     std::ostringstream o;
-    o << "XB" << XB << " slm" << SLM_DIV << " act" << ACT
+    o << "XB" << XB << " YB" << YB << " slm" << SLM_DIV << " act" << ACT
       << (OUT_FSV16 ? " fsv16" : " bfyx") << (RES ? " res" : "");
     return o.str();
   }
 };
 
-/** @brief 解析 "XB,SLM_DIV[,ACT,OUT_FSV16[,RES]]"。 */
+/** @brief 解析 "XB,SLM_DIV[,ACT,OUT_FSV16[,RES[,YB]]]"。 */
 inline Conv1x1BlkCfg parseConv1x1Blk(const std::string & s)
 {
   Conv1x1BlkCfg c;
@@ -271,6 +272,7 @@ inline Conv1x1BlkCfg parseConv1x1Blk(const std::string & s)
   if (v.size() > 2) c.ACT = v[2];
   if (v.size() > 3) c.OUT_FSV16 = v[3];
   if (v.size() > 4) c.RES = v[4];
+  if (v.size() > 5) c.YB = v[5];
   return c;
 }
 

@@ -26,6 +26,12 @@ struct Candidate
   std::string source;   // .cl 源名（"conv_ov" 等）
   std::string options;  // 编译宏
   std::string config;   // 人类可读 / 可 bake 的 config 串
+  // R48 §3.2: **数值契约标记**。默认逐位一致（与既有族相同的累加顺序/表达式）。
+  // 新数据通路若改变累加顺序（如 Winograd / split-K 重排）则置 exact=false，并给出相对
+  // FP32 参考允许的误差上限 tol（0 = 未标注，按 model_check 的全局默认收紧）。该标记随
+  // TuningEntry 落盘，供 model_check / numerical_check 按**被选中的候选**放宽验收口径。
+  bool   exact = true;
+  double tol = 0.0;     // 允许的 mean_rel 上限（仅 exact=false 时有意义）
 };
 
 // ---------------------------------------------------------------------------

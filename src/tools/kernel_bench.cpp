@@ -773,18 +773,19 @@ int benchConv1x1Blk(infvino::ClRuntime & rt, const infvino::Conv1x1BlkCfg & c,
   clSetKernelArg(k, 7, sizeof(WA), &WA);
   clSetKernelArg(k, 8, sizeof(CoutA), &CoutA);
 
+  const int yb = c.YB > 0 ? c.YB : 1;   // R48 D1
   const size_t lws[3] = {1, static_cast<size_t>(16 * c.SLM_DIV), 1};
   const size_t gws[3] = {
-    static_cast<size_t>(((W + c.XB - 1) / c.XB) * H),
+    static_cast<size_t>(((W + c.XB - 1) / c.XB) * ((H + yb - 1) / yb)),
     static_cast<size_t>(((Cout + 15) / 16) * lws[1]), 1};
   const double med = rt.timeMs(
     [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Cin * (double)HW;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
-    "  conv1x1blk %-16s Cin=%-4d Cout=%-4d %dx%d XB%d slm%d  %8.3f ms  %7.1f GFLOP/s  "
+    "  conv1x1blk %-16s Cin=%-4d Cout=%-4d %dx%d XB%d YB%d slm%d  %8.3f ms  %7.1f GFLOP/s  "
     "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
-    s.label.c_str(), Cin, Cout, H, W, c.XB, c.SLM_DIV, med,
+    s.label.c_str(), Cin, Cout, H, W, c.XB, c.YB, c.SLM_DIV, med,
     flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
 
   if (verify) {

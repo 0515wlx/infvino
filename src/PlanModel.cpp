@@ -2198,9 +2198,10 @@ void PlanModel::run()
             return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(k));
           };
           const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1);
+          const int yb = optInt("-DY_BLOCK=", 1);   // R48 D1: 输出行 tiling
           if (std::getenv("INFVINO_DEBUG_BLK"))
-            std::fprintf(stderr, "[blk1x1] out=%s Cout=%d Cin=%d Hin=%d Win=%d N=%d xfsv16=%d XB=%d SLM=%d\n",
-                         n.outs[0].c_str(), Cout, Cin, Hin, Win, N, (int)in(1).fsv16, xb, slm);
+            std::fprintf(stderr, "[blk1x1] out=%s Cout=%d Cin=%d Hin=%d Win=%d N=%d xfsv16=%d XB=%d YB=%d SLM=%d\n",
+                         n.outs[0].c_str(), Cout, Cin, Hin, Win, N, (int)in(1).fsv16, xb, yb, slm);
           cl_mem dxb = blkInput(n.ins[1], in(1), Cin, Hin, Win);
           cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
           std::string kbopts = gopts;
@@ -2218,7 +2219,8 @@ void PlanModel::run()
           setArg(kb, 7, sizeof(Win), &Win);
           setArg(kb, 8, sizeof(Cout), &Cout);
           const size_t blws[3] = {1, static_cast<size_t>(16 * slm), 1};
-          const size_t bgws[3] = {static_cast<size_t>(((Win + xb - 1) / xb) * Hin),
+          const size_t ybCount = static_cast<size_t>((Hin + yb - 1) / yb);  // R48 D1
+          const size_t bgws[3] = {static_cast<size_t>(((Win + xb - 1) / xb)) * ybCount,
                                   static_cast<size_t>(((Cout + 15) / 16) * blws[1]), 1};
           timed("conv1x1blk@" + std::to_string(Cout) + "x" + std::to_string(N) + "x" +
                   std::to_string(Cin),
@@ -3504,6 +3506,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
           };
           const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1);
+          const int yb = optInt("-DY_BLOCK=", 1);   // R48 D1: 输出行 tiling
           cl_mem dxb = blkInput(n.ins[1], ref(n.ins[1]), Cin, Hin, Win);
           cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
           std::string bopts = c.options;
@@ -3519,7 +3522,8 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kb, 7, sizeof(Win), &Win);
           setArg(kb, 8, sizeof(Cout), &Cout);
           const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
-          const size_t gws[3] = {static_cast<size_t>(((Win + xb - 1) / xb) * Hin),
+          const size_t ybCount = static_cast<size_t>((Hin + yb - 1) / yb);  // R48 D1
+          const size_t gws[3] = {static_cast<size_t>(((Win + xb - 1) / xb)) * ybCount,
                                  static_cast<size_t>(((Cout + 15) / 16) * lws[1]), 1};
           return [this, kb, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kb, 3, gws, lws);
@@ -4088,6 +4092,20 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
                          ((s.Cout + 15) / 16);
       totalThreads = nwg * wgSize;
       perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
+    }
+    else if (s.op == "conv1x1" && e.kernel == "conv1x1_blk")
+    {
+      // R48 D1: blocked 1x1 的占用 = 空间 tile (XB×YB) × Cout/16 个 WG；每 WG 足迹
+      // = Cin×XB×YB 元素。让 L3 模型能看到 tiling 候选（否则模型看不到新几何）。
+      const int xb = std::max(1, optIntOf(e.options, "-DX_BLOCK=", 4));
+      const int yb = std::max(1, optIntOf(e.options, "-DY_BLOCK=", 1));
+      const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
+      wgSize = 16 * slm;
+      const int tile = xb * yb;
+      const double nwg = static_cast<double>((s.N + tile - 1) / tile) *
+                         static_cast<double>((s.Cout + 15) / 16);
+      totalThreads = nwg * wgSize;
+      perWg = 2.0 * s.Cin * tile;
     }
     else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
     {

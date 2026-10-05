@@ -12,10 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "infvino/KernelFamily.hpp"
 #include "infvino/PlanModel.hpp"
 
 namespace
@@ -44,7 +46,7 @@ int main(int argc, char ** argv)
   std::vector<std::string> ops;
   int  limit = 0, iters = 30;
   bool report = false, expected = false, bake = false, list = false, retune = false;
-  bool refresh = false;
+  bool refresh = false, candidates_ = false;
   bool global = false;
   int  gIters = 0, gTopK = 3, gRounds = 3, gLimit = 0;
   double gMargin = 0.0;
@@ -65,6 +67,7 @@ int main(int argc, char ** argv)
     else if (a == "--report") report = true;
     else if (a == "--expected") expected = true;
     else if (a == "--list") list = true;
+    else if (a == "--candidates") candidates_ = true;
     else if (a == "--retune") retune = true;
     else if (a == "--refresh-expected") refresh = true;
     else if (a == "--global") global = true;
@@ -86,6 +89,7 @@ int main(int argc, char ** argv)
         "  --limit N          本次最多调优 N 个签名（0=不限；安全分批推荐 3–5）\n"
         "  --iters N          每个候选的计时迭代数（默认 30）\n"
         "  --list             只列出唯一签名，不跑 GPU 计时\n"
+        "  --candidates       列出每个签名的候选数（按族），不跑 GPU 计时\n"
         "  --retune           忽略缓存里已有的 tuned 条目，强制重新扫描（候选/标准更新后用）\n"
         "  --refresh-expected  仅用当前中间标准重算缓存命中项的 expected/ratio（**零 GPU**）\n"
         "  --global           R44/R47: 整网 busy 回验（R47：min+median 双口径 + 交错 + 可加目标\n"
@@ -129,6 +133,34 @@ int main(int argc, char ** argv)
       auto targets = model.tuningTargets(ops);
       std::printf("unique tuning signatures: %zu\n", targets.size());
       for (const auto & t : targets) std::printf("  %s\n", t.c_str());
+      return 0;
+    }
+
+    if (candidates_)
+    {
+      // R48 M0: 候选规模审计（零 GPU）。按签名打印总数与按族分解，超出预算者标 [BUDGET]。
+      const auto sigs = model.tuningSignatures(ops);
+      size_t total = 0, over = 0;
+      std::printf("unique tuning signatures: %zu\n", sigs.size());
+      for (const auto & s : sigs)
+      {
+        const auto cs = infvino::candidatesFromRegistry(s);
+        total += cs.size();
+        std::map<std::string, int> byFam;
+        for (const auto & c : cs) byFam[c.kernel]++;
+        // 预算截断会把 size 压到恰好 = cap，故用 >= 判定「命中/触顶」。
+        const bool hit = static_cast<int>(cs.size()) >= infvino::kSigCandidateCap;
+        if (hit) ++over;
+        std::printf("  %-52s %3zu%s  {", s.str().c_str(), cs.size(), hit ? " [BUDGET]" : "");
+        size_t i = 0;
+        for (const auto & kv : byFam)
+          std::printf("%s%s=%d", (i++ ? ", " : ""), kv.first.c_str(), kv.second);
+        std::printf("}\n");
+      }
+      std::printf("total candidates over %zu signatures: %zu (avg %.1f)\n", sigs.size(), total,
+                  sigs.empty() ? 0.0 : static_cast<double>(total) / sigs.size());
+      if (over) std::printf("WARN: %zu signature(s) at/over the per-signature cap %d\n", over,
+                            infvino::kSigCandidateCap);
       return 0;
     }
 

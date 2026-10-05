@@ -11,6 +11,7 @@
   python3 model_check.py --model yolov8n-pose --repo $PWD --image infvino-dev:latest
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -24,6 +25,38 @@ EU, CLOCK_GHZ = 80, 1.3
 MEAN_REL_TOL, MAX_REL_TOL = 2e-2, 5e-2
 
 DEFAULT_MODELS = ["yolov8n-pose", "yolo11n-pose", "mobilenetv3-small"]
+
+
+def contract_tolerances(paths):
+    """R48 §3.2: 读取调优缓存里的**数值契约标记**。
+
+    返回 (mean_tol, max_tol, notes)：若某个**被选中的候选**标注了 exact=false，
+    就按它声明的 tol 放宽端到端 mean_rel 验收（max_rel 取 2.5× tol），并把标注汇总
+    打印。旧缓存无此字段 = 全部逐位一致，口径不变。
+    """
+    mean_tol, max_tol, notes = MEAN_REL_TOL, MAX_REL_TOL, []
+    seen = set()
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            data = json.load(open(p))
+        except Exception:
+            continue
+        for key, e in (data.get("entries") or {}).items():
+            if e.get("numeric_exact", True):
+                continue
+            tol = float(e.get("numeric_tol", 0.0) or 0.0)
+            notes.append(f"{e.get('kernel', '?')} tol={tol:.3g} ({key})")
+            mean_tol = max(mean_tol, tol)
+            max_tol = max(max_tol, 2.5 * tol)
+    # 去重（同一候选可能同时出现在全局缓存与 per-plan 覆盖里）。
+    uniq = []
+    for n in notes:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return mean_tol, max_tol, uniq
 
 
 def conv_flops(onnx_path):
@@ -56,7 +89,25 @@ def main():
     ap.add_argument("--image", default="infvino-dev:latest")
     ap.add_argument("--workdir", default="/tmp/mcheck")
     ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--cache", default="config/tuning.json",
+                    help="R48: 调优缓存（用于读取数值契约标记）")
+    ap.add_argument("--plan-tuning", default=None,
+                    help="R48: per-plan 选择覆盖（默认 <workdir>/<model>/model.plan.tuning.json）")
     args = ap.parse_args()
+
+    cache_paths = [args.cache if os.path.isabs(args.cache) else os.path.join(args.repo, args.cache)]
+    pt = args.plan_tuning or os.path.join(
+        args.workdir, args.model, "model.plan.tuning.json")
+    cache_paths.append(pt)
+    mean_tol, max_tol, contract_notes = contract_tolerances(cache_paths)
+    if contract_notes:
+        print("[contract] non-exact candidate(s) selected -> relaxed tolerance:")
+        for n in contract_notes:
+            print(f"  - {n}")
+        print(f"[contract] effective mean_rel tol={mean_tol:.3g} max_rel tol={max_tol:.3g}")
+    else:
+        print("[contract] all selected candidates exact (bitwise) -> default tolerance")
+    MEAN_REL_TOL, MAX_REL_TOL = mean_tol, max_tol
 
     onnx_path = os.path.join(args.models_dir, args.model + ".onnx")
     if not os.path.isabs(onnx_path):

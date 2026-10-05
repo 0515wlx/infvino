@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <sstream>
 
 namespace infvino
@@ -135,6 +137,73 @@ std::vector<Candidate> smallCandidates(const OpSignature & sig)
       add("gap_r", "ops", "-DGAP_WGS=" + std::to_string(w), "WGS=" + std::to_string(w));
     return out;
   }
+  return out;
+}
+
+// R48 §3.1: 确定性候选预算。仅当超出时才重排/截断（否则原样返回，保证零行为变化）。
+std::vector<Candidate> evenlyPick(const std::vector<Candidate> & v, int q)
+{
+  if (q <= 0 || static_cast<int>(v.size()) <= q) return v;
+  std::vector<Candidate> o;
+  o.reserve(static_cast<size_t>(q));
+  for (int i = 0; i < q; ++i)
+  {
+    const size_t idx = (q == 1)
+                         ? 0
+                         : static_cast<size_t>(
+                             std::llround(static_cast<double>(i) * (v.size() - 1) / (q - 1)));
+    o.push_back(v[idx]);
+  }
+  return o;
+}
+
+std::vector<Candidate> applyCandidateBudget(std::vector<Candidate> in, const OpSignature & sig)
+{
+  const char * qe = std::getenv("INFVINO_FAMILY_QUOTA");
+  const char * ce = std::getenv("INFVINO_SIG_CAP");
+  const int quota = qe ? std::atoi(qe) : kFamilyCandidateQuota;
+  const int cap = ce ? std::atoi(ce) : kSigCandidateCap;
+  const int before = static_cast<int>(in.size());
+  if (in.empty() || (quota <= 0 && cap <= 0)) return in;
+
+  // 按族（kernel 名前缀）分组，保持首次出现顺序。
+  std::vector<std::string> order;
+  std::map<std::string, std::vector<Candidate>> groups;
+  for (auto & c : in)
+  {
+    if (!groups.count(c.kernel)) order.push_back(c.kernel);
+    groups[c.kernel].push_back(c);
+  }
+  bool truncated = false;
+  for (auto & kv : groups)
+    if (quota > 0 && static_cast<int>(kv.second.size()) > quota)
+    {
+      kv.second = evenlyPick(kv.second, quota);
+      truncated = true;
+    }
+  if (!truncated && (cap <= 0 || before <= cap)) return in;  // 未超预算，零行为变化
+
+  // 轮转交错以保证跨族/跨瓶颈多样性，再取全局上限。
+  std::vector<Candidate> out;
+  out.reserve(static_cast<size_t>(before));
+  for (size_t i = 0;; ++i)
+  {
+    bool more = false;
+    for (const auto & k : order)
+    {
+      const auto & g = groups[k];
+      if (i < g.size()) { out.push_back(g[i]); more = true; }
+    }
+    if (!more) break;
+  }
+  if (cap > 0 && static_cast<int>(out.size()) > cap)
+  {
+    out.resize(static_cast<size_t>(cap));
+    truncated = true;
+  }
+  if (truncated && std::getenv("INFVINO_CAND_STATS"))
+    std::fprintf(stderr, "[cand-budget] %s: %d -> %zu candidates (family quota=%d, sig cap=%d)\n",
+                 sig.str().c_str(), before, out.size(), quota, cap);
   return out;
 }
 }  // namespace
@@ -447,16 +516,31 @@ const std::vector<KernelFamily> & kernelFamilies()
       };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
+        // R48 D1: Y_BLOCK = 每 WI 的输出行数（空间 tiling）。权重跨行复用、摊薄权重读；
+        // 与 X_BLOCK 正交。实测：大 H（>=40）上 XB8+YB2 比 XB4+YB1 快 13–24%，小 H 上
+        // 因网格饥饿变慢——正是「按场景分族」要的跨瓶颈候选。约束 xb*yb<=16（累加器
+        // 寄存器预算）且 yb>1 时不再叠 split-K（两个 latency 旋钮同时上收益低、候选翻倍）。
+        auto emit = [&](int xb, int yb, int slm) {
+          std::ostringstream o;
+          o << "-DX_BLOCK=" << xb << " -DY_BLOCK=" << yb << " -DSLM_DIV=" << slm
+            << " -DACT=" << s.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+          std::ostringstream cc;
+          cc << "XB" << xb << " YB" << yb << " slm" << slm << " act" << s.act;
+          out.push_back(mk("conv1x1_blk", "conv1x1_blk", o.str(), cc.str()));
+        };
         for (int xb : {2, 4, 8}) {
           if (s.W > 0 && xb > s.W) continue;
           for (int slm : {1, 2, 4}) {
             if (slm > 1 && s.N < 64) continue;
-            std::ostringstream o;
-            o << "-DX_BLOCK=" << xb << " -DSLM_DIV=" << slm << " -DACT=" << s.act
-              << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
-            std::ostringstream cc;
-            cc << "XB" << xb << " slm" << slm << " act" << s.act;
-            out.push_back(mk("conv1x1_blk", "conv1x1_blk", o.str(), cc.str()));
+            emit(xb, 1, slm);
+          }
+        }
+        for (int yb : {2, 4}) {
+          if (s.H > 0 && yb > s.H) continue;
+          for (int xb : {2, 4, 8}) {
+            if (s.W > 0 && xb > s.W) continue;
+            if (xb * yb > 16) continue;
+            emit(xb, yb, 1);
           }
         }
         return out;
@@ -647,7 +731,9 @@ std::vector<Candidate> candidatesFromRegistry(const OpSignature & sig)
     auto c = f.candidates(sig);
     out.insert(out.end(), c.begin(), c.end());
   }
-  return out;
+  if (std::getenv("INFVINO_CAND_STATS"))
+    std::fprintf(stderr, "[cand-stats] %s: %zu candidates\n", sig.str().c_str(), out.size());
+  return applyCandidateBudget(std::move(out), sig);
 }
 
 const KernelFamily * familyByName(const std::string & kernelName)
