@@ -4060,9 +4060,64 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     *sb = statsOf(bs);
   };
 
+  // R47 step2: **L3 溢出估计（确定性、零 GPU）**。用复用距离近似「张量在被消费前是否已被逐出 L3」：
+  //   对每个激活张量 t：pressure = 其生产者与最后消费者之间新写入的字节；若 pressure + bytes(t) > L3，
+  //   判为一次 DRAM 往返。另把「blk 输入未持久化时引入的 reorder 缓冲」计为额外 L3 占用。
+  // 折算成时间：spill × (1/BW_DRAM − 1/BW_L3)。这是对本机 OA 计数器不可用的**替代估计**。
+  std::vector<double> outBytes(nodes_.size(), 0.0);
+  std::vector<double> prefix(nodes_.size() + 1, 0.0);
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    if (!nodes_[i].outs.empty())
+    {
+      auto it = T_.find(nodes_[i].outs[0]);
+      if (it != T_.end()) outBytes[i] = static_cast<double>(it->second.numel()) * 2.0;
+    }
+    prefix[i + 1] = prefix[i] + outBytes[i];
+  }
+  std::unordered_map<std::string, int> prod, lastUse;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    if (!nodes_[i].outs.empty()) prod[nodes_[i].outs[0]] = static_cast<int>(i);
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & in : nodes_[i].ins)
+      if (in != "-") lastUse[in] = static_cast<int>(i);
+  constexpr double kL3 = 3.75e6;                          // 有效 L3（与 Tuning.cpp 一致）
+  constexpr double kSpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;   // s/byte → ms/byte
+  auto spillMs = [&]() -> double {
+    double spill = 0.0;
+    for (const auto & kv : prod)
+    {
+      auto lu = lastUse.find(kv.first);
+      if (lu == lastUse.end()) continue;
+      auto ti = T_.find(kv.first);
+      if (ti == T_.end()) continue;
+      const double b = static_cast<double>(ti->second.numel()) * 2.0;
+      const int p = kv.second, c = lu->second;
+      if (c <= p) continue;
+      const double pressure = prefix[c + 1] - prefix[p + 1];   // 节点 (p, c] 产出的字节
+      if (pressure + b > kL3) spill += b;
+    }
+    // reorder 缓冲（blk 输入未持久 fsv16）额外占用 L3。
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      bool ok = false;
+      const OpSignature s = nodeSignature(nodes_[ni], &ok);
+      if (!ok) continue;
+      const TuningEntry * e = choiceEntry(ni, s);
+      if (!e || e->kernel.find("_blk") == std::string::npos) continue;
+      const Node & n = nodes_[ni];
+      const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
+      if (n.ins.size() <= inIdx) continue;
+      auto xit = T_.find(n.ins[inIdx]);
+      if (xit == T_.end() || xit->second.fsv16) continue;
+      spill += static_cast<double>(xit->second.numel()) * 2.0;
+    }
+    return spill * kSpillPerByteMs;
+  };
+
   // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的
-  // reorder 成本。对应 TVM meta_schedule 的「Σ weight × 单算子 ms」。用于排序 / 剪枝 / 分组，
-  // **不用于最终裁决**（最终仍由端到端 median 口径回验）。
+  // reorder 成本 + R47 step2 的 L3 溢出估计。对应 TVM meta_schedule 的「Σ weight × 单算子 ms」，
+  // 并把内存层级显式建模。用于排序 / 剪枝 / 分组，**不用于最终裁决**。
   auto predictNet = [&](const std::vector<TuningEntry> & asg) -> double {
     node_choice_ = asg;
     planBlockedLayout();  // 只更新 fsv16 标志，不触碰 dispatch
@@ -4087,6 +4142,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
         net += r->ms;
     }
+    net += spillMs();   // R47 step2: L3 溢出（复用距离 + reorder 缓冲）
     return net;
   };
   // R47 S3: 只算可加目标里的 **reorder 分量**（供 chain move 门控：reorder 占比小的模型跳过）。
@@ -4183,10 +4239,16 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   const double baseNet = baseStat.med;
 
   if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+  {
+    node_choice_ = baseline;
+    planBlockedLayout();
+    const double baseSpill = spillMs();
     std::fprintf(stderr,
                  "[global-retune] %zu signatures, topK=%d reps=%d rounds=%d, metric=min+median, "
-                 "accept=median, interleave=on, additive-priority=on, grouped=%s, base(med)=%.4f\n",
-                 targets.size(), topK, reps, rounds, groupedOn ? "on" : "off", baseNet);
+                 "accept=median, interleave=on, additive-priority=on, grouped=%s, base(med)=%.4f, "
+                 "base(L3 spill est)=%.4f ms\n",
+                 targets.size(), topK, reps, rounds, groupedOn ? "on" : "off", baseNet, baseSpill);
+  }
 
   // 落盘：base 签名写回 winner；同时把**同族**的 #blk / #non 备选更新为 winner，使运行时
   // 的联合布局不动点在本 plan 上复现出同一个选择（跨 plan 的 #blk/#non 唯一分解限制见审计）。

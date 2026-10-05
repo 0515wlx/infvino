@@ -90,3 +90,38 @@ scripts/gpu_clocks.sh unlock
 ./build-ct/kernel_autotune --plan models/mobilenetv3-small/model.plan \
   --cache config/tuning.json --refresh-expected
 ```
+
+---
+
+## 7. 第二步：把 L3 溢出估计接进选择目标（`predictNet`）
+
+**实现**（`PlanModel.cpp::globalRetune`，零 GPU、确定性）：
+
+```
+spill_bytes = Σ_t [ pressure(t) + bytes(t) > L3 ? bytes(t) : 0 ]      # 复用距离逐出
+            + Σ_{blk 且输入未持久 fsv16} bytes(input)                   # reorder 缓冲占用 L3
+spill_ms    = spill_bytes × (1/BW_DRAM − 1/BW_L3)     # 20 vs 130 GB/s
+predictNet  = Σ 逐节点 kernel ms + Σ #reorder.ms + spill_ms
+```
+
+其中 `pressure(t)` = 张量 t 的生产者与最后消费者之间新写入的字节（用节点级前缀和）。
+这让 `predictNet`（目标排序 / S2 契约门 / S3 chain move）**显式看见**「是否把工作集推过 L3」。
+报告里打印 `base(L3 spill est)`，可观测。
+
+**实测（mb 单进程 33 签名）**：`base(L3 spill est) ≈ 0.035 ms`（~2% busy）；S2 契约门现在把多个
+族的 `gemm*` 候选判为预测更差而拒绝。
+
+**诚实的局限**：
+1. 张量字节在 kernel 选择下**不变**（fsv16 仅在 `Cout%16==0` 时启用、无通道补齐）→ spill 的
+   **张量逐出项是赋值不变量**（在比较中相消）；只有 **reorder 缓冲项**随赋值变化，且与既有
+   `#reorder.ms` 部分重叠。所以本步对选择的**边际影响有限**。
+2. **仍缺**：① 每候选的 **tiling 感知 DRAM 流量**（OBW/OBH/BM/BN 决定 halo/重读次数）——
+   但对**内存受限候选**，隔离实测 ms ≈ 流量/BW，已隐式包含；② **占用率/访问模式导致的
+   跨算子 L3 争用**——这是端到端噪声的根源，本机 OA 不可用，需要校准实验或计数器才能精确。
+3. `pressure` 用「节点级产出字节」近似「L3 驻留压力」，忽略张量实际重用（同张量多次读）与
+   写合并缓冲，属**一阶估计**。
+
+**结论**：这是「把 L3 当黑箱」→「一阶确定性估计」的第一步落地；它让标尺（§3）与代理目标（本节）
+都显式含内存层级。要把它变成**准确实用**的选择依据，缺的是可用计数器或一套校准实验来标定
+「每候选跨算子外溢」。在这些就位前，**保留隔离 `min` 作为选择主口径**，`predictNet` 仅用于
+拒绝明显更差的候选（S2 门）。
