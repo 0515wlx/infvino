@@ -1,0 +1,123 @@
+# R48：系统性扩充算子候选集 —— 计划
+
+> 背景：R47 把 L3/DRAM 显式建模进标尺与选择目标（[`round47-l3-model.md`](round47-l3-model.md)），
+> 并落地「模型驱动选择」（[`round47-full-flow-findings.md`](round47-full-flow-findings.md) §4.8）。
+> 最终判读是：**整网性能的下一步增量不在「选谁」，而在「有什么可选」** —— 模型（正确地）
+> 判断当前候选集里没有比现状更优的选项。本文件给出**扩充候选集**的系统性计划。
+
+---
+
+## 0. 目标与判据
+
+- **目标**：让每个签名（op × shape × act）都有**跨越不同物理瓶颈**的候选，且每族有独立的上限
+  模型与布局契约；新增候选**不破坏逐位数值契约**（或明确记录误差口径）。
+- **判据**：
+  1. 每个「离硬上限最远」的签名，至少有 **≥2 个不同瓶颈类别**（Fma/Instruction/Memory/Launch）
+     的候选；
+  2. 新候选经 **autotune 在隔离 `min` 口径**上可复现地更快（≥2% 且 spread 稳定），或
+  3. 新候选**改变整网 L3/布局收益**（`predictNet` 预测下降且外部稳态 A/B 不回归）；
+  4. 三模型 `model_check` / `reuse_check` PASS。
+
+---
+
+## 1. 现状盘点（单一真相源 = `src/KernelFamilies.cpp` 注册表）
+
+| op | 现有族（数据通路）| 缺口（候选同质化的地方）|
+|---|---|---|
+| conv3x3 | `conv3x3_ov`（osv32）、`conv3x3_blk`（OBW/SLM）、`conv3x3_f16`（native）、`conv3x3_cin3` | 无 **输出 tiling / split-K**；大层受延迟/占用限（R41），无跨瓶颈候选 |
+| conv1x1 | `gemm`（BM/BN/BK/TM/TN）、`gemm_sk`（split-K）、`conv1x1_blk`、`conv1x1_gemv`（N=1）| N 中等时无 **direct conv1x1**（非 im2col）；小 N 的 tiling 单一 |
+| depthwise | `depthwise_v`、`depthwise_blk`、`depthwise_pad`(opt-in) | 无 **向量化/多输出-per-WI** 变体；K=5 的专用谱系缺失 |
+| gemm | `gemm`、`gemm_sk` | 无 **SLM staging / 双缓冲 K** 变体谱系 |
+| 小算子 | ew_binary/bcast/unary/concat4/copy/slice/pool/resize/permute/bmm/gap/softmax | 多数只有「标量 vs 向量」两变体；缺 **launch 融合**（把相邻小算子折进消费者）|
+
+> 扩展基础设施已就位：`KernelFamily`（supports/candidates/layout/ceiling/hardCeiling/actMask）
+> 是声明式的；加族 = 加声明 + 自包含 `.cl`，**不改** Autotuner/dispatch/布局规划/expectedOps
+> （见 [`kernel-families.md`](kernel-families.md)）。R47 的 L3 建模让新候选可被**显式评估**。
+
+---
+
+## 2. 扩充维度（按「物理瓶颈 × 契约」组织）
+
+### D1. 输出/空间 tiling 维度（Memory + Occupancy）
+- **动机**：R47 标定出「占用 → 有效 L3 容量/带宽断崖」（§9.1），且大层受占用限。对
+  conv3x3/conv1x1 增加**输出空间 tiling** 候选（一次只驻留一个子块的工作集），让工作集落在
+  ~1MB 有效容量内 → 命中 R47 模型里的「低占用、高带宽」区间。
+- **产物**：`conv3x3_ov` 的 `OBH` 谱系扩展 + 新 `-DTILE_OUT=HxW` 变体；`conv1x1` 的 N 维切块。
+- **验收**：大 spatial 层（W80/H80）隔离 min 改善；整网 `predictNet` 的 L3 spill 下降。
+
+### D2. split-K / 归约维度（Latency + Grid）
+- **动机**：网格饥饿层（20×20 系）受延迟限（R24/R40）。
+- **产物**：把现有 `gemm_sk` 思路推广到 conv3x3（**split-K conv**），以及 conv1x1 的多级 split。
+- **验收**：小网格层隔离 min 改善 ≥2%。
+
+### D3. 数据通路维度（Fma + Memory）
+- **动机**：conv3x3 现在只有 ov/blk/native/cin3；WINograd、direct-vector（CINC 泛化）未覆盖宽通道区。
+- **产物**：评估 **Winograd F(2×2,3×3)**（曾判定上限低，用 R47 的内存/占用模型复核是否值得）；
+  `CINC` 从 Cin≤4 泛化到任意 Cin%（R33 方向）。
+- **验收**：宽通道层隔离 min 改善；数值契约标注（Winograd 改变累加顺序）。
+
+### D4. 布局守护维度（Launch + L3）
+- **动机**：R47 §4.6 reorder 负收益的根因是「每层一趟 reorder」；减少 launch 次数是确定性杠杆。
+- **产物**：**决策级**先做（已具备 chain move，§4.3 S3）；**内核级**再做「producer 直接写消费者
+  所需布局」的**融合 reorder**（把 reorder 折进 conv 的 epilogue/prologue）。
+- **验收**：reorder 调用数与 ms 下降；整网 A/B 不回归。
+
+### D5. 小算子融合维度（Launch）
+- **动机**：小算子占 mb busy ~50%（§4.7）；多为 launch/带宽受限。
+- **产物**：把「P1 epilogue 激活融合」推广到**相邻小算子**（如 `concat4→conv1x1` 已有）；
+  候选层面：`ew_binary_bcast` 的通道特化已存在，补 **NHWC 连续读写**变体。
+- **验收**：dispatch 数下降；小算子分项 ms 下降。
+
+### D6. 全核内建候选项（Coverage）
+- **动机**：`conv1x1` N>1 无 direct；`depthwise` 无多输出-per-WI。
+- **产物**：`conv1x1_direct`（非 im2col，直接滑窗）、`depthwise_v2`（多输出/WI + 向量 store）。
+- **验收**：在「gemm 不适用的窄通道/小 N」区间拿到隔离 min 改善。
+
+---
+
+## 3. 基础设施前置（做 D1–D6 之前）
+
+1. **候选规模与安全**：候选数增长会放大 IGC JIT 与 GPU HANG 风险。需在
+   `candidatesXxx`/registry 层加**每签名候选上限 + 族配额**，并保证 `autotune.py` 分批。
+2. **数值契约标记**：`TuningEntry` 需能标注「本候选是否仍逐位一致 / 允许的误差上限」，
+   让 `model_check` 能按候选验收（R44 #7 的延伸）。
+3. **L3/占用模型接入候选**：D1 的 `TILE_OUT` 必须让 `occupancyPressure` 能解析（否则模型看不到）。
+4. **隔离口径为准**：新候选先以**隔离 `min`** 评估（R42 口径，稳定），整网用 `INFVINO_GLOBAL_MODEL`
+   + 外部稳态 A/B 裁决（R47 §4.8）。
+5. **文档/上限模型**：每个新族须带 `ceiling`/`hardCeiling`，否则 `ratio` 排名失真（R39 教训）。
+
+---
+
+## 4. 里程碑（建议顺序，每步独立可验收）
+
+| M | 内容 | 依赖 | 验收 |
+|---|---|---|---|
+| M0 | 候选上限/配额 + 数值契约标记基础设施 | — | `tuning_test` PASS；候选数可控 |
+| M1 | D1 输出 tiling（conv3x3/conv1x1） | M0 | 大 spatial 层隔离 min↑；L3 spill↓ |
+| M2 | D2 split-K conv | M0 | 小网格层隔离 min↑ |
+| M3 | D5 小算子融合/向量变体 | M0 | dispatch↓；小算子分项↓ |
+| M4 | D3 数据通路（Winograd/CINC 泛化，先离线评估） | R47 模型 | 宽通道层隔离 min↑ 或明确负结果 |
+| M5 | D4 内核级 reorder 融合 | M1、S3 chain move | reorder ms↓；整网不回归 |
+| M6 | D6 全核内建（direct conv1x1 / depthwise_v2） | M0 | 窄通道/小 N 区间改善 |
+
+> 每步完成后：`model_check`/`reuse_check` 三模型回归 + 锁频稳态 A/B；负结果如实归档。
+
+---
+
+## 5. 风险与边界
+
+- **数值**：Winograd / 融合 / 不同累加顺序会改变逐位结果 → 必须标注并放宽到明确误差口径。
+- **GPU 安全**：候选数增长 = IGC JIT 暴露量增长（历史 HANG 主因）→ 严格分批 + `gpu_guard`。
+- **收益不确定**：R40/R41 已证 conv3x3 大层是「无 L1 + 128-GRF ILP」的结构墙；D3 可能仍负结果。
+  R47 的模型让**负结果可提前离线判断**，减少无效 GPU 实验。
+- **不要重蹈 R46**：新候选的整网收益必须用**外部稳态 A/B**（非 in-situ）裁决，避免噪声主导。
+
+---
+
+## 6. 与既有工作的接口
+
+- **注册表**：[`kernel-families.md`](kernel-families.md) 的 `KernelFamily`（加族即加声明）。
+- **选择**：R47 模型驱动（`INFVINO_GLOBAL_MODEL`）在候选扩充后才有用武之地。
+- **L3 模型**：[`round47-l3-model.md`](round47-l3-model.md) 的占用/带宽曲线用于 D1 的 tiling 目标。
+- **reorder 负收益**：[`round47-full-flow-findings.md`](round47-full-flow-findings.md) §4.1/§4.6 是 D4 的动机。
+- **分段/预算**：[`profiling-budget.md`](profiling-budget.md) 的三态口径用于验收。
