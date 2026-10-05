@@ -410,6 +410,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.op = "gemm";
       f.source = "gemm";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
+      f.layout.inIndex = 1;   // gemm 槽 0 = 权重，激活在槽 1（R48 D4）
       f.bottleneck = Bottleneck::Fma;
       f.supports = [](const OpSignature & s) {
         return s.op == "gemm" || (s.op == "conv1x1" && s.N > 1);
@@ -489,6 +490,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.op = "conv1x1";
       f.source = "conv1x1";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
+      f.layout.inIndex = 1;   // R48 D4: conv1x1 槽 0 = 权重，激活在槽 1
       f.bottleneck = Bottleneck::Latency;
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1" && s.N == 1; };
       f.candidates = [](const OpSignature & s) {
@@ -510,6 +512,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.op = "conv1x1";
       f.source = "conv1x1_blk";
       f.layout = {Layout::FSV16, Layout::NCHW, true, true};
+      f.layout.inIndex = 1;   // R48 D4: 槽 0 = os_is_yx_isv16_osv16 权重，激活在槽 1
       f.bottleneck = Bottleneck::Fma;
       f.supports = [](const OpSignature & s) {
         return s.op == "conv1x1" && s.N > 1 && s.Cin >= 16;

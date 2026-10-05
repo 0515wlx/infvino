@@ -60,6 +60,13 @@
 #ifndef OUT_FSV16
 #define OUT_FSV16 0
 #endif
+// R48 D4: 消费者侧融合 reorder —— 输入直接读 **NCHW** [Cin][H][W]，lane 按自己的输入通道
+// gc=k*16+sglid 逐元素读取，省掉独立的 `reorder_bfyx_to_fsv16` pass 及其 launch。
+// 数值逐位一致（K 累加顺序、每输出计算不变）。lane 间地址跨 H*W（非合并读），故只在
+// **Cin 较小**（reorder 以 launch 为主、输入大概率 L2 命中）时值得——由 autotune 按签名选。
+#ifndef IN_NCHW
+#define IN_NCHW 0
+#endif
 #ifndef RES             // 1 = 加残差（在激活之后，语义同 gemm_f16/conv1x1.cl）
 #define RES 0
 #endif
@@ -192,6 +199,15 @@ __kernel void conv1x1_blk(
       const int y = y0 + r;
       VEC_T src = (VEC_T)0;
       if (y < H) {
+#if IN_NCHW
+        // R48 D4: 直接读 NCHW（lane 自己的输入通道 gc）。无独立 reorder pass。
+#pragma unroll
+        for (int i = 0; i < X_BLOCK; ++i) {
+          const int xx = x0 + i;
+          src[i] = (in_left || xx >= W) ? (half)0
+                   : input[(size_t)gc * H * W + (size_t)y * W + xx];
+        }
+#else
         const int base = y * input_y_pitch + input_xoff + k * input_fs_pitch;
 #if FIT_WH
         // Aligned: one packed block read (lane l gets channel l, columns x0..x0+X-1).
@@ -206,6 +222,7 @@ __kernel void conv1x1_blk(
             src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
           }
         }
+#endif
 #endif
       }
 #pragma unroll

@@ -289,6 +289,9 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
     blk_in_[name] = m;
     owned_blk_.push_back(m);
   }
+  if (std::getenv("INFVINO_DEBUG_REORDER"))
+    std::fprintf(stderr, "[reorder] %-40s Cin=%-4d %dx%d  %.1f KB\n", name.c_str(), Cin, H, W,
+                 static_cast<double>(Cin + 15) / 16 * H * W * 16 * 2 / 1024.0);
   // R36：同一帧内同一张量若已被重排过（多个 blocked 消费者共享），直接复用，跳过重复
   // launch。capture 期生效；重放期 blkInput 不再被调用。
   if (!std::getenv("INFVINO_NO_REORDER_DEDUP") && reordered_frame_.count(name)) return m;
@@ -936,6 +939,8 @@ void PlanModel::planBlockedLayout()
   // 布局会变；本函数在构造期与 autotune 末尾各调一次）。
   for (auto & kv : T_) kv.second.fsv16 = false;
   if (std::getenv("INFVINO_NO_BLOCK_LAYOUT")) return;
+  // R48 D4 诊断开关：关闭「按族激活槽判定持久化」与「小算子生产者直写 fsv16」，用于 A/B。
+  const bool d4 = std::getenv("INFVINO_NO_D4") == nullptr;
 
   std::unordered_map<std::string, std::vector<std::pair<size_t, int>>> consumers;
   for (size_t i = 0; i < nodes_.size(); ++i)
@@ -1004,12 +1009,60 @@ void PlanModel::planBlockedLayout()
     for (const auto & c : cit->second)
     {
       const KernelFamily * cf = nodeFamily(nodes_[c.first]);
-      if (c.second != 0 || !cf || cf->layout.in != Layout::FSV16) { all_blk = false; break; }
+      // R48 D4: 用族声明的「激活输入槽」判定——conv1x1/gemm 的激活在槽 1（槽 0 是权重）。
+      const int slot = d4 && cf ? cf->layout.inIndex : 0;
+      if (!cf || cf->layout.in != Layout::FSV16 || c.second != slot)
+      {
+        all_blk = false;
+        break;
+      }
     }
     if (!all_blk) continue;                          // 有非 blocked 消费者 → 保持 NCHW
     tit->second.fsv16 = true;
     ++marked;
   }
+
+  // R48 D4: 小算子生产者直接写 fsv16（消费者全是 blocked 时），省掉独立 reorder pass。
+  // 目前只覆盖 `ew_binary_ch`（通道广播，如 SE 的 Mul；唯一实现了 -DEWCH_OUT_FSV16）。
+  // 与 run() 的 kernel 选择保持一致：优先 tuning 选中的 kernel，否则内置启发式。
+  for (size_t i = 0; d4 && i < nodes_.size(); ++i)
+  {
+    const Node & n = nodes_[i];
+    if (n.op != "ew_binary" || n.outs.empty()) continue;
+    const std::string & t = n.outs[0];
+    if (out_set.count(t)) continue;
+    auto tit = T_.find(t);
+    if (tit == T_.end()) continue;
+    const auto & od = tit->second.dims;
+    if (od.size() < 3) continue;
+    const int C = static_cast<int>(od[od.size() - 3]);
+    if (C <= 0 || C % 16 != 0) continue;
+    const OpSignature sig = smallSig(n);
+    if (sig.op != "ew_binary_bcast") continue;   // 通道广播（bdims）才可能走 ew_binary_ch
+    const long nn = sig.params.size() > 0 ? sig.params[0] : 0;
+    const long Cs = sig.params.size() > 3 ? sig.params[3] : 0;
+    if (!(Cs > 0 && Cs < nn && nn % Cs == 0)) continue;
+    const TuningEntry * e = choiceEntry(i, sig);
+    const bool isCh = (e && !e->kernel.empty()) ? (e->kernel == "ew_binary_ch")
+                                                : (Cs > 0 && Cs < nn && nn % Cs == 0);
+    if (!isCh) continue;
+    auto cit = consumers.find(t);
+    if (cit == consumers.end() || cit->second.empty()) continue;
+    bool all_blk = true;
+    for (const auto & c : cit->second)
+    {
+      const KernelFamily * cf = nodeFamily(nodes_[c.first]);
+      if (!cf || cf->layout.in != Layout::FSV16 || c.second != cf->layout.inIndex)
+      {
+        all_blk = false;
+        break;
+      }
+    }
+    if (!all_blk) continue;
+    tit->second.fsv16 = true;
+    ++marked;
+  }
+  (void)d4;
 
   if (std::getenv("INFVINO_LAYOUT_REPORT"))
     std::fprintf(stderr, "[layout] fsv16 tensors: %d (family-driven persistent block layout)\n",
@@ -2041,6 +2094,13 @@ void PlanModel::run()
       if (const TuningEntry * e = choiceEntry(cur_node_, sig)) {
         kernOut = e->kernel;
         optsOut = e->options;
+      }
+      // R48 D4: 消费者全是 blocked 时，布局规划器把本张量标记为 fsv16；生产者直接写 fsv16
+      // （目前仅 ew_binary_ch 实现），省掉独立 reorder pass。与 planBlockedLayout 的标记条件一致。
+      if (kernOut == "ew_binary_ch" && !n.outs.empty() && !std::getenv("INFVINO_NO_D4")) {
+        auto oit = T_.find(n.outs[0]);
+        if (oit != T_.end() && oit->second.fsv16 && optsOut.find("-DEWCH_OUT_FSV16=") == std::string::npos)
+          optsOut += " -DEWCH_OUT_FSV16=1";
       }
       return getKernel("ops", kernOut, optsOut);
     };

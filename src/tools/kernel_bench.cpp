@@ -739,21 +739,24 @@ int benchConv1x1Blk(infvino::ClRuntime & rt, const infvino::Conv1x1BlkCfg & c,
     for (int ic = 0; ic < Cin; ++ic)
       hWb[(((size_t)(oc / 16) * icb + (ic / 16)) * 16 + (ic % 16)) * 16 + (oc % 16)] =
           hW[(size_t)oc * Cin + ic];
-  // input -> b_fs_yx_fsv16 [Cin/16][H][W][16]
+  // input -> b_fs_yx_fsv16 [Cin/16][H][W][16]（IN_NCHW=1 时直接喂 NCHW [Cin][H][W]）
   std::vector<uint16_t> hXb((size_t)icb * HW * 16, 0);
-  for (int ch = 0; ch < Cin; ++ch)
-    for (int y = 0; y < H; ++y)
-      for (int x = 0; x < W; ++x)
-        hXb[(((size_t)(ch / 16) * H + y) * W + x) * 16 + (ch % 16)] =
-            hX[(size_t)ch * HW + y * W + x];
+  if (!c.IN_NCHW)
+    for (int ch = 0; ch < Cin; ++ch)
+      for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x)
+          hXb[(((size_t)(ch / 16) * H + y) * W + x) * 16 + (ch % 16)] =
+              hX[(size_t)ch * HW + y * W + x];
 
   cl_mem dW = rt.alloc(hWb.size() * 2, CL_MEM_READ_ONLY);
-  cl_mem dX = rt.alloc(hXb.size() * 2, CL_MEM_READ_ONLY);
+  cl_mem dX = c.IN_NCHW ? rt.alloc((size_t)Cin * HW * 2, CL_MEM_READ_ONLY)
+                        : rt.alloc(hXb.size() * 2, CL_MEM_READ_ONLY);
   cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
   const size_t ybytes = c.OUT_FSV16 ? (size_t)ocb * HW * 16 * 2 : (size_t)Cout * HW * 2;
   cl_mem dY = rt.alloc(ybytes, CL_MEM_READ_WRITE);
   rt.write(dW, hWb.size() * 2, hWb.data());
-  rt.write(dX, hXb.size() * 2, hXb.data());
+  rt.write(dX, c.IN_NCHW ? (size_t)Cin * HW * 2 : hXb.size() * 2,
+           c.IN_NCHW ? hX.data() : hXb.data());
   rt.write(dB, (size_t)Cout * 2, hB.data());
 
   cl_mem dRes = nullptr;
@@ -783,9 +786,9 @@ int benchConv1x1Blk(infvino::ClRuntime & rt, const infvino::Conv1x1BlkCfg & c,
   const double flops = 2.0 * Cout * Cin * (double)HW;
   const double ops = rt.opsPerEuCycle(flops, med);
   std::printf(
-    "  conv1x1blk %-16s Cin=%-4d Cout=%-4d %dx%d XB%d YB%d slm%d  %8.3f ms  %7.1f GFLOP/s  "
+    "  conv1x1blk %-16s Cin=%-4d Cout=%-4d %dx%d XB%d YB%d slm%d%s  %8.3f ms  %7.1f GFLOP/s  "
     "ops/EU/cyc=%5.2f (%5.1f%% of 32)",
-    s.label.c_str(), Cin, Cout, H, W, c.XB, c.YB, c.SLM_DIV, med,
+    s.label.c_str(), Cin, Cout, H, W, c.XB, c.YB, c.SLM_DIV, c.IN_NCHW ? " innchw" : "", med,
     flops / (med * 1e-3) / 1e9, ops, ops / 32 * 100);
 
   if (verify) {

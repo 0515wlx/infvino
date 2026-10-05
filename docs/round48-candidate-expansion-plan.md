@@ -138,6 +138,9 @@
   → **收益未确认**。根因（findings §6.2）：大 spatial 1×1 上 **NCHW GEMM 本就快于 blocked**
   （1.1–1.6×），YB 无从被选中——与 reorder 无关。
 - **系统设计倒查（见 findings §7）**：reorder 税真实存在（mb ~6% busy、19 次/帧），但根因是
-  **布局图被 NCHW 的 conv3x3 主族切碎**（conv3x3_blk ISA 16.9 < ov 20.3，永不持久化），
-  转换只能以独立 pass 出现。**建议把 D4（reorder 融合）提前，暂缓 D1/D2/D3/D6**。
-- `config/tuning.json` 未改动；当前工作未 commit（待决策）。
+  **布局规划器漏洞**——持久化判据硬编码「消费者输入槽 0」，而 conv1x1/gemm 的激活在槽 1，
+  导致 **conv1x1_blk 消费者永不持久化**；叠加 NCHW 的 conv3x3 主族，布局图被切碎。
+- **D4 已落地并确认收益（findings §10）**：`LayoutReq.inIndex` 修正激活槽 + SE `Mul`
+  （`ew_binary_ch`）生产者直写 fsv16。mobilenet **−2.8%**（交错 8/8 全胜），yolo 噪声内；
+  三模型 model_check / reuse_check PASS。**建议继续 D4（conv 生产者直写），暂缓 D1/D2/D3/D6**。
+- `config/tuning.json` 未改动（D4 是布局/内核级改动，不改选择）。

@@ -48,6 +48,10 @@ struct LayoutReq
   Layout out = Layout::NCHW;      // 实际写出的布局
   bool canOutFsv16 = false;       // 能否直接产出 FSV16（供持久 blocked 链）
   bool needsWeightRepack = true;  // 是否有 host 版权重预重排
+  // R48 D4: 消费者读「激活张量」的输入槽号。conv3x3/depthwise = 0；conv1x1/gemm 的槽 0 是
+  // **权重**、激活在槽 1。布局规划器据此判断「该张量的消费者是否都吃 FSV16」——此前硬编码
+  // 槽 0，导致 conv1x1_blk 作为消费者时永不持久化（其输入被误判为非激活），每次都付 reorder。
+  int inIndex = 0;
 };
 
 /**

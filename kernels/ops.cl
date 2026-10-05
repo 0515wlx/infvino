@@ -247,6 +247,11 @@ __kernel void bmm(__global const half *restrict A, __global const half *restrict
 // ---- elementwise binary specialized for the "one operand broadcast per channel"
 // pattern (e.g. SE Mul: [C,1,1] * [C,HW]). 2-D grid (spatial, channel) removes the
 // rank loop/div/mod; `a_channel` says which input is the per-channel one. ----
+// R48 D4: OUT_FSV16=1 -> 直接写 b_fs_yx_fsv16（当唯一消费者是需要 fsv16 的 blocked 族时，
+// 省掉独立 reorder pass）。要求 C%16==0（由布局规划器保证）。
+#ifndef EWCH_OUT_FSV16
+#define EWCH_OUT_FSV16 0
+#endif
 __kernel void ew_binary_ch(__global const half *restrict a, __global const half *restrict b,
                            __global half *restrict y, const int HW, const int C,
                            const int op, const int a_channel) {
@@ -255,13 +260,16 @@ __kernel void ew_binary_ch(__global const half *restrict a, __global const half 
   if (r >= HW || c >= C) return;
   const half av = a_channel ? a[c] : a[c * HW + r];
   const half bv = a_channel ? b[c * HW + r] : b[c];
-  const int i = c * HW + r;
   float af = (float)av, bf = (float)bv, res = af;
   if (op == 0) res = af + bf;
   else if (op == 1) res = af - bf;
   else if (op == 2) res = af * bf;
   else res = af / bf;
-  y[i] = (half)res;
+#if EWCH_OUT_FSV16
+  y[(((size_t)(c / 16) * HW + r) * 16) + (c % 16)] = (half)res;
+#else
+  y[(size_t)c * HW + r] = (half)res;
+#endif
 }
 
 // ---- R30: broadcasting binary op on a 3-D grid with runtime strides -------------

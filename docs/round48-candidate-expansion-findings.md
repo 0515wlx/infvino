@@ -238,3 +238,69 @@ python3 scripts/model_check.py --model mobilenetv3-small --repo "$PWD"
 
 1. 是否 **commit** 当前工作（M0 基础设施 + D1-YB + 负结果记录）？
 2. 是否按 §7.4 **把 D4 提前**、暂缓 D1/D2/D3/D6？
+
+> 决策结果：commit（见 §11）；下一步做 **D4**（见 §10）。
+
+---
+
+## 10. D4 首轮：reorder 融合（已确认收益，mobilenet −2.8%）
+
+### 10.1 根因修正：布局规划器漏掉 conv1x1 的激活槽
+
+`planBlockedLayout` 的持久化判据此前**硬编码「消费者必须在输入槽 0 读该张量」**。但
+conv1x1/gemm 的槽 0 是**权重**、激活在槽 1 —— 于是 **`conv1x1_blk` 作为消费者时其输入永远
+不被判为「all blocked」，blocked 链无法持久化**，每个 1x1_blk 都付一趟 reorder（§7.2 的
+「布局图被切碎」的直接机制）。
+
+**修复**：`LayoutReq.inIndex`（conv3x3/depthwise=0；conv1x1/gemm=1），规划器按族声明的
+**激活槽**判定「该张量的消费者是否都吃 FSV16」。
+
+### 10.2 生产者侧融合：SE Mul 直写 fsv16
+
+高频 reorder 生产者是 SE 的 `Mul_output_0`（通道广播乘，走 `ew_binary_ch`；19 次中 8 次）。
+新增 `-DEWCH_OUT_FSV16`：`ew_binary_ch` 直接写 `b_fs_yx_fsv16`；规划器在「唯一消费者是
+blocked 且 C%16==0」时标记输出 fsv16；dispatch 据此编译。
+
+### 10.3 实测
+
+结构（mobilenet）：**fsv16 张量 3→9，reorder 19→13 次（0.133→0.098 ms/帧）**。
+
+整网 A/B（`INFVINO_NO_D4` off/on，交错 8 次，per-frame busy）：
+
+| 模型 | off median / min | on median / min | 结论 |
+|---|---|---|---|
+| mobilenetv3-small | 2.256 / 2.201 | **2.192 / 2.143** | **−2.8% / −2.6%（8/8 次 on 全胜）** |
+| yolov8n-pose | 13.996 / 13.989 | 14.031 / 13.993 | 噪声内（fsv16=0，无 blocked 链） |
+
+门禁：三模型 `model_check` PASS（mobilenet mean_rel 与基线**逐位相同** = 1.069e-2）、
+`reuse_check` PASS、`tuning_test` PASS。
+
+### 10.4 已归档的负结果：消费者侧标量 NCHW 读
+
+`conv1x1_blk -DIN_NCHW`（直接读 NCHW、省 reorder）**逐位一致但慢 1.5–2×**（如 576,96,7,7：
+0.059→0.072 ms）——lane 间跨 H*W 的标量读开销远大于一趟 reorder。**生产者侧直写 fsv16
+才是有效形态。**（保留为 off-by-default 的诊断变体。）
+
+### 10.5 算子族系统的应用经验
+
+- **布局契约（`LayoutReq`）是系统最关键的隐式接口**：一个字段（激活槽）缺失就让整条 blocked
+  链无法持久化，表现为长期「reorder 税」而**无任何报警**。
+- **数值契约标记的价值**：D4 改动 layout 后，`model_check` mean_rel 与基线逐位相同，立刻确认
+  「只改布局、不改数值」，无需逐层核对。
+- **候选扩充（§6）与布局修正（§10）的对撞**：前者净零，后者 +2.8% —— 印证 §7.3-E：
+  下一步杠杆在**布局图/融合**，不在更多同族候选。
+
+### 10.6 系统本身的不足（反思）
+
+| # | 不足 | 证据 | 方向 |
+|---|---|---|---|
+| A | **布局契约不完整 → 静默全局损失**，且无一致性断言（planner 声明 vs dispatch 实际） | inIndex 缺失使 conv1x1 链永不持久化 | 加不变量测试：每个被选 blk 节点，其输入要么 fsv16，要么明确计费 reorder |
+| B | **「加族只加声明」未落地**：`KernelFamily` 设计稿有 `launch` 字段，实现里没有 | 本轮 YB/D4 仍改 `run`/`makeEnqueue`/`occupancyPressure` | 把 launch 绑定声明化（计划 §7.3-D） |
+| C | **布局规划只有「选后单遍」**，缺少系统性测试 | 一个契约 bug 潜伏至今，单次修正 +2.8% | 布局不变量测试 + 小图穷举对照 |
+| D | reorder 税的正解 = **扩展持久化 + 生产者直写**，非微优化 reorder | §10.2/§10.4 | 继续 D4：把 conv 生产者（gemm/ov epilogue）也纳入直写 |
+| E | 候选扩充的 ROI 需先过「是否改变布局图」这一关 | §6 vs §10 | 新候选立项标准加一条：改变持久化/融合的可能性 |
+
+## 11. 提交
+
+D4（§10）收益确认，已 commit（`fix(autotune)/docs: R48 D4 ...`）。
+`config/tuning.json` 仍未改动（D4 是布局/内核级改动，不改选择）。
