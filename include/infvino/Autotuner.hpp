@@ -32,6 +32,9 @@ struct Candidate
   // TuningEntry 落盘，供 model_check / numerical_check 按**被选中的候选**放宽验收口径。
   bool   exact = true;
   double tol = 0.0;     // 允许的 mean_rel 上限（仅 exact=false 时有意义）
+  // R49: 布局能力声明（供布局最小割消费，避免在 PlanModel 里硬编码算子名）。
+  // canOutFsv16 = 该候选能**直接产出** b_fs_yx_fsv16（生产者直写，省一趟 reorder）。
+  bool   canOutFsv16 = false;
 };
 
 // ---------------------------------------------------------------------------

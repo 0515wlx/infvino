@@ -4,6 +4,8 @@
 > **软件耦合（上帝对象）与硬件耦合（L3/GRF/SLM/带宽）应分开收容**：前者靠分面（决策/会计/
 > 执行），后者靠一个把「共享资源」显式化的可加成本模型。本轮是统一模型的**第一个垂直
 > 试点**：把**布局**提升为系统层的一等公民，用**精确最小割**做全局布局标注。
+>
+> 本文件先给首轮试点（§0–§8），再给按用户决策续做的**步骤 1–3**（§9）。
 
 ---
 
@@ -165,3 +167,67 @@ INFVINO_LAYOUT_MINCUT=1 INFVINO_LAYOUT_REPORT=1 ./build-ct/kernel_run \
 INFVINO_LAYOUT_MINCUT=1 python3 scripts/model_check.py --model mobilenetv3-small --repo "$PWD"
 INFVINO_LAYOUT_MINCUT=1 python3 scripts/reuse_check.py --model mobilenetv3-small --repo "$PWD"
 ```
+
+---
+
+## 9. 步骤 1–3（用户决策后本轮续做）
+
+> 用户决策：**精确 min-cut**；布局契约表达力够用（不必更细）；证据链粒度 = **(族,shape,layout)**；
+> **先一族试点**，看收益 + 回头分析设计。随后按 findings §7 的顺序做 1→3。
+
+### 9.1 步骤 1 —— 布局契约声明化（去硬编码）
+
+首轮 `resolveLayoutMinCut` 里有两处硬编码：`producerCap` 用 `p.op=="conv1x1"` / `p.op=="ew_binary"`
+判生产者能否直写 fsv16；pin 规则也没查**消费者**能力（潜在正确性风险）。步骤 1 全部改为
+**注册表驱动**：
+
+- `Candidate.canOutFsv16`（新字段）：候选能否**直接产出** fsv16。`candidatesFromRegistry` 从
+  族契约 `KernelFamily.layout.canOutFsv16` 填充；`smallCandidates` 给 `ew_binary_ch`（D4）单独置位。
+- `resolveLayoutMinCut` 用 `familyByName(kernel)` / `candidatesFromRegistry(sig)` 判：
+  - `producerCanFsv16(t)`：生产者是 mincut 节点→看其 blk 族 `canOutFsv16`；否则看**实际选中**
+    kernel 的 `canOutFsv16`。
+  - `consumerCanReadFsv16(t)`：每个消费者要么是 mincut 节点（读激活槽），要么其**选中 kernel**
+    的族 `layout.in==FSV16` 且 `inIndex` 匹配；否则 pin NCHW。
+  - 激活槽号 `actSlot` 取自 blk 族的 `layout.inIndex`（conv1x1=1、conv3x3/depthwise=0），
+    不再写死。
+- **修正代价表**：首轮「input-only unary + 每张量 reorder」会重复计费/强制 fsv16；改为正确的
+  二元表 `f(x_in,x_out)`：`f00=min(eN,eB+r), f01=eB+r, f10=eB, f11=eB`（submodular，见 §2）。
+
+### 9.2 步骤 2 —— 目标校准：隔离提案 + 稳态验收门
+
+隔离 ms **只用于生成布局提案**；接受/拒绝以**整网交错 median** 为准：
+
+- baseline（联合不动点）先算好；mincut 只提出 proposal。
+- `INFVINO_LAYOUT_MINCUT_GATE=1` 且 profiling 可用时：交错测 baseline vs proposal 各 3 组、
+  每组 median，只有 **proposal median < baseline median × 0.99** 才接受，否则**回退**。
+- 这是 R47「整赋值验收」用在布局维度：**不在噪声上下结论**（R44–R48 的老坑）。
+
+### 9.3 步骤 3 —— 族扩展（depthwise）
+
+mincut 节点集从 `op=="conv1x1"` 放宽到**任何声明了布局契约的族**（有 `#blk/#non` 且 blk 族
+`canOutFsv16`）：现覆盖 **conv1x1 + depthwise**（mobilenet 的 `1x1→dw→1x1` 布局耦合链）。
+`conv3x3` 暂排除（`conv3x3_blk` 结构性弱于 `ov`，缺口 C），其张量由 producer/consumer 能力门
+自动 pin NCHW。
+
+### 9.4 步骤 1–3 实测（锁频非全程；交错）
+
+| 模型 | base busy | mincut(无门) | mincut(有门) | 门裁决 |
+|---|---:|---:|---:|---|
+| mobilenetv3-small | 1.58 | 1.38 | **1.35** | **ACCEPT**（median 1.60→1.40）|
+| yolo11n-pose | 11.49 | 11.37 | **11.35** | **ACCEPT**（median 11.57→11.33）|
+| yolov8n-pose | 10.52 | 10.75 | 10.52（回退） | **REJECT**（median 10.50→10.52）|
+
+- 数值：mb `mean_rel=1.069e-2`、y11 `7.91e-4`，**PASS**；`tuning_test` PASS。
+- **门按设计工作**：mb/y11 接受，y8 因隔离提案更差而被拒、回退到 baseline → **无回归**。
+- 结论：布局 mincut 在**布局耦合型模型**上是确定性增益（mb −14%、y11 −1.5%）；对 yolo 的
+  大 spatial 1×1（最优族是 NCHW GEMM）由门兜底。
+
+### 9.5 剩余缺口（下一步）
+
+1. **目标仍是隔离 ms**（缺口 A）：门能防回归，但「提案质量」仍受隔离口径限制（y8 提案为
+   全 NCHW）。根治需把 R47 的 L3/占用**会计**接进节点代价（线性、可加）。
+2. **生产侧/布局契约仍是族级**：`Candidate.canOutFsv16` 是候选级声明，但 per-port
+   `pref/firm/fusable` 尚未全部进 `KernelFamily`（当前够用，见用户决策 2）。
+3. **conv3x3 未纳入**（缺口 C）：需先让 `conv3x3_blk` 在契约上不弱于 ov，或明确放弃其 blocked 链。
+4. **门需要 profiling + 构造期多次整网执行**：生产应离线跑一次（kernel_autotune）后 bake 成
+   per-plan 工件，而非运行时每次自检。

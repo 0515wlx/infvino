@@ -99,7 +99,11 @@ std::vector<Candidate> smallCandidates(const OpSignature & sig)
     if (effRank <= 4) add("ew_binary_bcast4", "ops", "", "grid3");
     const int n = sig.params.size() > 0 ? sig.params[0] : 0;
     const int C = sig.params.size() > 3 ? sig.params[3] : 0;
-    if (C > 0 && C < n && n % C == 0) add("ew_binary_ch", "ops", "", "channel");
+    if (C > 0 && C < n && n % C == 0) {
+      add("ew_binary_ch", "ops", "", "channel");
+      // R48 D4: 通道广播（SE Mul）可 -DEWCH_OUT_FSV16 直接产出 fsv16（生产者直写）。
+      out.back().canOutFsv16 = true;
+    }
     return out;
   }
   if (op == "concat4") {
@@ -732,6 +736,9 @@ std::vector<Candidate> candidatesFromRegistry(const OpSignature & sig)
     if (!(f.actMask & (1 << sig.act))) continue;
     if (f.supports && !f.supports(sig)) continue;
     auto c = f.candidates(sig);
+    // R49: 族的布局契约 → 候选的输出能力（生产者直写 fsv16）。候选可自行覆盖。
+    for (auto & cand : c)
+      if (!cand.canOutFsv16) cand.canOutFsv16 = f.layout.canOutFsv16;
     out.insert(out.end(), c.begin(), c.end());
   }
   if (std::getenv("INFVINO_CAND_STATS"))

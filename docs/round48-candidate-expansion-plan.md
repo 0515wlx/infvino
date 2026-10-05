@@ -7,6 +7,30 @@
 
 ---
 
+## 0. 修订（R49 布局一等公民后，**立项标准已变**）
+
+> R49（[`round49-layout-mincut-pilot.md`](round49-layout-mincut-pilot.md)）把**布局**提升为系统层
+> 一等公民，用**精确最小割**做全局布局标注，并确立：**隔离 ms 只用于生成提案，接受/拒绝以
+> 外部稳态 A/B 为准**。据此，本计划做三处修订：
+
+1. **每个新候选必须声明布局契约**（否则 mincut 看不见它）：
+   - `Candidate.canOutFsv16`：能否**直接产出** `b_fs_yx_fsv16`（生产者直写，省一趟 reorder）。
+   - 族级 `KernelFamily.layout`：`in/out/canOutFsv16/inIndex`（激活槽）。**新增族/候选若不声明，
+     会被布局规划当作 NCHW-only 处理**（R49 两次翻车即此类静默损失）。
+2. **D4（reorder 融合）不再是独立 kernel 任务**：它已被布局 mincut 消费为「生产者直写能力」。
+   后续「consumer prologue 直读 NCHW / producer epilogue 直写」都应以**布局契约字段**表达，
+   而不是散落的 op 判断。
+3. **验收口径**：新候选先以**隔离 `min`** 评估（候选生成），整网收益**必须**用 R49 的
+   **门**（交错 median）或外部稳态 A/B 裁决；**不得**用 in-situ 单口径下结论（R44–R48 教训）。
+
+> 另：R49 已证明「大 spatial 1×1 的最优族是 NCHW GEMM，不是 blocked」（§6.2），因此 D1（blocked
+> 输出 tiling）这类**同族候选**对改变选择无帮助——立项前先过「是否改变布局图/是否跨物理瓶颈」
+> 这一关（R48 §7.3-E、R49 §9.5）。
+
+---
+
+---
+
 ## 0. 目标与判据
 
 - **目标**：让每个签名（op × shape × act）都有**跨越不同物理瓶颈**的候选，且每族有独立的上限

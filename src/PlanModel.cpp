@@ -1116,10 +1116,7 @@ void PlanModel::resolveLayoutChoices()
     return;
   }
 
-  // R49 试点：一族（conv1x1）的布局标注改走精确最小割（opt-in，默认关）。
-  // 成功即接管布局并返回；否则回退到既有联合不动点。
-  if (std::getenv("INFVINO_LAYOUT_MINCUT") && resolveLayoutMinCut(alt))
-    return;
+  const bool mincutOn = std::getenv("INFVINO_LAYOUT_MINCUT") != nullptr;
 
   const int kIters = 4;
   for (int it = 0; it < kIters; ++it)
@@ -1158,19 +1155,175 @@ void PlanModel::resolveLayoutChoices()
     std::fprintf(stderr, "[layout] joint fixpoint: %d conv3x3 nodes, %d -> blk\n",
                  static_cast<int>(node_choice_.size()), nblk);
   }
+
+  // R49 步骤 2：baseline（联合不动点）就绪后，把布局决策交给**精确最小割**。
+  // 隔离 ms 只用于**生成**布局提案；若开启验收门（INFVINO_LAYOUT_MINCUT_GATE=1）且
+  // profiling 可用，则用**整网交错 median** 对比 baseline vs mincut，只有改善 > 1% 才接受，
+  // 否则回退——不在噪声上下结论（这是 R44–R48 反复踩的坑）。
+  if (mincutOn)
+  {
+    struct LayoutState
+    {
+      std::vector<TuningEntry>              choice;
+      std::unordered_map<std::string, char> fsv;
+      bool                                  mincut = false;
+    };
+    auto snap = [&]() {
+      LayoutState s;
+      s.choice = node_choice_;
+      s.mincut = mincut_active_;
+      for (const auto & kv : T_) s.fsv[kv.first] = kv.second.fsv16 ? 1 : 0;
+      return s;
+    };
+    auto restore = [&](const LayoutState & s) {
+      node_choice_ = s.choice;
+      mincut_active_ = s.mincut;
+      for (auto & kv : T_)
+      {
+        auto it = s.fsv.find(kv.first);
+        if (it != s.fsv.end()) kv.second.fsv16 = (it->second != 0);
+      }
+    };
+    const LayoutState base = snap();
+    if (!resolveLayoutMinCut(alt))
+    {
+      restore(base);  // 不适配 → 保留 baseline
+    }
+    else if (std::getenv("INFVINO_LAYOUT_MINCUT_GATE") && profiling_ &&
+             !input_name_.empty() && inputNumel() > 0)
+    {
+      std::vector<uint16_t> zeros(inputNumel(), 0);
+      setInput(zeros.data());
+      auto busyMedian = [&](int reps) -> double {
+        invalidateCapture();
+        std::vector<double> v;
+        try
+        {
+          for (int r = 0; r <= reps; ++r)
+          {
+            clearProfile();
+            run();
+            if (r == 0) continue;  // capture/热身
+            const double b = profile().busy_ms;
+            if (b > 0.0) v.push_back(b);
+          }
+        }
+        catch (const std::exception &) { return 1e300; }
+        if (v.empty()) return 1e300;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+      };
+      const LayoutState cut = snap();
+      std::vector<double> bmed, mmed;
+      for (int r = 0; r < 3; ++r)
+      {
+        restore(base);
+        bmed.push_back(busyMedian(3));
+        restore(cut);
+        mmed.push_back(busyMedian(3));
+      }
+      auto medOf = [](std::vector<double> & v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+      const double bm = medOf(bmed), mm = medOf(mmed);
+      if (!(mm < bm * 0.99))
+      {
+        restore(base);
+        std::fprintf(stderr, "[layout] mincut gate REJECT: median %.4f -> %.4f ms\n", bm, mm);
+      }
+      else
+      {
+        std::fprintf(stderr, "[layout] mincut gate ACCEPT: median %.4f -> %.4f ms\n", bm, mm);
+      }
+    }
+  }
 }
 
 bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
 {
-  // ---- 收集本族（conv1x1）节点；非本族的 alt 交给既有不动点，不参与 mincut。----
+  // ---- 注册表驱动：族 → 布局契约（inIndex/canOutFsv16/in）。----
+  auto blkFamilyOf = [&](size_t ni) -> const KernelFamily * {
+    return familyByName(alt[ni].blk.kernel);
+  };
+  auto actSlot = [&](size_t ni) -> int {
+    const KernelFamily * f = blkFamilyOf(ni);
+    return f ? f->layout.inIndex : 1;
+  };
+  auto kernelCanOutFsv16 = [&](const std::string & kernel, const OpSignature & sig) -> bool {
+    if (const KernelFamily * f = familyByName(kernel)) return f->layout.canOutFsv16;
+    for (const auto & c : candidatesFromRegistry(sig))
+      if (c.kernel == kernel) return c.canOutFsv16;
+    return false;
+  };
+  auto kernelConsumesFsv16 = [&](const std::string & kernel) -> const KernelFamily * {
+    const KernelFamily * f = familyByName(kernel);
+    return (f && f->layout.in == Layout::FSV16) ? f : nullptr;
+  };
+
+  // ---- 参与 mincut 的节点：有 #blk/#non 备选、blk 族声明了布局契约。----
+  // 步骤 3：从 conv1x1 扩展到 depthwise（任何声明了布局契约的族）。conv3x3_blk 结构性
+  // 弱于 ov（R49 缺口 C），暂不纳入；其张量由 producer/consumer 能力门自动 pin。
   std::vector<size_t> nodes;
   for (size_t ni = 0; ni < nodes_.size(); ++ni)
-    if (alt[ni].has && nodes_[ni].op == "conv1x1" && !nodes_[ni].outs.empty() &&
-        !nodes_[ni].ins.empty())
-      nodes.push_back(ni);
+  {
+    if (!alt[ni].has || nodes_[ni].outs.empty()) continue;
+    if (nodes_[ni].op == "conv3x3") continue;
+    const int slot = actSlot(ni);
+    if (slot < 0 || static_cast<size_t>(slot) >= nodes_[ni].ins.size()) continue;
+    if (!blkFamilyOf(ni) || !blkFamilyOf(ni)->layout.canOutFsv16) continue;
+    nodes.push_back(ni);
+  }
   if (nodes.empty()) return false;
+  std::unordered_set<int> inMincut(nodes.begin(), nodes.end());
 
-  // ---- 变量：本族节点输入/输出张量的布局。pin = 必须 NCHW。----
+
+  // ---- 张量 → 生产者/消费者索引。----
+  std::unordered_map<std::string, int> producerOf;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs) producerOf[o] = static_cast<int>(i);
+  std::unordered_map<std::string, std::vector<std::pair<int, int>>> consumersOf;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (size_t s = 0; s < nodes_[i].ins.size(); ++s)
+      if (nodes_[i].ins[s] != "-")
+        consumersOf[nodes_[i].ins[s]].push_back({static_cast<int>(i), static_cast<int>(s)});
+
+  auto selectedKernel = [&](size_t ni, OpSignature * sigOut) -> std::string {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nodes_[ni], &ok);
+    if (sigOut) *sigOut = s;
+    if (!ok) return "";
+    const TuningEntry * e = choiceEntry(ni, s);
+    return (e && !e->kernel.empty()) ? e->kernel : "";
+  };
+  auto producerCanFsv16 = [&](const std::string & t) -> bool {
+    auto it = producerOf.find(t);
+    if (it == producerOf.end()) return false;  // 网络输入
+    const size_t pi = static_cast<size_t>(it->second);
+    if (inMincut.count(static_cast<int>(pi)))
+      return blkFamilyOf(pi) && blkFamilyOf(pi)->layout.canOutFsv16;
+    OpSignature s;
+    const std::string k = selectedKernel(pi, &s);
+    return !k.empty() && kernelCanOutFsv16(k, s);
+  };
+  auto consumerCanReadFsv16 = [&](const std::string & t) -> bool {
+    auto it = consumersOf.find(t);
+    if (it == consumersOf.end()) return true;
+    for (const auto & cs : it->second)
+    {
+      const size_t ci = static_cast<size_t>(cs.first);
+      const int slot = cs.second;
+      if (inMincut.count(static_cast<int>(ci)))
+      {
+        if (slot != actSlot(ci)) return false;  // 残差/辅助槽不能是 fsv16
+        continue;
+      }
+      OpSignature s;
+      const std::string k = selectedKernel(ci, &s);
+      const KernelFamily * cf = k.empty() ? nullptr : kernelConsumesFsv16(k);
+      if (!cf || cf->layout.inIndex != slot) return false;
+    }
+    return true;
+  };
+
+  // ---- 变量：本族节点的激活输入/输出张量（同一张量只一个变量）。----
   std::unordered_map<std::string, int> var;
   std::vector<std::string>             varName;
   auto varId = [&](const std::string & name) {
@@ -1183,90 +1336,42 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   };
   for (size_t ni : nodes)
   {
-    varId(nodes_[ni].ins[1]);   // conv1x1 激活在槽 1（槽 0 是权重）
+    varId(nodes_[ni].ins[static_cast<size_t>(actSlot(ni))]);
     varId(nodes_[ni].outs[0]);
   }
 
   const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
   BinaryEnergy en(static_cast<int>(varName.size()));
 
-  // ---- 生产者能力：一张量能否被其生产者**直接产出 FSV16**。----
-  //   0  = 能（D4：ew_binary_ch -DEWCH_OUT_FSV16，或本身就是本族 conv1x1_blk 生产者）
-  //   ∞  = 不能（生产者是 NCHW-only 的族，例如 conv3x3 native/ov、gemm、pool…）
-  //   r  = 需要独立 reorder 一趟（默认）
-  auto producerCap = [&](const std::string & t) -> double {
-    for (size_t i = 0; i < nodes_.size(); ++i)
-    {
-      const Node & p = nodes_[i];
-      for (const auto & o : p.outs)
-        if (o == t)
-        {
-          if (p.op == "conv1x1") return 0.0;   // 本族现有 blk 生产者（OUT_FSV16 由 dispatch 决定）
-          if (p.op == "ew_binary")             // R48 D4：SE Mul 走 ew_binary_ch 可直写
-          {
-            const OpSignature s = smallSig(p);
-            if (s.op == "ew_binary_bcast")
-            {
-              const long nn = s.params.size() > 0 ? s.params[0] : 0;
-              const long Cs = s.params.size() > 3 ? s.params[3] : 0;
-              if (Cs > 0 && Cs < nn && nn % Cs == 0) return 0.0;
-            }
-          }
-          return BinaryEnergy::kInf;           // NCHW-only 生产者
-        }
-    }
-    return BinaryEnergy::kInf;                 // 网络输入等
-  };
-
-  // pin：网络输入/输出必须 NCHW；生产者无法产 FSV16 的张量也 pin NCHW。
+  // pin：网络输入/输出、生产者无法产 FSV16、消费者无法读 FSV16 的张量 → 钉死 NCHW。
   for (size_t v = 0; v < varName.size(); ++v)
   {
     const std::string & t = varName[v];
-    bool pin = out_set.count(t) > 0;
-    if (!std::isfinite(producerCap(t))) pin = true;
+    bool pin = out_set.count(t) > 0 || !producerCanFsv16(t) || !consumerCanReadFsv16(t);
     if (pin) en.fix(static_cast<int>(v), 0);
   }
 
-  // ---- 代价分解（正确的 min-cut 形式）----
-  //
-  // 变量 v = 张量布局（0=NCHW, 1=FSV16）。代价分两部分：
-  //
-  //  1) **节点私有**：节点走哪个 kernel 只由「输入张量布局」决定——
-  //       输入 NCHW → non（eN.ms）；输入 FSV16 → blk（eB.ms）。
-  //       unary(a, 0) += eN.ms,  unary(a, 1) += eB.ms
-  //     （同一张量被多个消费者共享时，各消费者的 eN/eB 叠加——正确：每个消费者各跑一次。）
-  //
-  //  2) **张量共享**：
-  //       * 生产侧：取 FSV16 的代价 = producerCap(t)（0 / ∞ / r）。
-  //       * 消费侧：取 FSV16 免掉「若它从 NCHW 被 blk 消费者读」的那趟 reorder，
-  //         但这趟 reorder 只有存在 blk 消费者时才会发生——而这对**所有布局组合**都能
-  //         在 unary 里一次性表达：t 取 0 时记一趟 r，取 1 时记 producerCap(t)。
-  for (size_t v = 0; v < varName.size(); ++v)
-  {
-    const std::string & t = varName[v];
-    const double pc = producerCap(t);
-    const double r_of_t = [&] {
-      for (size_t ni : nodes)
-        if (nodes_[ni].ins[1] == t) return alt[ni].reorder.ms;
-      return 0.0;
-    }();
-    // c0 = t 为 NCHW：照付 reorder（若被 blk 消费者读）；c1 = t 为 FSV16：付生产侧代价。
-    en.addUnary(static_cast<int>(v), /*c0=*/r_of_t, /*c1=*/std::isfinite(pc) ? pc : BinaryEnergy::kInf);
-  }
-
+  // ---- 节点代价表 f(x_in, x_out)（含 reorder，submodular）→ unary + 吸引项。----
+  //   f(0,0) = min(eN, eB+r)   NCHW 入/出：non，或 blk 付输入 reorder 写 NCHW
+  //   f(0,1) = eB + r          NCHW 入 / FSV16 出：必须 blk，付输入 reorder
+  //   f(1,0) = eB              FSV16 入 / NCHW 出：blk
+  //   f(1,1) = eB              FSV16 入 / FSV16 出：blk
+  //   K = (f00+f11-f01-f10)/2 = (min(eN,eB+r) - eB - r)/2 ≤ 0 → submodular。
   for (size_t ni : nodes)
   {
     const Node & n = nodes_[ni];
-    const int a = varId(n.ins[1]);
-    const TuningEntry & eB = alt[ni].blk;    // FSV16 输入路径
-    const TuningEntry & eN = alt[ni].non;    // NCHW 输入路径
-    en.addUnary(a, /*c0=*/eN.ms, /*c1=*/eB.ms);
+    const int a = varId(n.ins[static_cast<size_t>(actSlot(ni))]);
+    const int b = varId(n.outs[0]);
+    const double eB = alt[ni].blk.ms, eN = alt[ni].non.ms, r = alt[ni].reorder.ms;
+    const double f00 = std::min(eN, eB + r), f01 = eB + r, f10 = eB, f11 = eB;
+    if (!en.addPairwiseTable(a, b, f00, f01, f10, f11))
+      return false;  // 非 submodular → 回退
   }
 
   const BinarySolution sol = solveBinaryMinCut(en);
   if (!sol.optimal) return false;
 
-  // ---- 落地：写 node_choice_ + 张量 fsv16。----
+  // ---- 落地：张量 fsv16 + 每节点 kernel（与代价表的 argmin 一致）。----
   for (size_t v = 0; v < varName.size(); ++v)
   {
     auto it = T_.find(varName[v]);
@@ -1274,8 +1379,13 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   }
   for (size_t ni : nodes)
   {
-    const int vin = varId(nodes_[ni].ins[1]);
-    const bool useBlk = (sol.labels[static_cast<size_t>(vin)] == 1);
+    const Node & n = nodes_[ni];
+    const int a = varId(n.ins[static_cast<size_t>(actSlot(ni))]);
+    const int b = varId(n.outs[0]);
+    const bool la = (sol.labels[static_cast<size_t>(a)] == 1);
+    const bool lb = (sol.labels[static_cast<size_t>(b)] == 1);
+    const double eB = alt[ni].blk.ms, eN = alt[ni].non.ms, r = alt[ni].reorder.ms;
+    const bool useBlk = la || lb || (eB + r <= eN);
     node_choice_[ni] = useBlk ? alt[ni].blk : alt[ni].non;
   }
   mincut_active_ = true;
@@ -1283,15 +1393,15 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   {
     int nfsv = 0;
     for (size_t v = 0; v < varName.size(); ++v) if (sol.labels[v] == 1) ++nfsv;
-    std::fprintf(stderr, "[layout] mincut: %zu conv1x1 nodes, %zu vars, %d fsv16, E=%.4f\n",
+    std::fprintf(stderr, "[layout] mincut: %zu nodes, %zu vars, %d fsv16, E=%.4f\n",
                  nodes.size(), varName.size(), nfsv, sol.energy);
     if (std::getenv("INFVINO_LAYOUT_DEBUG"))
       for (size_t ni : nodes)
       {
         const OpSignature s = nodeSignature(nodes_[ni], nullptr);
-        std::fprintf(stderr, "  [mincut] %-40s blk=%.4f non=%.4f r=%.4f -> %s (in=%s)\n",
+        std::fprintf(stderr, "  [mincut] %-40s blk=%.4f non=%.4f r=%.4f -> %s\n",
                      nodes_[ni].outs[0].c_str(), alt[ni].blk.ms, alt[ni].non.ms, alt[ni].reorder.ms,
-                     node_choice_[ni].kernel.c_str(), nodes_[ni].ins[1].c_str());
+                     node_choice_[ni].kernel.c_str());
         std::fprintf(stderr, "           sig=%s\n", s.str().c_str());
       }
   }
