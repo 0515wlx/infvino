@@ -423,6 +423,7 @@ void PlanModel::parse()
     t.mem  = rt_.alloc(elems * 2, CL_MEM_READ_WRITE);
     t.base = t.mem;
     t.base_off = 0;
+    t.cap_elems = static_cast<int64_t>(elems);
     owned_.push_back(t.mem);
     return T_[name] = t;
   };
@@ -512,9 +513,11 @@ void PlanModel::parse()
 
   // R51 D5：把「x * scale[c]」（通道广播 Mul，如 SE）折进**消费它的 conv1x1** 的 prologue：
   // conv 直接读未缩放的 value + 每输入通道 scale（kernel -DMUL_SCALE=1），省掉 Mul 的
-  // 独立 launch 与其物化张量。**opt-in**（`INFVINO_FUSE_SCALE=1`）：默认路径数值正确，
-  // 但 **mincut 路径存在未定位的数值 bug**（gap 直读 fsv16 与 mincut 的交互，见
-  // docs/round51 §5.2），故默认关 → 默认/mincut 路径与 R50 逐位一致。
+  // 独立 launch 与其物化张量。**opt-in**（`INFVINO_FUSE_SCALE=1`）。
+  // R52：R51 §5.1 的数值 bug（`gap_fsv16` 的 supports 恒 false → 分配补齐集合漏掉
+  // gap 输入 → 被标 fsv16 的 value 缓冲越界）已修复（见 docs/round52）。现在 mincut +
+  // 融合数值 PASS，且实测 mb 默认 −2.9%（7/8）、mincut −6.9%（8/8）；保持 opt-in 待正式
+  // 切默认（需 config 缓存补 `#blkfsv16` + 外部稳态 A/B）。
   if (std::getenv("INFVINO_FUSE_SCALE")) fuseChannelScaleMul();
 
   // P0：把激活张量改分配到按生存期复用的缓冲池（须在 fusion 之后，节点列表已定稿）。
@@ -1003,6 +1006,7 @@ void PlanModel::allocateActivations()
     T_[l.name].mem      = pref.mem;
     T_[l.name].base     = pref.base;
     T_[l.name].base_off = static_cast<int64_t>(pref.off);
+    T_[l.name].cap_elems = static_cast<int64_t>(l.bytes / 2);
   }
 
   // 4b) 视图/切片别名：reshape/flatten 直接指向源；连续 copy_c 建子 buffer（源内偏移）。
@@ -1028,6 +1032,7 @@ void PlanModel::allocateActivations()
       oit->second.mem      = sit->second.mem;         // 整块视图（reshape/flatten）
       oit->second.base     = sit->second.base;
       oit->second.base_off = sit->second.base_off;
+      oit->second.cap_elems = sit->second.cap_elems;   // 与源共享底层缓冲容量
     }
     else
     {
@@ -1049,6 +1054,7 @@ void PlanModel::allocateActivations()
         oit->second.mem      = sb;
         oit->second.base     = sit->second.base;
         oit->second.base_off = static_cast<int64_t>(origin);
+        oit->second.cap_elems = static_cast<int64_t>(nbytes / 2);
         alias_subs_.push_back(sb);
         alias_ok.insert(out_name);
       }
@@ -1057,6 +1063,7 @@ void PlanModel::allocateActivations()
         // 无法对齐/建子 buffer → 不别名，给输出单独分配，让 copy_c 正常执行（保数值）。
         cl_mem fresh = rt_.alloc(nbytes, CL_MEM_READ_WRITE);
         oit->second.mem = fresh; oit->second.base = fresh; oit->second.base_off = 0;
+        oit->second.cap_elems = static_cast<int64_t>(nbytes / 2);
         owned_.push_back(fresh);
       }
     }
@@ -1163,6 +1170,9 @@ void PlanModel::planBlockedLayout()
       const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "depthwise_blk") return familyByName("depthwise_blk");
     }
+    // R51 D4+ / R52：gap 视为「可读 fsv16」的消费者（kernel 侧 -DGAP_IN_FSV16），
+    // 使 SE 的 value（depthwise_blk 输出）能被持久 fsv16，D5 融合才是纯收益。
+    if (n.op == "gap") return familyByName("gap_fsv16");
     return nullptr;
   };
 
@@ -1197,6 +1207,9 @@ void PlanModel::planBlockedLayout()
       }
     }
     if (!all_blk) continue;                          // 有非 blocked 消费者 → 保持 NCHW
+    // R52 safety：只有缓冲确实放得下补齐布局才允许标记。分配能力集合（mayBeFsv16）
+    // 与这里的标记判据若发生漂移，越界写入会静默污染激活（R51 §5.1 根因）。
+    if (!mayMarkFsv16(t)) continue;
     tit->second.fsv16 = true;
     ++marked;
   }
@@ -1238,6 +1251,7 @@ void PlanModel::planBlockedLayout()
       }
     }
     if (!all_blk) continue;
+    if (!mayMarkFsv16(t)) continue;   // R52 safety（见上）
     tit->second.fsv16 = true;
     ++marked;
   }
@@ -1424,6 +1438,78 @@ void PlanModel::resolveLayoutChoices()
       }
     }
   }
+  // R52: 池/布局一致性守卫。任何被标记 fsv16 的张量都必须有放得下补齐布局的缓冲，
+  // 且其生产者确实直写 fsv16 —— 否则会在整网静默产生错误激活（R51 §5.1 的根因）。
+  poolAliasProbe(" resolveLayoutChoices", std::getenv("INFVINO_POOL_ALIAS_PROBE") != nullptr);
+}
+
+bool PlanModel::mayMarkFsv16(const std::string & name) const
+{
+  auto it = T_.find(name);
+  if (it == T_.end()) return false;
+  const Tensor & t = it->second;
+  if (t.fsv16) return true;   // 已标记（幂等）
+  const int64_t need = (t.dims.size() == 4) ? static_cast<int64_t>(paddedChannelNumel(t.dims))
+                                            : t.numel();
+  return t.cap_elems >= need;
+}
+
+bool PlanModel::poolAliasProbe(const char * where, bool verbose) const
+{
+  // 生产者索引（唯一写者）。
+  std::unordered_map<std::string, int> producer;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producer[o] = static_cast<int>(i);
+
+  // 该节点**当前选中的** kernel 是否声明「可直出 fsv16」。与 dispatch 同源
+  // （choiceEntry → 签名缓存/per-plan 覆盖/per-node 不动点）。
+  auto selectedCanOutFsv16 = [&](size_t ni) -> bool {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nodes_[ni], &ok);
+    if (!ok) return false;
+    const TuningEntry * e = choiceEntry(ni, s);
+    if (!e || e->kernel.empty()) return false;
+    if (const KernelFamily * f = familyByName(e->kernel)) return f->layout.canOutFsv16;
+    for (const auto & c : candidatesFromRegistry(s))
+      if (c.kernel == e->kernel) return c.canOutFsv16;
+    return false;
+  };
+
+  int bad = 0;
+  for (const auto & kv : T_)
+  {
+    const Tensor & t = kv.second;
+    if (!t.fsv16) continue;
+    const int64_t need =
+        (t.dims.size() == 4) ? static_cast<int64_t>(paddedChannelNumel(t.dims)) : t.numel();
+    if (t.cap_elems < need)
+    {
+      ++bad;
+      std::fprintf(stderr,
+                   "[pool-probe]%s BUG: %s marked fsv16 but buffer too small "
+                   "(cap=%lld need=%lld); layout/alloc drifted\n",
+                   where ? where : "", kv.first.c_str(), static_cast<long long>(t.cap_elems),
+                   static_cast<long long>(need));
+      continue;
+    }
+    auto pit = producer.find(kv.first);
+    if (pit != producer.end() && !selectedCanOutFsv16(static_cast<size_t>(pit->second)))
+    {
+      ++bad;
+      std::fprintf(stderr,
+                   "[pool-probe]%s BUG: %s marked fsv16 but producer '%s' does not write fsv16\n",
+                   where ? where : "", kv.first.c_str(),
+                   nodes_[static_cast<size_t>(pit->second)].op.c_str());
+    }
+    else if (verbose)
+      std::fprintf(stderr, "[pool-probe] ok: %s cap=%lld need=%lld\n", kv.first.c_str(),
+                   static_cast<long long>(t.cap_elems), static_cast<long long>(need));
+  }
+  if (bad > 0 || std::getenv("INFVINO_POOL_ALIAS_PROBE"))
+    std::fprintf(stderr, "[pool-probe]%s %s: %d violation(s)\n", where ? where : "",
+                 bad ? "FAIL" : "PASS", bad);
+  return bad == 0;
 }
 
 bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
@@ -1444,7 +1530,10 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   };
   auto kernelConsumesFsv16 = [&](const std::string & kernel) -> const KernelFamily * {
     const KernelFamily * f = familyByName(kernel);
-    return (f && f->layout.in == Layout::FSV16) ? f : nullptr;
+    if (f && f->layout.in == Layout::FSV16) return f;
+    // R51 D4+ / R52：gap 变体（gap/gap_r）在输入 fsv16 时用 -DGAP_IN_FSV16 直读。
+    if (kernel == "gap" || kernel == "gap_r") return familyByName("gap_fsv16");
+    return nullptr;
   };
 
   // ---- 参与 mincut 的节点：有 #blk/#non 备选、blk 族声明了布局契约。----
@@ -1580,6 +1669,16 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   if (!sol.optimal) return false;
 
   // ---- 落地：张量 fsv16 + 每节点 kernel（与代价表的 argmin 一致）。----
+  // R52 safety：任何被 mincut 标为 fsv16 的变量都必须有放得下补齐布局的缓冲；否则
+  // 说明分配补齐集合与布局契约漂移，回退到 baseline（planBlockedLayout 有同款守卫）。
+  for (size_t v = 0; v < varName.size(); ++v)
+    if (sol.labels[v] == 1 && !mayMarkFsv16(varName[v]))
+    {
+      std::fprintf(stderr,
+                   "[layout] mincut REJECT: %s labeled fsv16 but buffer cannot hold padded layout\n",
+                   varName[v].c_str());
+      return false;
+    }
   for (size_t v = 0; v < varName.size(); ++v)
   {
     auto it = T_.find(varName[v]);
@@ -3394,6 +3493,9 @@ void PlanModel::run()
         if (!e->kernel.empty()) kern = e->kernel;
         if (!e->options.empty()) opts = e->options;
       }
+      // R51 D4+ / R52：输入已持久 fsv16（生产者直写）时，gap 直读 fsv16（免一趟 reorder）。
+      if (in(0).fsv16 && opts.find("-DGAP_IN_FSV16=") == std::string::npos)
+        opts += " -DGAP_IN_FSV16=1";
       cl_kernel k = getKernel("ops", kern, opts);
       cl_uint   dim;
       size_t    gws[3], lws[3];

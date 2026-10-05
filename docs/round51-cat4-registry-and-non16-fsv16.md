@@ -224,6 +224,12 @@ fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
 
 ### 5.1 D4+ 联动（本轮续做 → **未落地，发现 correctness bug，已回退**）
 
+> **R52 已定位并修复该 bug 并重新落地本节的 D4+（`gap_fsv16`）。** 根因是
+> `gap_fsv16.supports` 恒 false 导致**分配补齐集合**与**布局标记判据**漂移（缓冲未按
+> `ceil(C/16)*16` 分配却被标 fsv16，越界写）。修复 + 探针 + A/B 见
+> [`round52-planner-graph-bug-and-gap-fsv16.md`](round52-planner-graph-bug-and-gap-fsv16.md)；
+> 实测 mb 默认 −2.9%（7/8）、mincut −6.9%（8/8），`mincut+D5` 数值 PASS。
+
 **动机**：让 SE 的 `value` 生产者（`depthwise_blk`）直写 fsv16，使 D5 的 conv prologue
 既能免 reorder 又能乘 scale。
 

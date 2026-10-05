@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "infvino/Autotuner.hpp"
+#include "infvino/KernelFamily.hpp"
 #include "infvino/LayoutSolver.hpp"
 #include "infvino/Tuning.hpp"
 
@@ -178,6 +179,42 @@ int main()
     CHECK(qok, "R48: per-family quota enforced");
     CHECK(q.size() < full.size(), "R48: per-family quota shrinks the set");
     unsetenv("INFVINO_FAMILY_QUOTA");
+  }
+
+  // --- R52: 布局契约族的「可读 fsv16」必须能被分配补齐集合发现 ---
+  // 根因（R51 §5.1）：`gap_fsv16` 曾把 supports 设为恒 false，导致分配补齐集合
+  // （mayBeFsv16 → opCanReadFsv16，按 supports 过滤）漏掉 gap 的输入，而布局标记
+  // 仍按 nodeFamily 把它标成 fsv16 → OUT_FSV16 越界写，整网数值错乱。
+  // 契约族可以**无候选**（candidates==nullptr），但其 supports 必须是真实的 op 判据。
+  {
+    const OpSignature gs = OpSignature::gap(120, 196);
+    const KernelFamily * gf = familyByName("gap_fsv16");
+    CHECK(gf != nullptr, "R52: gap_fsv16 layout-contract family is registered");
+    if (gf)
+    {
+      CHECK(gf->layout.in == Layout::FSV16 && gf->layout.inIndex == 0,
+            "R52: gap_fsv16 declares fsv16 input at the activation slot");
+      CHECK(!gf->layout.canOutFsv16, "R52: gap_fsv16 output stays NCHW");
+      CHECK(gf->candidates == nullptr, "R52: layout-contract family produces no candidates");
+      CHECK(gf->supports && gf->supports(gs),
+            "R52: gap_fsv16 supports() matches the gap signature (padding gate can see it)");
+    }
+    // 复刻规划器的 opCanReadFsv16 判据：gap 签名必须能找到一个声明「读 FSV16」的族。
+    bool discoverable = false;
+    for (const auto & f : kernelFamilies())
+    {
+      if (f.layout.in != Layout::FSV16 || f.layout.inIndex != 0) continue;
+      if (!(f.actMask & (1u << gs.act))) continue;
+      if (f.supports && !f.supports(gs)) continue;
+      discoverable = true;
+      break;
+    }
+    CHECK(discoverable, "R52: a gap signature is discoverable as an fsv16 reader (alloc/mark agree)");
+    // 契约族不得污染候选集：gap 的候选里不能出现 gap_fsv16。
+    bool pollutes = false;
+    for (const auto & c : candidatesFromRegistry(gs))
+      if (c.kernel == "gap_fsv16") pollutes = true;
+    CHECK(!pollutes, "R52: contract family does not leak into the candidate set");
   }
 
   // --- R49: 布局标注的精确最小割求解器（穷举对照）---

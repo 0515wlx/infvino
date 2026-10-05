@@ -244,6 +244,10 @@ private:
     // blocked conv、且 Cout%16==0 时才置位（见 planBlockedLayout）。同一 size 的
     // 元素数不变，因此不影响内存池分配。
     bool                 fsv16{false};
+    // R52: 该张量底层缓冲实际分配的元素数（pool arena/sub-buffer 或独立分配）。
+    // fsv16 需要 ceil(C/16)*16*H*W 个元素；cap_elems 用于「池/布局一致性探针」
+    // （INFVINO_POOL_ALIAS_PROBE）验证「被标记 fsv16 的张量缓冲确实放得下补齐布局」。
+    int64_t              cap_elems{0};
     int64_t              numel() const
     {
       int64_t n = 1;
@@ -265,6 +269,21 @@ private:
    *  把「生产者是 blocked conv 且所有消费者也是 blocked conv」的激活张量标记为
    *  fsv16，使 blocked 链内零 reorder。`INFVINO_NO_BLOCK_LAYOUT=1` 关闭。 */
   void    planBlockedLayout();
+  /**
+   * @brief R52 诊断/守卫：池 + 布局一致性探针。
+   *
+   * 遍历所有被标记 `fsv16` 的张量，验证：
+   *   1. 其底层缓冲容量 (`cap_elems`) ≥ `ceil(C/16)*16*H*W`（放得下补齐布局）；
+   *   2. 其生产者当前选中的 kernel 确实声明 `canOutFsv16`（否则「标记 fsv16 但
+   *      生产者写 NCHW」会在整网静默产生错误激活）。
+   *
+   * `INFVINO_POOL_ALIAS_PROBE=1` 时打印所有违例；违例数量 >0 返回 false。
+   * 作为硬守卫：`resolveLayoutChoices` 在落地布局后会调用它，任何违例都说明
+   * 分配补齐集合（`mayBeFsv16`）与布局标记判据发生了漂移。
+   */
+  bool    poolAliasProbe(const char * where, bool verbose = false) const;
+  /** @brief R52 硬守卫：张量的底层缓冲是否放得下 b_fs_yx_fsv16 补齐布局。 */
+  bool    mayMarkFsv16(const std::string & name) const;
   /**
    * @brief R38: 联合 (族, 布局) 选择不动点。
    *

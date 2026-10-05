@@ -754,6 +754,24 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.ceiling = [](const OpSignature & s, const ClDeviceInfo & d) { return expectedOps(s, d); };
       v.push_back(std::move(f));
     }
+    {
+      // R51 D4+ / R52：`gap` 的 fsv16 输入布局契约（**无候选**，仅让布局规划器把它当作
+      // 「可读 fsv16 的消费者」）。实际 kernel 由 run() 在输入 fsv16 时加
+      // `-DGAP_IN_FSV16=1` 编译。这是「SE value 生产者直写 fsv16」联动的关键：
+      // SE 的 value 同时被 gap 与 conv1x1 消费，gap 若只吃 NCHW 就会把 value 钉死 NCHW。
+      // R52：`supports` 必须是**真实的 op 判据**（而非恒 false）——`opCanReadFsv16`
+      // （分配补齐集合 mayBeFsv16）按 supports 过滤；恒 false 会让补齐集合漏掉 gap 的
+      // 输入，而 planBlockedLayout 仍按 nodeFamily 把它标成 fsv16 → 缓冲越界（R51 §5.1）。
+      KernelFamily f;
+      f.name = "gap_fsv16";
+      f.op = "gap";
+      f.source = "ops";
+      f.layout = {Layout::FSV16, Layout::NCHW, false, false};
+      f.layout.inIndex = 0;
+      f.bottleneck = Bottleneck::Memory;
+      f.supports = [](const OpSignature & s) { return s.op == "gap"; };   // 布局契约族（无候选）
+      v.push_back(std::move(f));
+    }
     // 激活码契约（规范码，全族统一）：conv3x3 只实现 {0,1,3}；depthwise {0..4}；其余 {0..5}。
     for (auto & f : v) f.actMask = (f.op == "conv3x3") ? 0xB : (f.op == "depthwise" ? 0x1F : 0x3F);
     // R43: 硬上限（只放 ISA 指令发射配额 / roofline 下界，不含 amort/gridFactor/延迟等

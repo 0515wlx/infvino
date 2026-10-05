@@ -249,3 +249,20 @@
 - **修正**：首版按 `dims[size-3]` 补齐导致 rank-3 张量 16× 膨胀（y11 +1.2%）；改为
   只补 4-D conv 张量 + 只补「可能被标记 fsv16」的能力集合。
 
+---
+
+## 10. 进展（R52：D4+/D5 的图级 bug 定位与修复）
+
+见 [`round52-planner-graph-bug-and-gap-fsv16.md`](round52-planner-graph-bug-and-gap-fsv16.md)：
+
+- **定位 R51 §5.1 的图级 correctness bug**：`gap_fsv16` 的 `supports` 恒 false 使
+  **分配补齐集合**漏掉含 gap 消费者的 value，而布局**标记**仍把它标成 fsv16 →
+  缓冲未按 `ceil(C/16)*16` 分配 → `b_fs_yx_fsv16` 越界写、整网数值错乱。
+  用**池/布局一致性探针**（`INFVINO_POOL_ALIAS_PROBE`）定位。
+- **修复**：契约族 `supports` 改为真实 op 判据（无候选用 `candidates=nullptr`，与
+  supports 解耦）；新增硬守卫 `mayMarkFsv16` + 探针 `poolAliasProbe`（容量 + 生产者直写
+  能力双重校验）。
+- **D5 收益确认（此前被 bug 掩盖）**：mb `INFVINO_FUSE_SCALE` 默认 **−2.9%（7/8）**、
+  mincut **−6.9%（8/8）**；`mincut+D5` `model_check` 由 0.507 FAIL → **1.203e-2 PASS**。
+  三模型全 PASS、y8/y11 逐位不变；`config/tuning.json` 未改动（D5 仍 opt-in）。
+
