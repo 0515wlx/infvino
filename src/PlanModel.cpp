@@ -4108,9 +4108,16 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     const double concurrent = std::min(totalThreads, kSatThreads);
     return concurrent * perWg;
   };
-  auto spillMs = [&]() -> double {
+  // R47 step4: 占用感知的**有效 L3 容量**（footprint 实测，§9.1）：驻留足迹 ≈1MB 即达
+  // ~21GB/s 平台，之后断崖（组相联/流式占位放大有效占用）。把 LRU 容量按节点占用缩放：
+  // 占用越大，留给「其他张量复用」的有效容量越小。以 footprint 平台 1MB 为容量锚点。
+  constexpr double kL3Resident1Mb = 1.0e6;
+  auto effCapacity = [&](double press) -> double {
+    return std::max(kL3Resident1Mb, kL3 - 0.5 * press);
+  };
+  auto spillBytes = [&]() -> double {
     std::vector<std::pair<std::string, double>> res;   // MRU 在尾部
-    double resBytes = 0.0, miss = 0.0;
+    double resBytes = 0.0, miss = 0.0, currentCap = kL3;
     auto touch = [&](const std::string & name, double bytes, bool write) {
       for (size_t k = 0; k < res.size(); ++k)
         if (res[k].first == name)
@@ -4123,16 +4130,21 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       if (!write) miss += bytes;
       res.push_back({name, bytes});
       resBytes += bytes;
-      while (resBytes > kL3 && !res.empty()) { resBytes -= res.front().second; res.erase(res.begin()); }
+      while (resBytes > currentCap && !res.empty())
+      {
+        resBytes -= res.front().second;
+        res.erase(res.begin());
+      }
     };
     for (size_t i = 0; i < nodes_.size(); ++i)
     {
       bool ok = false;
       const OpSignature s = nodeSignature(nodes_[i], &ok);
       const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
-      // 占用压力：先冲刷 LRU，给本节点在飞工作集腾地方（跨算子耦合在此体现）。
+      // 占用压力：按占用算有效容量并冲刷 LRU（跨算子耦合在此体现）。
       const double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
-      while (resBytes + press > kL3 && !res.empty())
+      currentCap = effCapacity(press);
+      while (resBytes > currentCap && !res.empty())
       {
         resBytes -= res.front().second;
         res.erase(res.begin());
@@ -4151,8 +4163,9 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         if (it != T_.end()) touch(n.outs[0], static_cast<double>(it->second.numel()) * 2.0, true);
       }
     }
-    return miss * kSpillPerByteMs;
+    return miss;
   };
+  auto spillMs = [&]() -> double { return spillBytes() * kSpillPerByteMs; };
 
   // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的
   // reorder 成本 + R47 step2 的 L3 溢出估计。对应 TVM meta_schedule 的「Σ weight × 单算子 ms」，
