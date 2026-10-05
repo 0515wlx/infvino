@@ -3894,6 +3894,10 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   if (rounds < 1) rounds = 1;
   const int reps = (iters > 0) ? iters : 3;   // 每个 assignment 的整网测量次数（取 min busy）
   const double kMinGain = 0.01;               // R45 P2#8: 噪声地板 1%（noise_check 典型 ~1.5%）
+  // R47 S2: 布局契约门 —— 候选的**可加目标预测净**（含 reorder）不得比现状预测更差超过此值。
+  // 只用于**拒绝**：防止「预测净变差、但端到端被噪声抬成改善」的候选被接受（R46 的
+  // depthwise_v→blk 即此类：多付 reorder 却过了 1% 门）。不改变「预测更好才考虑」的候选集。
+  const double kPredTol = 0.01;
 
   auto opWanted = [&](const std::string & op) {
     // R45：所有 autotune 处理的族在 run() 里都已统一走 choiceEntry（per-node 覆盖），
@@ -4058,21 +4062,48 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     double net = 0.0;
     for (size_t ni = 0; ni < nodes_.size(); ++ni)
     {
-      const TuningEntry & e = asg[ni];
-      if (!e.kernel.empty()) net += e.ms;
-      if (e.kernel.find("_blk") == std::string::npos) continue;
+      // R47 fix: asg 只填 target 节点；非 target 节点必须按 choiceEntry 解析其**实际选择**，
+      // 否则「整网代理」只统计到被调优的少数节点（reorder 占比也会误算成 0）。
+      bool ok = false;
+      const OpSignature s = nodeSignature(nodes_[ni], &ok);
+      const TuningEntry * e = ok ? choiceEntry(ni, s) : nullptr;
+      if (!e && ni < asg.size() && !asg[ni].kernel.empty()) e = &asg[ni];
+      if (!e) continue;
+      if (!e->kernel.empty()) net += e->ms;
+      if (e->kernel.find("_blk") == std::string::npos) continue;
       const Node & n = nodes_[ni];
       const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
       if (n.ins.size() <= inIdx) continue;
       auto xit = T_.find(n.ins[inIdx]);
       if (xit == T_.end() || xit->second.fsv16) continue;
-      bool ok2 = false;
-      const OpSignature s = nodeSignature(n, &ok2);
-      if (!ok2) continue;
+      if (!ok) continue;
       if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
         net += r->ms;
     }
     return net;
+  };
+  // R47 S3: 只算可加目标里的 **reorder 分量**（供 chain move 门控：reorder 占比小的模型跳过）。
+  auto predReorder = [&](const std::vector<TuningEntry> & asg) -> double {
+    node_choice_ = asg;
+    planBlockedLayout();
+    double r = 0.0;
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      bool ok = false;
+      const OpSignature s = nodeSignature(nodes_[ni], &ok);
+      if (!ok) continue;
+      const TuningEntry * e = choiceEntry(ni, s);
+      if (!e && ni < asg.size() && !asg[ni].kernel.empty()) e = &asg[ni];
+      if (!e || e->kernel.find("_blk") == std::string::npos) continue;
+      const Node & n = nodes_[ni];
+      const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
+      if (n.ins.size() <= inIdx) continue;
+      auto xit = T_.find(n.ins[inIdx]);
+      if (xit == T_.end() || xit->second.fsv16) continue;
+      if (const TuningEntry * rr = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
+        r += rr->ms;
+    }
+    return r;
   };
 
   // R47 §3-P0: **布局耦合连通分量**。共享「可能被重排的输入张量」、或「blk 生产者→消费者」
@@ -4176,6 +4207,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       NetStat bestStat = measureAssign(baseAssign, reps);
       if (!bestStat.ok) continue;
       const double baseMed = bestStat.med;
+      const double basePred = predictNet(baseAssign);   // R47 S2: 布局契约门基线
       if (bestStat.spread > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
         std::fprintf(stderr, "[global-retune] WARN %s base noisy (spread %.0f%%)\n",
                      t.cs.sig.str().c_str(), bestStat.spread * 100.0);
@@ -4185,6 +4217,18 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         if (c.kernel == bestE.kernel && c.options == bestE.options) continue;
         std::vector<TuningEntry> candAssign = baseAssign;
         for (size_t ni : t.nodes) candAssign[ni] = c;
+        // R47 S2: 布局契约门 —— 预测净（含 reorder）明显变差的候选直接拒绝，不做端到端测量。
+        // 这堵住「多付 reorder、全靠噪声过关」的净负 blk（如 depthwise_v→blk）。
+        const double candPred = predictNet(candAssign);
+        if (candPred > basePred * (1.0 + kPredTol))
+        {
+          if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+            std::fprintf(stderr,
+                         "[global-retune] gate %s candidate %s pred %.4f > base %.4f (+%.1f%%)\n",
+                         t.cs.sig.str().c_str(), c.kernel.c_str(), candPred, basePred,
+                         basePred > 0.0 ? (candPred - basePred) / basePred * 100.0 : 0.0);
+          continue;
+        }
         NetStat bs, cs;
         measurePair(baseAssign, candAssign, reps, &bs, &cs);   // R47: 交错，抵消热漂移
         if (!cs.ok) continue;
@@ -4215,54 +4259,121 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     if (budgetHit || changed == 0) break;
   }
 
-  // R47 §3-P0: **布局耦合分组 move** —— 对每个耦合连通分量，用可加目标在分量内联合重优化
-  // （每个 target 在分量上下文里选使 predictNet 最小的候选），把整分量的 joint assignment
-  // 作为**一个 move** 端到端回验一次。解决 R46 §4.1：逐 op 独立选的 blk 组合在一起可能更差
-  // （跨 op reorder）。blocked chain 未落地前，这里只在「现有 blk/non 耦合」上分组。
+  // R47 S3: **决策级 chain move** —— 对每个布局耦合连通分量，显式尝试
+  //   (a) 逐节点贪心最优、(b) 整链一起切 blk、(c) 整链一起切 non
+  // 三种**整分量联合赋值**，各作为一个 move 端到端回验（先过 S2 契约门），取 median 最优者。
+  // 这是「blocked chain 的决策级近似」：不改 kernel/数据流，只把「全链是否一起进 blocked
+  // 布局」当成一个联合决定——命中「整链一起切 blk → reorder=0」的联合最优，而逐节点坐标下降
+  // 做不到（反协同）。门控：预测 reorder 占比 < kChainReorderShare 的模型跳过（如 yolo）。
   if (groupedOn)
   {
-    std::unordered_map<int, std::vector<size_t>> compTargets;
-    for (size_t ti = 0; ti < targets.size(); ++ti)
-      if (!targets[ti].nodes.empty()) compTargets[comp[targets[ti].nodes[0]]].push_back(ti);
-    for (auto & kv : compTargets)
+    const double kChainReorderShare = 0.02;
+    const double baseNetPred = predictNet(baseline);
+    const double reorderShare = baseNetPred > 0.0 ? predReorder(baseline) / baseNetPred : 0.0;
+    if (reorderShare < kChainReorderShare)
     {
-      if (kv.second.size() < 2) continue;   // 非耦合分量无需分组（逐节点已最优）
-      if (budget > 0 && evals >= budget) { budgetHit = true; break; }
-      std::vector<TuningEntry> baseAssign = assign;
-      std::vector<TuningEntry> joint = assign;
-      std::vector<size_t> order = kv.second;
-      std::stable_sort(order.begin(), order.end(),
-                       [&](size_t a, size_t b) { return tmeta[a].headroom > tmeta[b].headroom; });
-      bool anyChange = false;
-      for (size_t ti : order)
-      {
+      if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+        std::fprintf(stderr,
+                     "[global-retune] chain moves skipped (reorder share %.1f%% < %.1f%%)\n",
+                     reorderShare * 100.0, kChainReorderShare * 100.0);
+    }
+    else
+    {
+      std::unordered_map<int, std::vector<size_t>> compTargets;
+      for (size_t ti = 0; ti < targets.size(); ++ti)
+        if (!targets[ti].nodes.empty()) compTargets[comp[targets[ti].nodes[0]]].push_back(ti);
+      // 按族选候选：mode 1=仅 blk、2=仅 non。**按 kernel ms 选**（不看 reorder）——reorder 是
+      // 整链的联合属性，必须在整链赋值上评估；逐节点用 predictNet 会被 reorder 卡住而无法翻转
+      // （顺序贪心陷阱，正是 chain move 要解决的）。
+      auto pickFamily = [&](size_t ti, int mode) -> TuningEntry {
         auto & t = targets[ti];
-        const TuningEntry cur = joint[t.nodes[0]];
-        double bestPred = predictNet(joint);
-        TuningEntry bestE = cur;
+        TuningEntry bestE = assign[t.nodes[0]];
+        double bestMs = 1e300;
+        bool found = false;
         for (const auto & c : t.cs.cands)
         {
-          std::vector<TuningEntry> tmp = joint;
-          for (size_t ni : t.nodes) tmp[ni] = c;
-          const double p = predictNet(tmp);
-          if (p < bestPred * (1.0 - kMinGain)) { bestPred = p; bestE = c; }
+          const bool isBlk = c.kernel.find("_blk") != std::string::npos;
+          if (mode == 1 && !isBlk) continue;
+          if (mode == 2 && isBlk) continue;
+          if (c.ms < bestMs) { bestMs = c.ms; bestE = c; found = true; }
         }
-        if (bestE.kernel != cur.kernel || bestE.options != cur.options) anyChange = true;
-        for (size_t ni : t.nodes) joint[ni] = bestE;
-      }
-      if (!anyChange) continue;
-      NetStat bs, js;
-      measurePair(baseAssign, joint, reps, &bs, &js);
-      if (js.ok && bs.ok && js.med < bs.med * (1.0 - kMinGain))
+        return found ? bestE : assign[t.nodes[0]];
+      };
+      if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
       {
-        assign = joint;
-        for (size_t ti : kv.second) won[ti] = 1;
-        if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
-          std::fprintf(stderr,
-                       "[global-retune] grouped move (comp=%d, %zu targets): med %.4f -> %.4f ms "
-                       "(%.1f%%)\n",
-                       kv.first, kv.second.size(), bs.med, js.med,
-                       bs.med > 0.0 ? (bs.med - js.med) / bs.med * 100.0 : 0.0);
+        int coupled = 0;
+        for (auto & kv : compTargets) if (kv.second.size() >= 2) ++coupled;
+        std::fprintf(stderr, "[global-retune] chain-diag: %zu component(s) hold targets, %d coupled\n",
+                     compTargets.size(), coupled);
+      }
+      for (auto & kv : compTargets)
+      {
+        if (kv.second.size() < 2) continue;   // 非耦合分量无需分组（逐节点已最优）
+        if (budget > 0 && evals >= budget) { budgetHit = true; break; }
+        std::vector<TuningEntry> baseAssign = assign;
+        std::vector<size_t> order = kv.second;
+        std::stable_sort(order.begin(), order.end(),
+                         [&](size_t a, size_t b) { return tmeta[a].headroom > tmeta[b].headroom; });
+        std::vector<std::vector<TuningEntry>> candJoints;
+        for (int mode = 1; mode <= 2; ++mode)   // 1=整链切 blk, 2=整链切 non
+        {
+          std::vector<TuningEntry> j = assign;
+          bool changed = false;
+          for (size_t ti : order)
+          {
+            const TuningEntry cur = j[targets[ti].nodes[0]];
+            const TuningEntry e = pickFamily(ti, mode);
+            if (e.kernel != cur.kernel || e.options != cur.options) changed = true;
+            for (size_t ni : targets[ti].nodes) j[ni] = e;
+          }
+          if (!changed) continue;
+          if (predictNet(j) > baseNetPred * (1.0 + kPredTol)) continue;   // S2 契约门
+          bool dup = false;   // 去重（整链 blk 与整链 non 可能得到同一赋值）
+          for (auto & pv : candJoints)
+          {
+            bool same = true;
+            for (size_t ti : order)
+              for (size_t ni : targets[ti].nodes)
+                if (pv[ni].kernel != j[ni].kernel || pv[ni].options != j[ni].options)
+                {
+                  same = false;
+                  break;
+                }
+            if (same) { dup = true; break; }
+          }
+          if (!dup) candJoints.push_back(std::move(j));
+        }
+        if (candJoints.empty())
+        {
+          if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+            std::fprintf(stderr,
+                         "[global-retune] chain-diag: comp=%d %zu targets -> no joint candidate "
+                         "(no-change or contract-gated)\n",
+                         kv.first, kv.second.size());
+          continue;
+        }
+        double bestMed = 1e300;
+        NetStat bestBs;
+        std::vector<TuningEntry> bestJoint;
+        bool haveBest = false;
+        for (auto & j : candJoints)
+        {
+          NetStat bs, js;
+          measurePair(baseAssign, j, reps, &bs, &js);
+          if (!js.ok || !bs.ok) continue;
+          if (js.med < bestMed) { bestMed = js.med; bestBs = bs; bestJoint = j; haveBest = true; }
+        }
+        if (haveBest && bestMed < bestBs.med * (1.0 - kMinGain))
+        {
+          assign = bestJoint;
+          for (size_t ti : kv.second) won[ti] = 1;
+          if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+            std::fprintf(stderr,
+                         "[global-retune] chain move (comp=%d, %zu targets): med %.4f -> %.4f ms "
+                         "(%.1f%%)\n",
+                         kv.first, kv.second.size(), bestBs.med, bestMed,
+                         bestBs.med > 0.0 ? (bestBs.med - bestMed) / bestBs.med * 100.0 : 0.0);
+        }
       }
     }
   }
