@@ -51,6 +51,7 @@ int main(int argc, char ** argv)
 {
   std::string op = "gemm", kernel_dir = INFVINO_KERNEL_DIR;
   std::string in_a, in_b, dump, in_x, in_w, in_bias;
+  std::string in_scale;
   std::string knl, opts;
   int M = 0, N = 0, K = 0, iters = 1;
   int Cin = 0, Cout = 0, H = 0, W = 0, stride = -1, pad = -1;
@@ -88,6 +89,7 @@ int main(int argc, char ** argv)
     else if (a == "--input-x") in_x = next();
     else if (a == "--input-w") in_w = next();
     else if (a == "--input-bias") in_bias = next();
+    else if (a == "--input-scale") in_scale = next();
     else if (a == "--dump") dump = next();
     else if (a == "--tiles") tiles = infvino::parseTiles(next());
     else if (a == "--conv") conv = infvino::parseConv(next());
@@ -390,6 +392,124 @@ int main(int argc, char ** argv)
                      dump.c_str(), outer, axdim, inner);
       }
       clReleaseMemObject(dX); clReleaseMemObject(dY); clReleaseKernel(k);
+    } else if (op == "gap") {
+      // R51 D4+ unit test: NCHW [C,H,W] -> reorder to b_fs_yx_fsv16 -> gap_r -DGAP_IN_FSV16=1,
+      // dump [C]. Python reference = mean over H,W (NCHW).
+      if (Cin <= 0 || H <= 0 || W <= 0) throw std::runtime_error("need --cin --h --w");
+      const int HW = H * W;
+      const int Cpad = (Cin + 15) / 16 * 16;
+      auto hX = readBin(in_x, static_cast<size_t>(Cin) * H * W);
+
+      cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * H * W * 2, CL_MEM_READ_ONLY);
+      cl_mem dF = rt.alloc(static_cast<size_t>(Cpad) * H * W * 2, CL_MEM_READ_WRITE);
+      rt.write(dX, static_cast<size_t>(Cin) * H * W * 2, hX.data());
+      std::vector<uint16_t> zeros(static_cast<size_t>(Cpad) * H * W, 0);
+      rt.write(dF, zeros.size() * 2, zeros.data());
+      cl_kernel kr = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+      clSetKernelArg(kr, 0, sizeof(dX), &dX);
+      clSetKernelArg(kr, 1, sizeof(dF), &dF);
+      clSetKernelArg(kr, 2, sizeof(Cin), &Cin);
+      clSetKernelArg(kr, 3, sizeof(H), &H);
+      clSetKernelArg(kr, 4, sizeof(W), &W);
+      const size_t rg[3] = {(size_t)W, (size_t)H, (size_t)Cin};
+      infvino::ClRuntime::enqueueND(rt.queue(), kr, 3, rg, nullptr);
+
+      const std::string kern = knl.empty() ? "gap_r" : knl;
+      const std::string o = opts.empty() ? "-DGAP_WGS=128 -DGAP_IN_FSV16=1" : opts;
+      cl_kernel k = rt.buildKernel("ops", kern, o);
+      cl_mem dY = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_WRITE_ONLY);
+      clSetKernelArg(k, 0, sizeof(dF), &dF);
+      clSetKernelArg(k, 1, sizeof(dY), &dY);
+      clSetKernelArg(k, 2, sizeof(Cin), &Cin);
+      clSetKernelArg(k, 3, sizeof(HW), &HW);
+      const size_t lws[1] = {128};
+      const size_t gws[1] = {static_cast<size_t>(Cin) * 128};
+      for (int i = 0; i < iters; ++i)
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws);
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hY(static_cast<size_t>(Cin));
+        rt.read(dY, static_cast<size_t>(Cin) * 2, hY.data());
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (gap_fsv16 C=%d fp16)\n", dump.c_str(), Cin);
+      }
+      clReleaseMemObject(dX); clReleaseMemObject(dF); clReleaseMemObject(dY);
+      clReleaseKernel(kr); clReleaseKernel(k);
+    } else if (op == "conv1x1blk") {
+      // R51 D5 unit test: conv1x1_blk with -DMUL_SCALE=1, fsv16 input.
+      //   y[o,h,w] = sum_c W[o,c] * ( X[c,h,w] * scale[c] ) + bias[o]
+      if (Cin <= 0 || Cout <= 0 || H <= 0 || W <= 0)
+        throw std::runtime_error("need --cin --cout --h --w");
+      auto hW = readBin(in_w, static_cast<size_t>(Cout) * Cin);
+      auto hX = readBin(in_x, static_cast<size_t>(Cin) * H * W);
+      auto hS = readBin(in_scale, static_cast<size_t>(Cin));
+      std::vector<uint16_t> hB;
+      if (!in_bias.empty()) hB = readBin(in_bias, static_cast<size_t>(Cout));
+      const int icb = (Cin + 15) / 16, ocb = (Cout + 15) / 16;
+      // os_is_yx_isv16_osv16 repack.
+      std::vector<uint16_t> hWo(static_cast<size_t>(ocb) * icb * 16 * 16, 0);
+      for (int o = 0; o < Cout; ++o)
+        for (int i = 0; i < Cin; ++i)
+          hWo[((((size_t)(o / 16) * icb + (i / 16)) * 16) + (i % 16)) * 16 + (o % 16)] =
+              hW[static_cast<size_t>(o) * Cin + i];
+      // reorder X -> fsv16.
+      const int Cpad = (Cin + 15) / 16 * 16;
+      cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * H * W * 2, CL_MEM_READ_ONLY);
+      cl_mem dF = rt.alloc(static_cast<size_t>(Cpad) * H * W * 2, CL_MEM_READ_WRITE);
+      rt.write(dX, static_cast<size_t>(Cin) * H * W * 2, hX.data());
+      std::vector<uint16_t> zeros(static_cast<size_t>(Cpad) * H * W, 0);
+      rt.write(dF, zeros.size() * 2, zeros.data());
+      cl_kernel kr = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+      clSetKernelArg(kr, 0, sizeof(dX), &dX);
+      clSetKernelArg(kr, 1, sizeof(dF), &dF);
+      clSetKernelArg(kr, 2, sizeof(Cin), &Cin);
+      clSetKernelArg(kr, 3, sizeof(H), &H);
+      clSetKernelArg(kr, 4, sizeof(W), &W);
+      const size_t rg[3] = {(size_t)W, (size_t)H, (size_t)Cin};
+      infvino::ClRuntime::enqueueND(rt.queue(), kr, 3, rg, nullptr);
+      clReleaseKernel(kr);
+      // weights / bias / scale.
+      cl_mem dWo = rt.alloc(hWo.size() * 2, CL_MEM_READ_ONLY);
+      rt.write(dWo, hWo.size() * 2, hWo.data());
+      cl_mem dS = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_READ_ONLY);
+      rt.write(dS, static_cast<size_t>(Cin) * 2, hS.data());
+      cl_mem dB = nullptr;
+      if (!hB.empty()) { dB = rt.alloc(static_cast<size_t>(Cout) * 2, CL_MEM_READ_ONLY);
+                         rt.write(dB, static_cast<size_t>(Cout) * 2, hB.data()); }
+      cl_mem dRes = nullptr;
+      cl_mem dY = rt.alloc(static_cast<size_t>(Cout) * H * W * 2, CL_MEM_WRITE_ONLY);
+      const int XB = 4, YB = 1, SLM = 1;
+      const std::string o = "-DX_BLOCK=4 -DY_BLOCK=1 -DSLM_DIV=1 -DACT=0 -DMUL_SCALE=1 -DSG=16 "
+                            "-cl-mad-enable -cl-fast-relaxed-math";
+      cl_kernel k = rt.buildKernel("conv1x1_blk", "conv1x1_blk", o);
+      clSetKernelArg(k, 0, sizeof(dF), &dF);
+      clSetKernelArg(k, 1, sizeof(dWo), &dWo);
+      clSetKernelArg(k, 2, sizeof(dB), &dB);
+      clSetKernelArg(k, 3, sizeof(dY), &dY);
+      clSetKernelArg(k, 4, sizeof(dRes), &dRes);
+      clSetKernelArg(k, 5, sizeof(Cin), &Cin);
+      clSetKernelArg(k, 6, sizeof(H), &H);
+      clSetKernelArg(k, 7, sizeof(W), &W);
+      clSetKernelArg(k, 8, sizeof(Cout), &Cout);
+      clSetKernelArg(k, 9, sizeof(dS), &dS);
+      const size_t lws[3] = {1, static_cast<size_t>(16 * SLM), 1};
+      const size_t ybCount = static_cast<size_t>((H + YB - 1) / YB);
+      const size_t gws[3] = {static_cast<size_t>(((W + XB - 1) / XB)) * ybCount,
+                             static_cast<size_t>(((Cout + 15) / 16) * lws[1]), 1};
+      for (int i = 0; i < iters; ++i)
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hY(static_cast<size_t>(Cout) * H * W);
+        rt.read(dY, hY.size() * 2, hY.data());
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (conv1x1blk %dx%dx%d fp16)\n",
+                     dump.c_str(), Cout, H, W);
+      }
+      clReleaseMemObject(dX); clReleaseMemObject(dF); clReleaseMemObject(dWo);
+      clReleaseMemObject(dS); clReleaseMemObject(dY);
+      if (dB) clReleaseMemObject(dB);
+      clReleaseKernel(k);
     } else if (op == "depthwise") {
       if (Cin <= 0 || H <= 0 || W <= 0) throw std::runtime_error("need --cin --h --w");
       int S = stride >= 0 ? stride : 1, P = pad >= 0 ? pad : 1;

@@ -1606,13 +1606,6 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     std::fprintf(stderr, "[layout] mincut: %zu nodes, %zu vars, %d fsv16, E=%.4f\n",
                  nodes.size(), varName.size(), nfsv, sol.energy);
     if (std::getenv("INFVINO_LAYOUT_DEBUG"))
-    {
-      for (size_t v = 0; v < varName.size(); ++v)
-        if (sol.labels[v] == 1)
-          std::fprintf(stderr, "  [mincut-fsv16] %s\n", varName[v].c_str());
-      for (auto & kv : T_)
-        if (kv.second.fsv16 && var.find(kv.first) == var.end())
-          std::fprintf(stderr, "  [mincut-fsv16-nonvar] %s\n", kv.first.c_str());
       for (size_t ni : nodes)
       {
         const OpSignature s = nodeSignature(nodes_[ni], nullptr);
@@ -1621,7 +1614,6 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
                      node_choice_[ni].kernel.c_str());
         std::fprintf(stderr, "           sig=%s\n", s.str().c_str());
       }
-    }
   }
   return true;
 }

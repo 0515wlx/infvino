@@ -176,12 +176,22 @@ __kernel void permute_0213(__global const half *restrict x, __global half *restr
 }
 
 // ---- global average pool over spatial: [C,H,W] -> [C] ----
+// R51 D4+ (unit-tested): GAP_IN_FSV16=1 reads the input in b_fs_yx_fsv16
+// ([C/16][H][W][16]); output [C] stays NCHW.
+#ifndef GAP_IN_FSV16
+#define GAP_IN_FSV16 0
+#endif
 __kernel void gap(__global const half *restrict x, __global half *restrict y,
                   const int C, const int HW) {
   const int c = get_global_id(0);
   if (c >= C) return;
   float s = 0.0f;
-  for (int i = 0; i < HW; ++i) s += (float)x[c * HW + i];
+  for (int i = 0; i < HW; ++i)
+#if GAP_IN_FSV16
+    s += (float)x[(((size_t)(c / 16) * HW + i) * 16) + (c % 16)];
+#else
+    s += (float)x[c * HW + i];
+#endif
   y[c] = (half)(s / (float)HW);
 }
 
@@ -199,7 +209,12 @@ __kernel void gap_r(__global const half *restrict x, __global half *restrict y,
   if (c >= C) return;
   __local float s[GAP_WGS];
   float acc = 0.0f;
-  for (int i = lid; i < HW; i += GAP_WGS) acc += (float)x[c * HW + i];
+  for (int i = lid; i < HW; i += GAP_WGS)
+#if GAP_IN_FSV16
+    acc += (float)x[(((size_t)(c / 16) * HW + i) * 16) + (c % 16)];
+#else
+    acc += (float)x[c * HW + i];
+#endif
   s[lid] = acc;
   barrier(CLK_LOCAL_MEM_FENCE);
   for (int off = GAP_WGS / 2; off > 0; off >>= 1) {

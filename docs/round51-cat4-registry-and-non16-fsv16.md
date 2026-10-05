@@ -237,17 +237,34 @@ fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
 
 **随后发现 correctness bug**：`INFVINO_LAYOUT_MINCUT=1 INFVINO_FUSE_SCALE=1` 的
 `model_check` **FAIL（mean_rel 0.507）**；用 `INFVINO_NO_GAP_FSV16` 隔离后 PASS。
-进一步发现**旧缓存 + 默认路径 + 融合**也 FAIL。即 **`GAP_IN_FSV16`（gap 直读 fsv16）
-与布局规划的组合会产生错误的激活读取**，根因本轮**未定位**（gap/生产者/消费者三方的
-fsv16 记法在纸上一致，但实测错；怀疑某条链上「标记 fsv16 但生产者实际写 NCHW」）。
+进一步发现**旧缓存 + 默认路径 + 融合**也 FAIL。即 **`gap` 直读 fsv16 与布局规划的组合
+会产生错误的激活读取**。
+
+**单元级定位（本轮）**：给 `kernel_numtest` 加了两个用例，逐元素对照 numpy：
+- `--op gap`（NCHW→reorder 成 fsv16→`gap_r -DGAP_IN_FSV16=1`）：C∈{16,96,120,144,240,576}
+  **全部 PASS**（max_abs ~2.4e-4）。
+- `--op conv1x1blk`（fsv16 输入 + `-DMUL_SCALE=1`，osv16 权重 + scale）：4 组形状含
+  Cin=120/576 **全部 PASS**。
+
+期间发现并修复 `conv1x1_blk` 的**真实 kernel bug**：`MUL_SCALE` 在 **packed `BLOCK_READ`
+路径**下，lane 并不等于「自己的通道」（是 16×8 的 OV tile），直接乘 `Scale[gc]` 会乘错通道。
+修复：`-DMUL_SCALE=1` 时强制走**标量逐通道载入**（`input[base + i*FS + sglid]`），使
+lane 的 `src` 确为通道 `gc`。
+
+**但整网组合仍 FAIL**（两个 kernel 各自正确 → 问题在**图级**：某条
+`depthwise_blk(OUT_FSV16) → gap(直读 fsv16) + fused conv(直读 fsv16)` 链上仍有一致性缺口，
+本轮**未定位**）。
 
 **决策（安全优先）**：
-- **回退 `gap_fsv16`**（ops.cl 的 `GAP_IN_FSV16`、`gap_fsv16` 族、planner/dispatch 接线）。
+- **回退 `gap_fsv16` 的 planner/dispatch 接线**（`gap_fsv16` 族、nodeFamily、mincut、
+  run() 宏）；**保留** `ops.cl` 的 `GAP_IN_FSV16`（供单元测试）与两个 kernel_numtest 用例，
+  以及上面的 `conv1x1_blk` packed-read 修复。
 - D5 保持 **opt-in**；回退后 mb 四种组合（默认/mincut × 融合开/关）**全部 PASS 且逐位相同**
   （默认 1.069e-2、mincut 1.215e-2）。
 - **`config/tuning.json` 未改动**（缓存烘焙一并回退）。
-- **D4+ 的 kernel 侧（MUL_SCALE）本身正确**；未落地的是「gap 直读 fsv16」这一环。
-  下一步需要**单元级验证 gap 的 fsv16 读**（kernel_numtest/独立用例）后再重启 D4+。
+- **重启 D4+ 的前置**：用单元用例进一步逼近「生产者写 fsv16 → 消费者读」的真实链
+  （例如 depthwise_blk OUT_FSV16 → gap），定位图级缺口。
+
 
 
 

@@ -220,7 +220,16 @@ __kernel void conv1x1_blk(
         }
 #else
         const int base = y * input_y_pitch + input_xoff + k * input_fs_pitch;
-#if FIT_WH
+#if MUL_SCALE
+        // R51 D5 fix: the packed BLOCK_READ lays out a 16x8 tile per sub-group (lane l
+        // does NOT own channel l), so the per-channel scale below would be applied to the
+        // wrong channel. Force the scalar per-channel load so `src` lane == channel gc.
+        _Pragma("unroll")
+        for (int i = 0; i < X_BLOCK; ++i) {
+          const int xx = x0 + i;
+          src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
+        }
+#elif FIT_WH
         // Aligned: one packed block read (lane l gets channel l, columns x0..x0+X-1).
         if (!in_left) src = AS_V(BLOCK_READ((__global const ushort *)input + base));
 #else
