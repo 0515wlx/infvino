@@ -284,6 +284,27 @@ private:
   void    resolveLayoutChoices();
   /** @brief R38: per-node 覆盖（不动点结果），未命中则回退到签名缓存。 */
   const TuningEntry * choiceEntry(size_t ni, const OpSignature & sig) const;
+  /** @brief R38/R49: 一个节点在缓存里的两种布局备选 + 一趟 reorder 成本。*/
+  struct LayoutAlt
+  {
+    TuningEntry blk, non, reorder;
+    bool        has = false;
+  };
+  /**
+   * @brief R49 试点：把布局决策建模成二元标注的**精确最小割**（LayoutSolver）。
+   *
+   * 只对 `op == "conv1x1"` 且缓存含 `#blk/#non/#reorder` 的节点生效（一族试点，
+   * `INFVINO_LAYOUT_MINCUT=1` 开启）。变量 = 相关激活张量的布局（NCHW/FSV16）；
+   * 节点代价表（输入布局 × 输出布局 → ms，含 reorder）分解成 unary + 吸引项；
+   * 网络输入/输出、以及非本族消费者/生产者的张量钉死 NCHW。
+   *
+   * 成功返回 true 并写好 `node_choice_` 与各张量 `fsv16`；任何不适配（非本族 alt、
+   * 表非 submodular、变量为空）都返回 false，调用方回退到既有不动点/启发式。
+   */
+  bool    resolveLayoutMinCut(const std::vector<LayoutAlt> & alt);
+  /** @brief R49: mincut 是否已接管布局（为真时 planBlockedLayout 直接返回，保留标注）。*/
+  bool    mincut_active_ = false;
+
   /** @brief R45 P0#4: per-plan 覆盖的节点键（用节点输出名，保证唯一且跨重生成稳定）。*/
   OpSignature planNodeKey(const std::string & out_name) const;
   /** @brief R36: 该 conv3x3 节点是否会被纳入 blocked 通路（与 dispatch 同判据）。 */

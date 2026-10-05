@@ -45,6 +45,7 @@ add_library(infvino SHARED
   src/Tuning.cpp
   src/Autotuner.cpp
   src/KernelFamilies.cpp
+  src/LayoutSolver.cpp
   src/PlanModel.cpp
   src/ClBackend.cpp
   src/InferenceEngine.cpp

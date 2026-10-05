@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "infvino/Tiles.hpp"
 #include "infvino/Autotuner.hpp"
 #include "infvino/KernelFamily.hpp"
+#include "infvino/LayoutSolver.hpp"
 
 namespace infvino
 {
@@ -935,6 +937,8 @@ bool PlanModel::convWillUseBlk(const Node & n) const
 
 void PlanModel::planBlockedLayout()
 {
+  // R49: mincut 一旦接管布局，本函数不再重新推导（否则会覆盖全局最解）。
+  if (mincut_active_) return;
   // 可重入：先清空所有张量的 fsv16，再依据**当前 tuning_**重新规划（autotune 之后
   // 布局会变；本函数在构造期与 autotune 末尾各调一次）。
   for (auto & kv : T_) kv.second.fsv16 = false;
@@ -1089,8 +1093,7 @@ void PlanModel::resolveLayoutChoices()
   node_choice_.assign(nodes_.size(), {});
   // Only conv3x3 has the blk/non-blk reorder dichotomy today; other families keep the
   // plain signature-cache choice (their conservative billing lives in Autotuner).
-  struct Alt { TuningEntry blk, non, reorder; bool has = false; };
-  std::vector<Alt> alt(nodes_.size());
+  std::vector<LayoutAlt> alt(nodes_.size());
   bool any = false;
   for (size_t ni = 0; ni < nodes_.size(); ++ni)
   {
@@ -1112,6 +1115,11 @@ void PlanModel::resolveLayoutChoices()
     planBlockedLayout();  // R36 behavior
     return;
   }
+
+  // R49 试点：一族（conv1x1）的布局标注改走精确最小割（opt-in，默认关）。
+  // 成功即接管布局并返回；否则回退到既有联合不动点。
+  if (std::getenv("INFVINO_LAYOUT_MINCUT") && resolveLayoutMinCut(alt))
+    return;
 
   const int kIters = 4;
   for (int it = 0; it < kIters; ++it)
@@ -1150,6 +1158,144 @@ void PlanModel::resolveLayoutChoices()
     std::fprintf(stderr, "[layout] joint fixpoint: %d conv3x3 nodes, %d -> blk\n",
                  static_cast<int>(node_choice_.size()), nblk);
   }
+}
+
+bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
+{
+  // ---- 收集本族（conv1x1）节点；非本族的 alt 交给既有不动点，不参与 mincut。----
+  std::vector<size_t> nodes;
+  for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    if (alt[ni].has && nodes_[ni].op == "conv1x1" && !nodes_[ni].outs.empty() &&
+        !nodes_[ni].ins.empty())
+      nodes.push_back(ni);
+  if (nodes.empty()) return false;
+
+  // ---- 变量：本族节点输入/输出张量的布局。pin = 必须 NCHW。----
+  std::unordered_map<std::string, int> var;
+  std::vector<std::string>             varName;
+  auto varId = [&](const std::string & name) {
+    auto it = var.find(name);
+    if (it != var.end()) return it->second;
+    const int id = static_cast<int>(varName.size());
+    var[name] = id;
+    varName.push_back(name);
+    return id;
+  };
+  for (size_t ni : nodes)
+  {
+    varId(nodes_[ni].ins[1]);   // conv1x1 激活在槽 1（槽 0 是权重）
+    varId(nodes_[ni].outs[0]);
+  }
+
+  const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
+  BinaryEnergy en(static_cast<int>(varName.size()));
+
+  // ---- 生产者能力：一张量能否被其生产者**直接产出 FSV16**。----
+  //   0  = 能（D4：ew_binary_ch -DEWCH_OUT_FSV16，或本身就是本族 conv1x1_blk 生产者）
+  //   ∞  = 不能（生产者是 NCHW-only 的族，例如 conv3x3 native/ov、gemm、pool…）
+  //   r  = 需要独立 reorder 一趟（默认）
+  auto producerCap = [&](const std::string & t) -> double {
+    for (size_t i = 0; i < nodes_.size(); ++i)
+    {
+      const Node & p = nodes_[i];
+      for (const auto & o : p.outs)
+        if (o == t)
+        {
+          if (p.op == "conv1x1") return 0.0;   // 本族现有 blk 生产者（OUT_FSV16 由 dispatch 决定）
+          if (p.op == "ew_binary")             // R48 D4：SE Mul 走 ew_binary_ch 可直写
+          {
+            const OpSignature s = smallSig(p);
+            if (s.op == "ew_binary_bcast")
+            {
+              const long nn = s.params.size() > 0 ? s.params[0] : 0;
+              const long Cs = s.params.size() > 3 ? s.params[3] : 0;
+              if (Cs > 0 && Cs < nn && nn % Cs == 0) return 0.0;
+            }
+          }
+          return BinaryEnergy::kInf;           // NCHW-only 生产者
+        }
+    }
+    return BinaryEnergy::kInf;                 // 网络输入等
+  };
+
+  // pin：网络输入/输出必须 NCHW；生产者无法产 FSV16 的张量也 pin NCHW。
+  for (size_t v = 0; v < varName.size(); ++v)
+  {
+    const std::string & t = varName[v];
+    bool pin = out_set.count(t) > 0;
+    if (!std::isfinite(producerCap(t))) pin = true;
+    if (pin) en.fix(static_cast<int>(v), 0);
+  }
+
+  // ---- 代价分解（正确的 min-cut 形式）----
+  //
+  // 变量 v = 张量布局（0=NCHW, 1=FSV16）。代价分两部分：
+  //
+  //  1) **节点私有**：节点走哪个 kernel 只由「输入张量布局」决定——
+  //       输入 NCHW → non（eN.ms）；输入 FSV16 → blk（eB.ms）。
+  //       unary(a, 0) += eN.ms,  unary(a, 1) += eB.ms
+  //     （同一张量被多个消费者共享时，各消费者的 eN/eB 叠加——正确：每个消费者各跑一次。）
+  //
+  //  2) **张量共享**：
+  //       * 生产侧：取 FSV16 的代价 = producerCap(t)（0 / ∞ / r）。
+  //       * 消费侧：取 FSV16 免掉「若它从 NCHW 被 blk 消费者读」的那趟 reorder，
+  //         但这趟 reorder 只有存在 blk 消费者时才会发生——而这对**所有布局组合**都能
+  //         在 unary 里一次性表达：t 取 0 时记一趟 r，取 1 时记 producerCap(t)。
+  for (size_t v = 0; v < varName.size(); ++v)
+  {
+    const std::string & t = varName[v];
+    const double pc = producerCap(t);
+    const double r_of_t = [&] {
+      for (size_t ni : nodes)
+        if (nodes_[ni].ins[1] == t) return alt[ni].reorder.ms;
+      return 0.0;
+    }();
+    // c0 = t 为 NCHW：照付 reorder（若被 blk 消费者读）；c1 = t 为 FSV16：付生产侧代价。
+    en.addUnary(static_cast<int>(v), /*c0=*/r_of_t, /*c1=*/std::isfinite(pc) ? pc : BinaryEnergy::kInf);
+  }
+
+  for (size_t ni : nodes)
+  {
+    const Node & n = nodes_[ni];
+    const int a = varId(n.ins[1]);
+    const TuningEntry & eB = alt[ni].blk;    // FSV16 输入路径
+    const TuningEntry & eN = alt[ni].non;    // NCHW 输入路径
+    en.addUnary(a, /*c0=*/eN.ms, /*c1=*/eB.ms);
+  }
+
+  const BinarySolution sol = solveBinaryMinCut(en);
+  if (!sol.optimal) return false;
+
+  // ---- 落地：写 node_choice_ + 张量 fsv16。----
+  for (size_t v = 0; v < varName.size(); ++v)
+  {
+    auto it = T_.find(varName[v]);
+    if (it != T_.end()) it->second.fsv16 = (sol.labels[v] == 1);
+  }
+  for (size_t ni : nodes)
+  {
+    const int vin = varId(nodes_[ni].ins[1]);
+    const bool useBlk = (sol.labels[static_cast<size_t>(vin)] == 1);
+    node_choice_[ni] = useBlk ? alt[ni].blk : alt[ni].non;
+  }
+  mincut_active_ = true;
+  if (std::getenv("INFVINO_LAYOUT_REPORT"))
+  {
+    int nfsv = 0;
+    for (size_t v = 0; v < varName.size(); ++v) if (sol.labels[v] == 1) ++nfsv;
+    std::fprintf(stderr, "[layout] mincut: %zu conv1x1 nodes, %zu vars, %d fsv16, E=%.4f\n",
+                 nodes.size(), varName.size(), nfsv, sol.energy);
+    if (std::getenv("INFVINO_LAYOUT_DEBUG"))
+      for (size_t ni : nodes)
+      {
+        const OpSignature s = nodeSignature(nodes_[ni], nullptr);
+        std::fprintf(stderr, "  [mincut] %-40s blk=%.4f non=%.4f r=%.4f -> %s (in=%s)\n",
+                     nodes_[ni].outs[0].c_str(), alt[ni].blk.ms, alt[ni].non.ms, alt[ni].reorder.ms,
+                     node_choice_[ni].kernel.c_str(), nodes_[ni].ins[1].c_str());
+        std::fprintf(stderr, "           sig=%s\n", s.str().c_str());
+      }
+  }
+  return true;
 }
 
 void PlanModel::buildKernels()

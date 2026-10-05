@@ -4,14 +4,20 @@
 //
 // 覆盖：签名稳定性、缓存 round-trip、设备键、expected_ops 的单调性/上界。
 // 用法：./tuning_test            （成功返回 0）
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "infvino/Autotuner.hpp"
+#include "infvino/LayoutSolver.hpp"
 #include "infvino/Tuning.hpp"
 
 namespace
@@ -172,6 +178,100 @@ int main()
     CHECK(qok, "R48: per-family quota enforced");
     CHECK(q.size() < full.size(), "R48: per-family quota shrinks the set");
     unsetenv("INFVINO_FAMILY_QUOTA");
+  }
+
+  // --- R49: 布局标注的精确最小割求解器（穷举对照）---
+  {
+    // 一般二元代价表：把 f(x,y) 拆成 unary+吸引项后，解必须是**精确**最优。
+    struct OrigPair { int i, j; double f[2][2]; };
+    auto evalOrig = [](int n, const std::vector<std::array<double, 2>> & u,
+                       const std::vector<OrigPair> & pt, const std::vector<int> & fx,
+                       const std::vector<int> & x) {
+      double E = 0.0;
+      for (int i = 0; i < n; ++i) E += u[(size_t)i][(size_t)x[(size_t)i]];
+      for (const auto & p : pt) E += p.f[x[(size_t)p.i]][x[(size_t)p.j]];
+      (void)fx;
+      return E;
+    };
+    auto brute = [&](int n, const std::vector<std::array<double, 2>> & u,
+                     const std::vector<OrigPair> & pt, const std::vector<int> & fx) {
+      double best = std::numeric_limits<double>::infinity();
+      std::vector<int> bestX((size_t)n, 0);
+      for (int mask = 0; mask < (1 << n); ++mask) {
+        std::vector<int> x((size_t)n, 0);
+        bool ok = true;
+        for (int i = 0; i < n; ++i) {
+          x[(size_t)i] = (mask >> i) & 1;
+          if (fx[(size_t)i] >= 0 && x[(size_t)i] != fx[(size_t)i]) ok = false;
+        }
+        if (!ok) continue;
+        const double e = evalOrig(n, u, pt, fx, x);
+        if (e < best) { best = e; bestX = x; }
+      }
+      return std::make_pair(best, bestX);
+    };
+
+    // 链 t0 -n0- t1 -n1- t2，节点代价表来自「布局→kernel」模型（含输出 FSV16 约束）。
+    // f00=min(B+r,G), f01=B+r, f10=B, f11=B。
+    auto chainTable = [](double B, double G, double r) {
+      OrigPair p;
+      p.f[0][0] = std::min(B + r, G);
+      p.f[0][1] = B + r;
+      p.f[1][0] = B;
+      p.f[1][1] = B;
+      return p;
+    };
+
+    int n = 3;
+    std::vector<std::array<double, 2>> u((size_t)n, {0.0, 0.0});
+    std::vector<OrigPair> pt;
+    OrigPair p0 = chainTable(1.0, 4.0, 2.0); p0.i = 0; p0.j = 1; pt.push_back(p0);
+    OrigPair p1 = chainTable(1.0, 4.0, 2.0); p1.i = 1; p1.j = 2; pt.push_back(p1);
+    std::vector<int> fx((size_t)n, -1);
+    fx[0] = 0;  // 网络输入钉死 NCHW
+
+    const auto bf = brute(n, u, pt, fx);
+
+    // 用分解构造求解器能量。
+    infvino::BinaryEnergy en(n);
+    bool submodular = true;
+    for (const auto & p : pt)
+      submodular &= en.addPairwiseTable(p.i, p.j, p.f[0][0], p.f[0][1], p.f[1][0], p.f[1][1]);
+    en.fix(0, 0);
+    CHECK(submodular, "R49: layout pairwise tables are submodular");
+    const auto sol = infvino::solveBinaryMinCut(en);
+    CHECK(sol.optimal, "R49: min-cut returns exact optimum");
+    CHECK(std::fabs(sol.energy - bf.first) < 1e-6, "R49: min-cut energy == brute force optimum");
+    CHECK(sol.labels[0] == 0, "R49: fixed (network input) stays NCHW");
+
+    // 解算出的标签代入原表，能量应与解一致（验证分解无损）。
+    const double solE = evalOrig(n, u, pt, fx, sol.labels);
+    CHECK(std::fabs(solE - sol.energy) < 1e-6, "R49: decomposition is lossless (energy matches)");
+
+    // 非 submodular 的表必须被拒绝（返回 false，不静默改语义）。
+    // K = (f00+f11-f01-f10)/2 = (0+10-0-0)/2 = 5 > 0 → supermodular。
+    {
+      infvino::BinaryEnergy bad(2);
+      CHECK(!bad.addPairwiseTable(0, 1, 0.0, 0.0, 0.0, 10.0),
+            "R49: non-submodular table rejected");
+    }
+
+    // 全局最优 vs 逐节点独立 argmin：证明「逐节点贪心」确实会错过全局。
+    // 变量 3 个，unary 想 1/0/1，链上强吸引 → 全局全 0 更优。
+    {
+      int m = 3;
+      std::vector<std::array<double, 2>> uu = {{{0.0, 1.0}}, {{0.0, 3.0}}, {{0.0, 1.0}}};
+      std::vector<OrigPair> pp;
+      OrigPair q0; q0.i = 0; q0.j = 1; q0.f[0][0]=0; q0.f[0][1]=2.5; q0.f[1][0]=2.5; q0.f[1][1]=0; pp.push_back(q0);
+      OrigPair q1 = q0; q1.i = 1; q1.j = 2; pp.push_back(q1);
+      std::vector<int> nofix((size_t)m, -1);
+      const auto g = brute(m, uu, pp, nofix);
+      infvino::BinaryEnergy ge(m);
+      for (const auto & p : pp) ge.addPairwiseTable(p.i, p.j, p.f[0][0], p.f[0][1], p.f[1][0], p.f[1][1]);
+      for (int i = 0; i < m; ++i) ge.addUnary(i, uu[(size_t)i][0], uu[(size_t)i][1]);
+      const auto gs = infvino::solveBinaryMinCut(ge);
+      CHECK(std::fabs(gs.energy - g.first) < 1e-6, "R49: chain coupling optimum == brute force");
+    }
   }
 
   std::printf("\n%s (%d failures)\n", g_fail ? "TUNING TEST FAILED" : "TUNING TEST PASSED", g_fail);
