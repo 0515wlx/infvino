@@ -350,7 +350,25 @@ net(median) 1.6389 -> 1.6416 ms (+0.2%)                                      # �
 > 但整网性能的下一步增量不在"选谁"，而在"有什么可选"** —— 目标应转向扩充候选与内核/布局改进
 > （第二步扩散到小算子、blocked chain 等）。
 
-## 5. 下一步（按 ROI）> 实现顺序以 **§4.2 的 S1–S4** 为准（先统一计费口径 → 尊重布局契约 → 决策级 chain move →
+### 4.9 补充：小算子整网外溢进 `predictNet`
+
+**动机**：§4.7 逐节点归因显示 `conv1x1_n11_gemv`（fc 头）在 full 下 **+3.9% 回归**——因为
+`predictNet` 只累加了 conv/gemm 的占用与 spill，**漏掉了小算子（GEMV/ew/gap/pool/...）**。
+
+**实现**（`PlanModel.cpp::predictNet` / `spillMs`）：
+- 新增 `isSmallOp(op)` 与 `smallOpCostMs(ni)`：小算子为**流式**（读输入+写输出），代价 =
+  `kSmallLaunchUs（3.5µs）+ bytes/BW(bytes)`（BW 用 R47 锁频曲线 `copyBwGbps`）。
+- `predictNet` 追加 Σ 小算子流式成本；
+- `spillMs` 的 L3 模拟里，小算子的**流式足迹**计入 `press`，即其读+写会冲刷 L3、逐出常驻张量
+  （此前只有 conv/gemm 的占用参与冲刷）。
+- 为此把 `copyBwGbps` / `kSmallLaunchUs` 从 `Tuning.cpp` 的匿名命名空间导出（`Tuning.hpp` 声明）。
+
+**效果**：`predictNet` 从 1.76 → **1.89 ms**（反映了此前缺失的小算子流式外溢）；模型驱动在 mb 上
+仍判「无严格改善」（同 §4.8），但**标尺现在覆盖了小算子**——fc 头那类回归从此可见。
+
+## 5. 下一步（按 ROI）
+
+> 实现顺序以 **§4.2 的 S1–S4** 为准（先统一计费口径 → 尊重布局契约 → 决策级 chain move →
 > 完整 blocked chain）。
 
 1. **确认 blocked chain 的机会上限**：离线算 mb 若 reorder→0（全部 fsv16 持久化）能省多少

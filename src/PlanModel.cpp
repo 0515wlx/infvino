@@ -4115,6 +4115,35 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   auto effCapacity = [&](double press) -> double {
     return std::max(kL3Resident1Mb, kL3 - 0.5 * press);
   };
+  // R47 补充：**小算子（GEMV/ew/gap/pool/...）的整网外溢**。小算子是流式（读输入+写输出，
+  // 保留工作集小），其代价 = launch 地板 + 流式 bytes/BW；且在流式期间会**冲刷 L3**（逐出
+  // 常驻张量）。此前的 `predictNet` 只累加了 conv/gemm 的占用，漏掉小算子 —— 这正是 §4.7 里
+  // fc 头（GEMV）回归未被预见的原因。这里以「launch + 流式」估计其外溢，并让它进入 L3 模拟。
+  auto isSmallOp = [](const std::string & op) {
+    return op == "ew_binary" || op == "ew_binary_bcast" || op == "ew_unary" || op == "copy_c" ||
+           op == "slice_axis" || op == "concat4" || op == "maxpool" || op == "resize_nn" ||
+           op == "permute_0213" || op == "bmm" || op == "softmax_axis" || op == "gap";
+  };
+  auto smallOpCostMs = [&](size_t ni) -> double {
+    const Node & n = nodes_[ni];
+    if (!isSmallOp(n.op)) return -1.0;   // -1 = 非小算子
+    double bytes = 0.0;
+    for (const auto & in : n.ins)
+    {
+      if (in == "-") continue;
+      auto it = T_.find(in);
+      if (it == T_.end()) continue;
+      bytes += static_cast<double>(it->second.numel()) * 2.0;
+    }
+    if (!n.outs.empty())
+    {
+      auto it = T_.find(n.outs[0]);
+      if (it != T_.end()) bytes += static_cast<double>(it->second.numel()) * 2.0;
+    }
+    if (bytes <= 0.0) return 0.0;
+    const double bw = copyBwGbps(bytes) * 1e9;
+    return kSmallLaunchUs * 1e-3 + bytes / bw * 1e3;   // ms
+  };
   auto spillBytes = [&]() -> double {
     std::vector<std::pair<std::string, double>> res;   // MRU 在尾部
     double resBytes = 0.0, miss = 0.0, currentCap = kL3;
@@ -4142,7 +4171,24 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       const OpSignature s = nodeSignature(nodes_[i], &ok);
       const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
       // 占用压力：按占用算有效容量并冲刷 LRU（跨算子耦合在此体现）。
-      const double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
+      double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
+      // R47 补充：小算子流式读+写会冲刷 L3（其流式足迹即有效压力）。
+      if (isSmallOp(nodes_[i].op))
+      {
+        double fb = 0.0;
+        for (const auto & in : nodes_[i].ins)
+        {
+          if (in == "-") continue;
+          auto it = T_.find(in);
+          if (it != T_.end()) fb += static_cast<double>(it->second.numel()) * 2.0;
+        }
+        if (!nodes_[i].outs.empty())
+        {
+          auto it = T_.find(nodes_[i].outs[0]);
+          if (it != T_.end()) fb += static_cast<double>(it->second.numel()) * 2.0;
+        }
+        press = std::max(press, fb);
+      }
       currentCap = effCapacity(press);
       while (resBytes > currentCap && !res.empty())
       {
@@ -4194,7 +4240,14 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
         net += r->ms;
     }
-    net += spillMs();   // R47 step2: L3 溢出（复用距离 + reorder 缓冲）
+    // R47 补充：小算子的 launch + 流式成本（隔离 ms 已含 kernel 时间，但 GEMV/ew 的
+    // 「跨 op 外溢」——冲刷 L3 后再被消费者读取——需显式计入，否则 fc 头回归不可见）。
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      const double c = smallOpCostMs(ni);
+      if (c > 0.0) net += c;
+    }
+    net += spillMs();   // R47 step2: L3 溢出（复用距离 + reorder 缓冲 + 小算子流式）
     return net;
   };
   // R47 S3: 只算可加目标里的 **reorder 分量**（供 chain move 门控：reorder 占比小的模型跳过）。

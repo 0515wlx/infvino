@@ -380,12 +380,12 @@ const BwPoint kBwCurve[] = {
   {4e3, 3.0}, {16e3, 8.1}, {64e3, 22.7}, {256e3, 46.4}, {512e3, 63.3},
   {1e6, 145.4}, {2e6, 138.8}, {3e6, 111.5}, {4e6, 56.1}, {5e6, 35.5},
   {6e6, 28.2}, {8e6, 22.2}, {12e6, 20.7}, {16e6, 20.3}};
-constexpr double kSmallLaunchUs = 3.5;
+constexpr double kSmallLaunchUsInternal = 3.5;
 // R47-L3: 有效 L3 容量（由膝点推断；用于图级溢出估计）。
 constexpr double kL3Bytes = 3.75e6;
 
 // 由足迹插值 copy 带宽（log-log 线性；端点外取端点值）。
-double copyBwGbps(double footprint)
+double copyBwGbpsImpl(double footprint)
 {
   const int n = static_cast<int>(sizeof(kBwCurve) / sizeof(kBwCurve[0]));
   if (footprint <= kBwCurve[0].bytes) return kBwCurve[0].gbps;
@@ -408,7 +408,7 @@ double copyBwGbps(double footprint)
 double memRooflineOps(double flops, double bytes, int eu, double clkMhz, double launchUs)
 {
   if (flops <= 0.0 || bytes <= 0.0) return 1e30;
-  const double bw = copyBwGbps(bytes) * 1e9;
+  const double bw = copyBwGbpsImpl(bytes) * 1e9;
   const double t = launchUs * 1e-6 + bytes / bw;
   if (t <= 0.0) return 1e30;
   return flops / (static_cast<double>(eu) * clkMhz * 1e6 * t);
@@ -418,8 +418,8 @@ double memRooflineOps(double flops, double bytes, int eu, double clkMhz, double 
 double smallMemCeiling(double outElems, double bytes, int eu, double clkMhz)
 {
   if (outElems <= 0.0 || bytes <= 0.0) return 0.0;
-  const double bw = copyBwGbps(bytes) * 1e9;  // bytes/s
-  const double t  = kSmallLaunchUs * 1e-6 + bytes / bw;
+  const double bw = copyBwGbpsImpl(bytes) * 1e9;  // bytes/s
+  const double t  = kSmallLaunchUsInternal * 1e-6 + bytes / bw;
   return 2.0 * outElems / (static_cast<double>(eu) * clkMhz * 1e6 * t);
 }
 
@@ -428,6 +428,12 @@ double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
   return i < v.size() ? static_cast<double>(v[i]) : dflt;
 }
 }  // namespace
+
+// R47: 导出 copy 带宽插值（外层可见）：转发到匿名命名空间里的同名实现。
+double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
+
+// R47: 导出的 launch 地板（供 PlanModel 的小算子外溢估计使用）。
+const double kSmallLaunchUs = 3.5;
 
 double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
 {

@@ -143,6 +143,12 @@ private:
  */
 double expectedOps(const OpSignature & sig, const ClDeviceInfo & dev);
 
+/** @brief R47: 按足迹插值的 copy(read+write) 带宽（GB/s）。锁频实测曲线；
+ *  用于内存 roofline 与小算子流式成本估计。 */
+double copyBwGbps(double footprint);
+/** @brief R47: 小算子每 dispatch 的 launch 地板（µs）。 */
+extern const double kSmallLaunchUs;
+
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/
 constexpr double kPeakOpsPerEuCycle = 32.0;
 /** @brief 纯寄存器 FP16 FMA 的结构上限（R13/R18）。*/
