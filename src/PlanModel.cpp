@@ -4313,6 +4313,131 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   };
 
   std::vector<char> won(targets.size(), 0);
+
+  // R47「第二步」：**模型驱动选择**（`INFVINO_GLOBAL_MODEL=1`）。让 L3 模型真正**主导选择**，
+  // 而不是逐节点端到端回验（后者被 ±5% 噪声主导、非组合）。流程：
+  //   (1) 逐 target 用 `predictNet` argmin 选候选（唯一随预测改善才接受）→ 得 proposal；
+  //   (2) 整网**预测**改善门（零 GPU）；
+  //   (3) 可选**外部稳态确认门**（`INFVINO_GLOBAL_MODEL_CONFIRM=1`）——一次 committed vs
+  //       proposal 的 median 对照，只要不显著变差就放行（否则整体回退）。
+  // 与旧的端到端坐标下降互斥（此模式不逐候选测量）。
+  if (std::getenv("INFVINO_GLOBAL_MODEL"))
+  {
+    std::vector<TuningEntry> proposal = baseline;
+    const double basePred0 = predictNet(baseline);
+    int proposed = 0;
+    // 一轮模型坐标下降：逐 target 用 predictNet argmin 选候选（唯一随预测改善才接受）。
+    auto modelRound = [&](std::vector<TuningEntry> & prop) {
+      int ch = 0;
+      for (size_t ti = 0; ti < targets.size(); ++ti)
+      {
+        auto & t = targets[ti];
+        if (t.nodes.empty()) continue;
+        const TuningEntry cur = prop[t.nodes[0]];
+        TuningEntry bestE = cur;
+        std::vector<TuningEntry> bestTmp = prop;
+        double bestPred = predictNet(prop);
+        for (const auto & c : t.cs.cands)
+        {
+          if (c.kernel == cur.kernel && c.options == cur.options) continue;
+          std::vector<TuningEntry> tmp = prop;
+          for (size_t ni : t.nodes) tmp[ni] = c;
+          const double p = predictNet(tmp);
+          if (p < bestPred * (1.0 - kMinGain)) { bestPred = p; bestE = c; bestTmp = tmp; }
+        }
+        if (bestE.kernel != cur.kernel || bestE.options != cur.options)
+        {
+          prop = bestTmp;
+          ++ch;
+          if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+            std::fprintf(stderr, "[global-retune] model propose %-38s %s -> %s\n",
+                         t.cs.sig.str().c_str(), cur.kernel.c_str(), bestE.kernel.c_str());
+        }
+      }
+      return ch;
+    };
+    // 从 baseline 收敛。
+    proposed += modelRound(proposal);
+    // **扰动重启**：坐标下降会卡在局部最优（尤其布局耦合的“反协同”谷底）。对每个 target 试
+    // 用**次优候选**（按 predictNet）扰动，再收敛一次；若得到更低的预测则接受。取最好解。
+    double best = predictNet(proposal);
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+    {
+      auto & t = targets[ti];
+      if (t.nodes.empty()) continue;
+      const TuningEntry cur = proposal[t.nodes[0]];
+      // 选一个**与当前不同**、预测次优的候选作扰动起点。
+      TuningEntry perturbE = cur;
+      double second = 1e300;
+      for (const auto & c : t.cs.cands)
+      {
+        if (c.kernel == cur.kernel && c.options == cur.options) continue;
+        std::vector<TuningEntry> tmp = proposal;
+        for (size_t ni : t.nodes) tmp[ni] = c;
+        const double p = predictNet(tmp);
+        if (p < second) { second = p; perturbE = c; }
+      }
+      if (perturbE.kernel == cur.kernel && perturbE.options == cur.options) continue;
+      std::vector<TuningEntry> alt = proposal;
+      for (size_t ni : t.nodes) alt[ni] = perturbE;
+      modelRound(alt);
+      const double ap = predictNet(alt);
+      if (ap < best * (1.0 - kMinGain)) { best = ap; proposal = std::move(alt); }
+    }
+    const double basePred = basePred0;
+    const double propPred = predictNet(proposal);
+    proposed = 0;
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+    {
+      auto & t = targets[ti];
+      if (t.nodes.empty()) continue;
+      if (proposal[t.nodes[0]].kernel != baseline[t.nodes[0]].kernel ||
+          proposal[t.nodes[0]].options != baseline[t.nodes[0]].options)
+      { won[ti] = 1; ++proposed; }
+    }
+    const bool predBetter = propPred < basePred * (1.0 - kMinGain);
+    if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+      std::fprintf(stderr,
+                   "[global-retune] model-driven: %d target(s), predictNet %.4f -> %.4f ms (%+.1f%%) %s\n",
+                   proposed, basePred, propPred,
+                   basePred > 0.0 ? (propPred - basePred) / basePred * 100.0 : 0.0,
+                   predBetter ? "ACCEPT" : "REJECT(pred)");
+    bool commit = predBetter && proposed > 0;
+    if (commit && std::getenv("INFVINO_GLOBAL_MODEL_CONFIRM"))
+    {
+      NetStat bsW, psW;
+      measurePair(baseline, proposal, std::max(reps, 3), &bsW, &psW);
+      const bool ok = psW.ok && bsW.ok && psW.med < bsW.med * (1.0 + kMinGain);  // 不显著变差即放行
+      if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+        std::fprintf(stderr, "[global-retune] model confirm: net(median) %.4f -> %.4f ms %s\n",
+                     bsW.med, psW.med, ok ? "PASS" : "FAIL(revert)");
+      commit = ok;
+    }
+    if (commit)
+    {
+      assign = proposal;
+      for (size_t ti = 0; ti < targets.size(); ++ti)
+      {
+        auto & t = targets[ti];
+        if (!t.nodes.empty() && !assign[t.nodes[0]].kernel.empty()) persist(t.cs, assign[t.nodes[0]]);
+      }
+    }
+    plan_overrides_.setEnabled(true);
+    plan_overrides_.setDeviceId(tuning_.deviceId());
+    for (auto & t : targets)
+      for (size_t ni : t.nodes)
+        if (ni < assign.size() && ni < nodes_.size() && !nodes_[ni].outs.empty() &&
+            !assign[ni].kernel.empty())
+        {
+          TuningEntry e = assign[ni];
+          if (e.device_id.empty()) e.device_id = tuning_.deviceId();
+          plan_overrides_.put(planNodeKey(nodes_[ni].outs[0]), e);
+        }
+    invalidateCapture();
+    resolveLayoutChoices();
+    return commit ? proposed : 0;
+  }
+
   bool budgetHit = false;
   for (int round = 0; round < rounds; ++round)
   {

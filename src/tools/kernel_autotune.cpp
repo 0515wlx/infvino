@@ -98,6 +98,8 @@ int main(int argc, char ** argv)
         "                     ⚠️ 隔离名次不预测整网名次，>0 可能剪掉流水线更快的候选）\n"
         "  --global-budget N  整网**执行次数**总预算（0=不限；抗组合爆炸/GPU 风险）\n"
         "  --plan-tuning <f>  per-plan 选择覆盖的输出路径（默认 <plan>.tuning.json）\n"
+        "  环境 INFVINO_GLOBAL_MODEL=1: 模型驱动选择（predictNet argmin 主导，不做端到端坐标下降）；\n"
+        "        INFVINO_GLOBAL_MODEL_CONFIRM=1 再叠加一次外部稳态确认门\n"
         "  --report           打印每个节点的候选扫描明细\n"
         "  --expected         打印 中间标准(期望) vs 实测 ops/EU/cyc 与 ratio\n"
         "  --bake <out.plan>  额外复制一份 plan（审计；运行时以 cache 为准）\n"
