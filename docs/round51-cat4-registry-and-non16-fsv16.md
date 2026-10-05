@@ -222,33 +222,33 @@ fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
 **默认关** → 默认路径与 R50 逐位一致、零回归。若要转正，需与「value 生产者 fsv16 持久化」
 联合决策（即 D4 的延伸：让生产者直写 + prologue 直读/乘 scale 一步完成）。
 
-### 5.1 D4+ 联动（本轮续做）：让 `gap` 直读 fsv16 → D5 转正
+### 5.1 D4+ 联动（本轮续做 → **未落地，发现 correctness bug，已回退**）
 
-**根因（为何上面中性）**：SE 的 value 同时被 **`gap`**（算 scale）与 fused conv1x1 消费。
-`gap` 只吃 NCHW → 布局规划把 value **钉死 NCHW**，即使生产者是 `depthwise_blk`。于是融合
-只是把「Mul（读 NCHW、写 fsv16）」换成「reorder（读 NCHW、写 fsv16）」，成本相抵。
+**动机**：让 SE 的 `value` 生产者（`depthwise_blk`）直写 fsv16，使 D5 的 conv prologue
+既能免 reorder 又能乘 scale。
 
-**修复**：给 `gap`/`gap_r` 加 `-DGAP_IN_FSV16`（按 `[C/16][H][W][16]` 直读，输出仍 NCHW）；
-注册一个**无候选**的 `gap_fsv16` 布局契约族，让 `planBlockedLayout`/mincut 把 `gap` 当作
-「可读 fsv16 的消费者」；`run()` 在输入已持久 fsv16 时自动加宏。于是 **depthwise → (gap +
-fused conv1x1)** 整条链可持久 fsv16：既去 Mul 又免 reorder。
+**做法（曾实现）**：给 `gap`/`gap_r` 加 `-DGAP_IN_FSV16`（按 `[C/16][H][W][16]` 直读），
+注册无候选的 `gap_fsv16` 布局契约族，让 `planBlockedLayout`/mincut 把 `gap` 当作
+「可读 fsv16 的消费者」；`run()` 在输入持久 fsv16 时自动加宏。
 
-**前提**：布局不动点需要 depthwise 的**输出 fsv16 成本**（R50 的 `#blkfsv16`），
-`config/tuning.json` 里没有 → 需 `--op depthwise --retune`（一次性写缓存）。
+**实测（mb，`--op depthwise --retune` 临时缓存；同 binary 融合开/关，交错 ×8）**：
+默认 2.194→**2.150（−2.0%）**、mincut 1.915→**1.783（−6.9%）**，8/8 —— **但只看了 busy，
+未验证 mincut 数值**。
 
-**实测（mb，`--op depthwise --retune` 的临时缓存；同 binary，融合开/关，交错 ×8）**：
+**随后发现 correctness bug**：`INFVINO_LAYOUT_MINCUT=1 INFVINO_FUSE_SCALE=1` 的
+`model_check` **FAIL（mean_rel 0.507）**；用 `INFVINO_NO_GAP_FSV16` 隔离后 PASS。
+进一步发现**旧缓存 + 默认路径 + 融合**也 FAIL。即 **`GAP_IN_FSV16`（gap 直读 fsv16）
+与布局规划的组合会产生错误的激活读取**，根因本轮**未定位**（gap/生产者/消费者三方的
+fsv16 记法在纸上一致，但实测错；怀疑某条链上「标记 fsv16 但生产者实际写 NCHW」）。
 
-| 路径 | off | on | Δ |
-|---|---:|---:|---:|
-| 默认 | 2.194 | **2.150** | **−2.0%（8/8）** |
-| mincut | 1.915 | **1.783** | **−6.9%（8/8）** |
+**决策（安全优先）**：
+- **回退 `gap_fsv16`**（ops.cl 的 `GAP_IN_FSV16`、`gap_fsv16` 族、planner/dispatch 接线）。
+- D5 保持 **opt-in**；回退后 mb 四种组合（默认/mincut × 融合开/关）**全部 PASS 且逐位相同**
+  （默认 1.069e-2、mincut 1.215e-2）。
+- **`config/tuning.json` 未改动**（缓存烘焙一并回退）。
+- **D4+ 的 kernel 侧（MUL_SCALE）本身正确**；未落地的是「gap 直读 fsv16」这一环。
+  下一步需要**单元级验证 gap 的 fsv16 读**（kernel_numtest/独立用例）后再重启 D4+。
 
-结构：ON 后 dispatch 83→77、reorder 10→13、fsv16 11→8（gap 直读 + value 持久抵消了 Mul 的
-消失）。**数值：同缓存下融合开/关逐位相同（mean_rel 9.109e-3）**。
-
-**结论**：D5「SE Mul→conv prologue」在与 **D4（生产者直写 fsv16）+ gap 直读** 联动后，
-从「中性」转为 **mb −2.0%~−6.9%**；代价是必须先把 depthwise 的 `#blkfsv16` 写进缓存
-（否则回退中性）。**下一步**：把该缓存并入 `config/tuning.json` 并把 D5 默认打开。
 
 
 ---
@@ -257,8 +257,10 @@ fused conv1x1)** 整条链可持久 fsv16：既去 Mul 又免 reorder。
 
 1. **P1（高风险）conv3x3 的布局链**：给 `conv3x3` 一个能输出 fsv16 的 epilogue（或让消费者
    prologue 直读），纳入 mincut；否则维持 R49「明确放弃 3×3 blocked 链」。
-2. ✅/⚠ **P2 小算子 launch 融合（D5）已试（本文 §5）**：SE Mul→conv1x1 prologue 融合
-   （`MUL_SCALE`）逐位一致、减少 dispatch，但整网**中性**（与 D4 的布局转换相抵），按先例
-   保持 **opt-in**。下一步可做 **gap+fc / resize→conv** 等不与布局转换冲突的融合。
+2. ◑/⚠ **P2 小算子 launch 融合（D5）已试（本文 §5）**：SE Mul→conv1x1 prologue 融合
+   （`MUL_SCALE`）kernel 侧逐位正确、减少 dispatch；整网中性（与 D4 的布局转换相抵），
+   opt-in。**D4+ 联动（gap 直读 fsv16）曾给出 mb −2%/−6.9%，但暴露 correctness bug
+   （mincut/旧缓存下 mean_rel 0.5），已回退**（见 §5.1）。下一步：先给 gap 的 fsv16 读
+   做单元级验证，再重启 D4+；或改做 gap+fc / resize→conv 等不与布局转换冲突的融合。
 3. **P3 direct conv1x1（窄通道/小 N）**、conv1x1 N=1 split-K、gemm staging。
 4. ✅ **M5 收尾已完成（本文 §4）**：`conv1x1_blk` 的输出 fsv16 成本（`#blkfsv16`）纳入 autotune。

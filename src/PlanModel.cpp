@@ -511,9 +511,9 @@ void PlanModel::parse()
 
   // R51 D5：把「x * scale[c]」（通道广播 Mul，如 SE）折进**消费它的 conv1x1** 的 prologue：
   // conv 直接读未缩放的 value + 每输入通道 scale（kernel -DMUL_SCALE=1），省掉 Mul 的
-  // 独立 launch 与其物化张量。**opt-in**（`INFVINO_FUSE_SCALE=1`）：实测整网中性，根因是
-  // 被去掉的 Mul 同时承担了 D4 的 fsv16 布局转换（见 docs/round51 §7）；仅当 value 生产者
-  // 本就输出 fsv16 时才是纯收益。默认关 → 默认路径与 R50 逐位一致。
+  // 独立 launch 与其物化张量。**opt-in**（`INFVINO_FUSE_SCALE=1`）：默认路径数值正确，
+  // 但 **mincut 路径存在未定位的数值 bug**（gap 直读 fsv16 与 mincut 的交互，见
+  // docs/round51 §5.2），故默认关 → 默认/mincut 路径与 R50 逐位一致。
   if (std::getenv("INFVINO_FUSE_SCALE")) fuseChannelScaleMul();
 
   // P0：把激活张量改分配到按生存期复用的缓冲池（须在 fusion 之后，节点列表已定稿）。
@@ -1162,8 +1162,6 @@ void PlanModel::planBlockedLayout()
       const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "depthwise_blk") return familyByName("depthwise_blk");
     }
-    // R51 D4+: gap 视为「可读 fsv16」的消费者（kernel 侧 -DGAP_IN_FSV16）。
-    if (n.op == "gap") return familyByName("gap_fsv16");
     return nullptr;
   };
 
@@ -1445,10 +1443,7 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   };
   auto kernelConsumesFsv16 = [&](const std::string & kernel) -> const KernelFamily * {
     const KernelFamily * f = familyByName(kernel);
-    if (f && f->layout.in == Layout::FSV16) return f;
-    // R51 D4+: gap 变体（gap/gap_r）在输入 fsv16 时用 -DGAP_IN_FSV16 直读。
-    if (kernel == "gap" || kernel == "gap_r") return familyByName("gap_fsv16");
-    return nullptr;
+    return (f && f->layout.in == Layout::FSV16) ? f : nullptr;
   };
 
   // ---- 参与 mincut 的节点：有 #blk/#non 备选、blk 族声明了布局契约。----
@@ -1611,6 +1606,13 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     std::fprintf(stderr, "[layout] mincut: %zu nodes, %zu vars, %d fsv16, E=%.4f\n",
                  nodes.size(), varName.size(), nfsv, sol.energy);
     if (std::getenv("INFVINO_LAYOUT_DEBUG"))
+    {
+      for (size_t v = 0; v < varName.size(); ++v)
+        if (sol.labels[v] == 1)
+          std::fprintf(stderr, "  [mincut-fsv16] %s\n", varName[v].c_str());
+      for (auto & kv : T_)
+        if (kv.second.fsv16 && var.find(kv.first) == var.end())
+          std::fprintf(stderr, "  [mincut-fsv16-nonvar] %s\n", kv.first.c_str());
       for (size_t ni : nodes)
       {
         const OpSignature s = nodeSignature(nodes_[ni], nullptr);
@@ -1619,6 +1621,7 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
                      node_choice_[ni].kernel.c_str());
         std::fprintf(stderr, "           sig=%s\n", s.str().c_str());
       }
+    }
   }
   return true;
 }
@@ -3366,9 +3369,6 @@ void PlanModel::run()
         if (!e->kernel.empty()) kern = e->kernel;
         if (!e->options.empty()) opts = e->options;
       }
-      // R51 D4+: 输入已持久 fsv16（生产者直写）时，gap 直读 fsv16（免一趟 reorder）。
-      if (in(0).fsv16 && opts.find("-DGAP_IN_FSV16=") == std::string::npos)
-        opts += " -DGAP_IN_FSV16=1";
       cl_kernel k = getKernel("ops", kern, opts);
       cl_uint   dim;
       size_t    gws[3], lws[3];
