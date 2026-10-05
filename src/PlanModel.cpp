@@ -4040,6 +4040,40 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);
           }
+          // R51 M5: conv1x1_blk 在**输出 fsv16** 时的成本（布局契约 canOutFsv16），与
+          // depthwise_blk 的 `#blkfsv16` 对应。此前 conv1x1 一直用 bfyx 输出成本给
+          // 「输出 fsv16」定价，系统性高估 blocked 族（fsv16 输出把 16 lane 合并写、通常
+          // 更快），使布局规划偏保守/失真。仅当输出缓冲被补齐（Cout%16==0 或 capable）
+          // 时才测，避免 OUT_FSV16 写越界。
+          TuningEntry ebFsv16;
+          const std::string & oname = n.outs[0];
+          if ((Cout % 16 == 0 || fsv16_capable_.count(oname)) && !eb.options.empty())
+          {
+            Candidate c2;
+            c2.kernel = eb.kernel;
+            c2.config = eb.config;
+            c2.options = (eb.options.find("-DOUT_FSV16=") == std::string::npos)
+                           ? eb.options + " -DOUT_FSV16=1"
+                           : eb.options;
+            try
+            {
+              auto enq2 = makeEnqueue(c2);
+              double ms2 = 0, sp2 = 0;
+              if (benchCandidate(rt_, enq2, iters, &ms2, &sp2) && ms2 > 0.0)
+              {
+                ebFsv16 = eb;
+                ebFsv16.options = c2.options;
+                ebFsv16.ms = ms2;
+                ebFsv16.ops = rt_.opsPerEuCycle(flops, ms2);
+                ebFsv16.source = "tuned";
+                ebFsv16.ratio =
+                    ebFsv16.expected > 0 ? ebFsv16.ops / ebFsv16.expected : 0.0;
+                ebFsv16.hard_ratio =
+                    ebFsv16.hard_ceiling > 0 ? ebFsv16.ops / ebFsv16.hard_ceiling : 0.0;
+              }
+            }
+            catch (const std::exception &) {}
+          }
           if (merge) {
             tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
             TuningEntry er;
@@ -4050,6 +4084,8 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
             if (!eNon.kernel.empty())
               tuning_.put(OpSignature::custom(sig.str() + "#non", {}), eNon);
+            if (!ebFsv16.kernel.empty())
+              tuning_.put(OpSignature::custom(sig.str() + "#blkfsv16", {}), ebFsv16);
           }
           // Fallback base entry (used when the joint fixpoint has no alternatives):
           // select on the billed cost, store kernel-only ms.

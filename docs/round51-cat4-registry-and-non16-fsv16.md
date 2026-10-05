@@ -164,11 +164,36 @@ INFVINO_LAYOUT_MINCUT=1 python3 scripts/model_check.py --model mobilenetv3-small
 
 ---
 
-## 4. 下一步（回到 §4bis 排序）
+## 4. 追加：M5 收尾 —— `conv1x1_blk` 的输出 fsv16 成本（`#blkfsv16`）
+
+R50 只给 `depthwise_blk` 测了「输出 fsv16」的真实成本；`conv1x1_blk` 一直用 **bfyx 输出成本**
+给「输出 fsv16」定价（`alt[].blkFsv16` 缺失 → 回退 `blk.ms`），系统性高估 blocked 族，
+使布局规划偏保守。本轮补上：autotune 在测完 `conv1x1_blk` 后，用同一配置 + `-DOUT_FSV16=1`
+再测一次，存为 `<sig>#blkfsv16`（仅当输出缓冲被补齐：`Cout%16==0` 或 `fsv16_capable_`，
+避免越界）。`resolveLayoutChoices`/mincut 的 `eBf` 从此用它。
+
+**隔离 A/B**（同一 binary，仅缓存差异：`<sig>#blkfsv16` 有/无；`--op conv1x1 --retune` 重扫）：
+
+| 模型 | 路径 | 无 `#blkfsv16` | 有 `#blkfsv16` | Δ |
+|---|---|---:|---:|---:|
+| mobilenetv3-small | 默认 | 2.151 | 2.156 | 噪声内 |
+| mobilenetv3-small | mincut | 1.912 | 1.923 | 噪声内 |
+| yolo11n-pose | 默认 | 15.258 | 15.319 | +0.4%（噪声内） |
+| yolo11n-pose | mincut | 15.092 | **14.876** | **−1.4%（8/8 全胜）** |
+
+- mb 上布局本就大多选 fsv16 → 定价修正无差异；y11 的 conv1x1 布局成本被高估 → 修正后 mincut
+  少付 reorder / 更准。
+- **默认缓存 `config/tuning.json` 未改动**：`#blkfsv16` 需 `kernel_autotune --op conv1x1 --retune`
+  才会写入；这是一个「成本模型保真」修复（能力增量），不改现有默认选择。
+- 数值：mb 默认 `model_check` PASS（1.069e-2 与基线逐位相同）；y11 mincut + 重扫缓存 PASS
+  （9.18e-4）。`tuning_test` PASS。
+
+---
+
+## 5. 下一步（回到 §4bis 排序）
 
 1. **P1（高风险）conv3x3 的布局链**：给 `conv3x3` 一个能输出 fsv16 的 epilogue（或让消费者
    prologue 直读），纳入 mincut；否则维持 R49「明确放弃 3×3 blocked 链」。
 2. **P2 小算子 launch 融合（D5）**：把相邻逐元素/pool/gap 折进 conv prologue/epilogue。
 3. **P3 direct conv1x1（窄通道/小 N）**、conv1x1 N=1 split-K、gemm staging。
-4. **M5 收尾**：把 `conv1x1_blk` 的**输出 fsv16 成本**（`#blkfsv16`）也纳入 autotune（目前只有
-   depthwise_blk 测；conv1x1 一直按 bfyx 成本给 fsv16 输出定价，R48 里程碑 M5 的遗留项）。
+4. ✅ **M5 收尾已完成（本文 §4）**：`conv1x1_blk` 的输出 fsv16 成本（`#blkfsv16`）纳入 autotune。

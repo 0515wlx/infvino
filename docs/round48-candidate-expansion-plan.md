@@ -121,7 +121,7 @@
 | M2 | D2 split-K conv | M0 | 小网格层隔离 min↑ | ⏸ 暂缓（R41 判 conv3x3 结构墙；gemm_sk 已有） |
 | M3 | D5 小算子融合/向量变体 | M0 | dispatch↓；小算子分项↓ | ◑ 注册表已纳小算子；**launch 融合未做** |
 | M4 | D3 数据通路（Winograd/CINC 泛化，先离线评估） | R47 模型 | 宽通道层隔离 min↑ 或明确负结果 | ⏸ 负预期（R41）；可在布局链之后再评估 |
-| M5 | D4 内核级 reorder 融合 | M1、S3 chain move | reorder ms↓；整网不回归 | ◑ D4 + R49 mincut + R50 契约成本已做；**conv1x1_blk 的 fsv16 成本未纳入** |
+| M5 | D4 内核级 reorder 融合 | M1、S3 chain move | reorder ms↓；整网不回归 | ✅ D4 + R49 mincut + R50/R51 布局契约成本（深度/1×1 的 `#blkfsv16`） |
 | M6 | D6 全核内建（direct conv1x1 / depthwise_v2） | M0 | 窄通道/小 N 区间改善 | ◑ depthwise `Y_BLOCK` 已做（R50）；**direct conv1x1 未做** |
 
 > 每步完成后：`model_check`/`reuse_check` 三模型回归 + 锁频稳态 A/B；负结果如实归档。
