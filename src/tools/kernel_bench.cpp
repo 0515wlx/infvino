@@ -454,9 +454,9 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
   char oo[192];
   const int SLM_DIV = (c.TY >= 1) ? c.TY : 1;
   std::snprintf(oo, sizeof(oo),
-                "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 -DSLM_DIV=%d "
+                "-DOBW=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 -DSLM_DIV=%d -DOUT_FSV16=%d "
                 "-cl-mad-enable -cl-fast-relaxed-math",
-                OBW, c.STRIDE, c.PAD, c.ACT, SLM_DIV);
+                OBW, c.STRIDE, c.PAD, c.ACT, SLM_DIV, c.OUTFSV ? 1 : 0);
   // Mirror the registry's compile-time specialization so the bench matches the
   // production candidate binary exactly.
   {
@@ -495,10 +495,11 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
           hWb[((((size_t)(o / 16) * icb + (i / 16)) * 9 + kh * 3 + kw) * 16 + (i % 16)) * 16 + (o % 16)] =
               hWt[((size_t)o * Cin + i) * 9 + kh * 3 + kw];
 
+  const size_t yelems = c.OUTFSV ? (size_t)ocb * Hout * Wout * 16 : (size_t)Cout * Hout * Wout;
   cl_mem dX = rt.alloc((size_t)icb * s.H * s.W * 16 * 2, CL_MEM_READ_ONLY);
   cl_mem dW = rt.alloc(hWb.size() * 2, CL_MEM_READ_ONLY);
   cl_mem dB = rt.alloc((size_t)Cout * 2, CL_MEM_READ_ONLY);
-  cl_mem dY = rt.alloc((size_t)Cout * Hout * Wout * 2, CL_MEM_WRITE_ONLY);
+  cl_mem dY = rt.alloc(yelems * 2, CL_MEM_WRITE_ONLY);
   rt.write(dX, hXb.size() * 2, hXb.data());
   rt.write(dW, hWb.size() * 2, hWb.data());
   rt.write(dB, (size_t)Cout * 2, hB.data());
@@ -532,7 +533,17 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
     btp90 > 0 ? (btp90 / btmin - 1.0) * 100.0 : 0.0);
 
   if (verify) {
-    rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
+    if (c.OUTFSV) {
+      std::vector<uint16_t> hYb(yelems, 0);
+      rt.read(dY, yelems * 2, hYb.data());
+      for (int ch = 0; ch < Cout; ++ch)
+        for (int y = 0; y < Hout; ++y)
+          for (int x = 0; x < Wout; ++x)
+            hY[((size_t)ch * Hout + y) * Wout + x] =
+              hYb[(((size_t)(ch / 16) * Hout + y) * Wout + x) * 16 + (ch % 16)];
+    } else {
+      rt.read(dY, (size_t)Cout * Hout * Wout * 2, hY.data());
+    }
     auto ref_act = [&](float f) -> double {
       if (c.ACT == 1) return f / (1.0 + std::exp(-(double)f));
       if (c.ACT == 3) return (double)(f * std::min(std::max(f + 3.0f, 0.0f), 6.0f) / 6.0f);
@@ -564,6 +575,37 @@ int benchConvBlk(infvino::ClRuntime & rt, const infvino::Conv3x3Cfg & c, const C
   std::printf("\n");
   clReleaseMemObject(dX); clReleaseMemObject(dW); clReleaseMemObject(dB); clReleaseMemObject(dY);
   clReleaseKernel(k);
+  return 0;
+}
+
+// R52: standalone bfyx -> b_fs_yx_fsv16 reorder (the per-layer blocked-chain tax).
+// Shape = Cin,_,H,W; measures GB/s (bytes = read + write, incl. channel padding).
+int benchReorder(infvino::ClRuntime & rt, const ConvShape & s, int iters)
+{
+  const int C = s.Cin, H = s.H, W = s.W, cb = (C + 15) / 16;
+  cl_kernel k;
+  try { k = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", ""); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+  const size_t ne = (size_t)C * H * W, no = (size_t)cb * H * W * 16;
+  cl_mem dI = rt.alloc(ne * 2, CL_MEM_READ_ONLY);
+  cl_mem dO = rt.alloc(no * 2, CL_MEM_WRITE_ONLY);
+  std::vector<uint16_t> h(ne, 0x3c00);   // 1.0
+  rt.write(dI, ne * 2, h.data());
+  int Ca = C, Ha = H, Wa = W;
+  clSetKernelArg(k, 0, sizeof(dI), &dI);
+  clSetKernelArg(k, 1, sizeof(dO), &dO);
+  clSetKernelArg(k, 2, sizeof(Ca), &Ca);
+  clSetKernelArg(k, 3, sizeof(Ha), &Ha);
+  clSetKernelArg(k, 4, sizeof(Wa), &Wa);
+  const size_t gws[3] = {(size_t)W, (size_t)H, (size_t)C};
+  double btmin = 0.0, btp90 = 0.0;
+  double med = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, nullptr); },
+                         3, iters, &btmin, &btp90);
+  const double bytes = 2.0 * (ne + no) * 2.0;
+  std::printf("  reorder Cin=%-4d %dx%d bytes=%.2fMB  %8.4f ms  %7.1f GB/s  [min %.4f p90 %.4f spread %+.0f%%]\n",
+              C, H, W, bytes / 1e6, med, bytes / (med * 1e-3) / 1e9, btmin, btp90,
+              btp90 > 0 ? (btp90 / btmin - 1.0) * 100.0 : 0.0);
+  clReleaseMemObject(dI); clReleaseMemObject(dO); clReleaseKernel(k);
   return 0;
 }
 
@@ -1466,6 +1508,12 @@ int main(int argc, char ** argv)
       conv_shapes = {{16, 16, 112, 112, "mb-s2"}, {96, 96, 56, 56, "mb"},
                      {240, 240, 28, 28, "mb"}, {576, 576, 14, 14, "mb"}};
     for (const auto & s : conv_shapes) rc |= benchDepthwiseBlk(rt, dwblk, s, iters, verify);
+  } else if (op == "reorder") {
+    std::printf("[reorder] bfyx -> b_fs_yx_fsv16\n");
+    if (conv_shapes.empty())
+      conv_shapes = {{64, 0, 82, 82, "80s1_64"}, {16, 0, 162, 162, "160s1_16"},
+                     {16, 0, 322, 322, "160s2_16"}, {3, 0, 322, 322, "stem"}};
+    for (const auto & s : conv_shapes) rc |= benchReorder(rt, s, iters);
   } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov" || op == "conv3x3blk") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;

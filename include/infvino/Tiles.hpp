@@ -149,6 +149,11 @@ struct Conv3x3Cfg
   // Round 41: conv_ov software-pipelining knob: 1 = double-buffer / prefetch the
   // next input-channel block one `kd` ahead (diagnostic; hides global-read latency).
   int PF = 0;
+  // R52 layout analysis: `conv3x3_blk` writes b_fs_yx_fsv16 directly (kernel
+  // -DOUT_FSV16=1). Bench-only knob (not part of `options()`, which production
+  // builds separately); lets us measure the fsv16-output cost that the layout
+  // planner (`#blkfsv16`) needs to price.
+  int OUTFSV = 0;
 
   std::string options() const
   {
@@ -358,6 +363,7 @@ inline Conv3x3Cfg parseConv(const std::string & s)
   if (v.size() > 20) c.XG = v[20];
   if (v.size() > 21) c.WGL = v[21];
   if (v.size() > 22) c.PF = v[22];
+  if (v.size() > 23) c.OUTFSV = v[23];
   return c;
 }
 

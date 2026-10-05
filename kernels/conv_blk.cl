@@ -297,6 +297,15 @@ __kernel void conv3x3_blk(
 // bfyx [C][H][W] -> b_fs_yx_fsv16 [C/16][H][W][16] (host-side reorder before
 // the blocked conv; OV keeps tensors blocked network-wide, infvino converts
 // per-layer so the rest of the pipeline stays plain bfyx).
+//
+// R52 note: a per-channel-block variant (one work-item writes a contiguous 16-lane
+// block) was tried to coalesce the writes for Cin%16!=0 — it helps large-spatial
+// tiny-Cin (Cin=3 640x640: 8.5→22.8 GB/s) but **regressed** the network's actual
+// reorder shapes (small spatial W<16 with 40..288 channels: mb reorder 0.079→0.26
+// ms/frame), because the strided per-channel reads no longer map to a full x
+// sub-group. Net negative → kept the per-element mapping (coalesced reads). See
+// docs/round53. Reorder is near roofline (50-70 GB/s) for every shape the models
+// actually convert.
 __kernel void reorder_bfyx_to_fsv16(
   __global const half *restrict in,
   __global half *restrict out,

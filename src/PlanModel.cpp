@@ -1537,13 +1537,17 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   };
 
   // ---- 参与 mincut 的节点：有 #blk/#non 备选、blk 族声明了布局契约。----
-  // 步骤 3：从 conv1x1 扩展到 depthwise（任何声明了布局契约的族）。conv3x3_blk 结构性
-  // 弱于 ov（R49 缺口 C），暂不纳入；其张量由 producer/consumer 能力门自动 pin。
+  // 步骤 3：从 conv1x1 扩展到 depthwise（任何声明了布局契约的族）。
+  // R52：conv3x3 默认仍排除（R49 判其隔离弱于 ov），但 **opt-in** 纳入
+  // （`INFVINO_LAYOUT_MINCUT_3X3=1`）——配合 conv3x3 的 `#blkfsv16` 成本，mincut 是唯一
+  // 能「假设整条链都 blocked」从而发现 fsv16 输出收益的求解器（plan 期不动点存在
+  // chicken-and-egg：out_fsv16 未被标记时 blk 永远要付 reorder → 无法跳出 NCHW 基线）。
+  const bool mincut3x3 = std::getenv("INFVINO_LAYOUT_MINCUT_3X3") != nullptr;
   std::vector<size_t> nodes;
   for (size_t ni = 0; ni < nodes_.size(); ++ni)
   {
     if (!alt[ni].has || nodes_[ni].outs.empty()) continue;
-    if (nodes_[ni].op == "conv3x3") continue;
+    if (nodes_[ni].op == "conv3x3" && !mincut3x3) continue;
     const int slot = actSlot(ni);
     if (slot < 0 || static_cast<size_t>(slot) >= nodes_[ni].ins.size()) continue;
     if (!blkFamilyOf(ni) || !blkFamilyOf(ni)->layout.canOutFsv16) continue;
@@ -3970,6 +3974,10 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
         };
         benchCandidate(rt_, renq, iters, &reorderMs);
+        if (std::getenv("INFVINO_AUTOTUNE_DEBUG"))
+          std::fprintf(stderr, "  [reorder] %s Cin=%d H=%d W=%d inbytes=%.1fMB ms=%.4f\n",
+                       sig.str().c_str(), Cin, H, W,
+                       2.0 * static_cast<double>(bytes) / 1e6, reorderMs);
         clReleaseMemObject(scratch);
       }
       TuningEntry e = en;
@@ -3977,6 +3985,70 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       {
         const double eff = eb.ms + reorderMs;   // billed selection cost
         if (en.kernel.empty() || eff < en.ms) e = eb;   // store kernel-only ms
+      }
+      // R52: conv3x3_blk 在**输出 fsv16** 时的成本（布局契约 canOutFsv16）。bfyx 输出时
+      // 16 个 lane=16 条不相邻的输出通道行 → 写不合并（窄/非对齐 Cout、stride-2 尤甚）；
+      // fsv16 把 16 lane 合并成连续 32B 写（实测 80×80 s2 64→64 / 160×160 16→16 快
+      // 16–60%）。此前 conv3x3 从不用 fsv16 输出成本定价 → 布局不动点系统性高估 blk，
+      // 把 3×3 排除在持久 fsv16 链之外（R49 缺口 C 的一半是**测量口径**而非 kernel 弱者）。
+      TuningEntry ebFsv16;
+      const std::string & oname = n.outs[0];
+      if (!eb.kernel.empty() && (Cout % 16 == 0 || fsv16_capable_.count(oname)) &&
+          !eb.options.empty())
+      {
+        Candidate c2;
+        c2.kernel = eb.kernel;
+        c2.config = eb.config;
+        c2.options = (eb.options.find("-DOUT_FSV16=") == std::string::npos)
+                       ? eb.options + " -DOUT_FSV16=1"
+                       : eb.options;
+        int obw = 8;
+        auto p = c2.options.find("-DOBW=");
+        if (p != std::string::npos) obw = std::atoi(c2.options.c_str() + p + 6);
+        int slm = 1;
+        auto ps = c2.options.find("-DSLM_DIV=");
+        if (ps != std::string::npos) slm = std::atoi(c2.options.c_str() + ps + 10);
+        if (slm < 1) slm = 1;
+        const size_t ybytes =
+            static_cast<size_t>((Cout + 15) / 16) * Hout * Wout * 16 * 2;
+        try
+        {
+          cl_mem ysc = rt_.alloc(ybytes, CL_MEM_READ_WRITE);
+          cl_kernel kk = getKernel("conv_blk", "conv3x3_blk", c2.options);
+          cl_mem dw = blkWeight(n.ins[1], ref(n.ins[1]), Cout, Cin);
+          cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
+          setArg(kk, 0, sizeof(dxb), &dxb);
+          setArg(kk, 1, sizeof(dw), &dw);
+          setArg(kk, 2, sizeof(db), &db);
+          setArg(kk, 3, sizeof(ysc), &ysc);
+          setArg(kk, 4, sizeof(Cin), &Cin);
+          setArg(kk, 5, sizeof(H), &H);
+          setArg(kk, 6, sizeof(W), &W);
+          setArg(kk, 7, sizeof(Cout), &Cout);
+          setArg(kk, 8, sizeof(Hout), &Hout);
+          setArg(kk, 9, sizeof(Wout), &Wout);
+          const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
+          const size_t gws[3] = {
+            static_cast<size_t>((Wout + obw - 1) / obw) * static_cast<size_t>(Hout),
+            static_cast<size_t>(((Cout + 15) / 16) * 16 * slm), 1};
+          std::function<cl_event()> enq2 = [this, kk, gws, lws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kk, 3, gws, lws);
+          };
+          double ms2 = 0, sp2 = 0;
+          if (benchCandidate(rt_, enq2, iters, &ms2, &sp2) && ms2 > 0.0)
+          {
+            ebFsv16 = eb;
+            ebFsv16.options = c2.options;
+            ebFsv16.ms = ms2;
+            ebFsv16.ops = rt_.opsPerEuCycle(flops, ms2);
+            ebFsv16.source = "tuned";
+            ebFsv16.ratio = ebFsv16.expected > 0 ? ebFsv16.ops / ebFsv16.expected : 0.0;
+            ebFsv16.hard_ratio =
+                ebFsv16.hard_ceiling > 0 ? ebFsv16.ops / ebFsv16.hard_ceiling : 0.0;
+          }
+          clReleaseMemObject(ysc);
+        }
+        catch (const std::exception &) {}
       }
       if (merge && !eb.kernel.empty())
       {
@@ -3989,6 +4061,8 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
         if (!en.kernel.empty())
           tuning_.put(OpSignature::custom(sig.str() + "#non", {}), en);
+        if (!ebFsv16.kernel.empty())
+          tuning_.put(OpSignature::custom(sig.str() + "#blkfsv16", {}), ebFsv16);
       }
       if (!e.kernel.empty()) {
         done[sig.str()] = e;

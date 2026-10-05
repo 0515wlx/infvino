@@ -266,3 +266,24 @@
   mincut **−6.9%（8/8）**；`mincut+D5` `model_check` 由 0.507 FAIL → **1.203e-2 PASS**。
   三模型全 PASS、y8/y11 逐位不变；`config/tuning.json` 未改动（D5 仍 opt-in）。
 
+---
+
+## 11. 进展（R53：conv3×3 路线 × shape × layout 系统分析 —— §6 第 1 项）
+
+见 [`round53-conv3x3-route-shape-layout.md`](round53-conv3x3-route-shape-layout.md)：
+
+- **路线 × shape × layout 受控矩阵**（ov/blk/native × 10 regime × bfyx/fsv16 输出）+ ISA 配额：
+  实测/配额两条路线都 **0.63–0.65** → 缺的是寄存器↔延迟耦合（R41 复现），**流水本身无欠调**。
+- **发现并修复成本模型缺口**：`conv3x3_blk` 的输出 fsv16 成本从未测量（窄/stride-2 实测快
+  5–16%）→ 加 `#blkfsv16`（与 conv1x1/depthwise 同款，需 `--retune`）。
+- **布局链判决（负）**：修正成本后 y8 31 签名仅 1 个 `blk_fsv16 < ov`（且本就选 blk）；
+  mincut 纳入 conv3x3（opt-in `INFVINO_LAYOUT_MINCUT_3X3`）→ 60 节点 0 个 fsv16，
+  busy 不变。**确认 R49：3×3 blocked 链不成立**。
+- **求解器缺口记录**：plan 期不动点存在 chicken-and-egg（无法从 NCHW 基线发现链）；
+  mincut 是唯一能「假设整条链」的求解器。
+- **reorder 审计（负）**：旧 kernel 对实际 shape 近 roofline（50–70 GB/s）；per-block
+  变体对大空间小 Cin 快但小空间回归 → 回退。y8 reorder 仅 0.6%。
+- **模型缺口**：软标尺对 `20×20 256→64` ratio=1.53（低估大 K 小空间）；`#reorder` 未建模
+  多消费者摊销。
+- **未做（需新 kernel）**：② direct conv1x1、③ split-K/Winograd conv。
+
