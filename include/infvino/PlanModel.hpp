@@ -288,6 +288,10 @@ private:
   struct LayoutAlt
   {
     TuningEntry blk, non, reorder;
+    // R50: blocked 族在「输出 fsv16」时的实测成本（同一 kernel + OUT_FSV16=1）。
+    // 布局契约 canOutFsv16=true 表示该族可直出 fsv16；此时其成本用本项而非 bfyx 输出
+    // 的 `blk.ms`——二者对 depthwise_blk 相差 ~2×（lane 合并写 vs 跨通道散写）。
+    TuningEntry blkFsv16;
     bool        has = false;
   };
   /**

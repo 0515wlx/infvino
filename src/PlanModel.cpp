@@ -1107,6 +1107,9 @@ void PlanModel::resolveLayoutChoices()
     alt[ni].non = *n;
     if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(sig.str() + "#reorder", {})))
       alt[ni].reorder = *r;
+    // R50: 输出 fsv16 的 blocked 成本（契约 canOutFsv16）。缺失时回退为 blk.ms（旧行为）。
+    if (const TuningEntry * bf = tuning_.lookup(OpSignature::custom(sig.str() + "#blkfsv16", {})))
+      if (!bf->kernel.empty()) alt[ni].blkFsv16 = *bf;
     alt[ni].has = true;
     any = true;
   }
@@ -1137,7 +1140,17 @@ void PlanModel::resolveLayoutChoices()
         auto xit = T_.find(n.ins[inIdx]);
         if (xit != T_.end()) in_fsv16 = xit->second.fsv16;
       }
-      double blkCost = alt[ni].blk.ms + (in_fsv16 ? 0.0 : alt[ni].reorder.ms);
+      // R50: 若本节点输出已被规划为 fsv16（契约 canOutFsv16），用 fsv16 输出的实测成本
+      // （`#blkfsv16`）；否则用 bfyx 输出成本。缺失 `#blkfsv16` 时回退为旧行为。
+      bool out_fsv16 = false;
+      if (!n.outs.empty())
+      {
+        auto oit = T_.find(n.outs[0]);
+        if (oit != T_.end()) out_fsv16 = oit->second.fsv16;
+      }
+      const double blkKernelMs =
+          (out_fsv16 && !alt[ni].blkFsv16.kernel.empty()) ? alt[ni].blkFsv16.ms : alt[ni].blk.ms;
+      double blkCost = blkKernelMs + (in_fsv16 ? 0.0 : alt[ni].reorder.ms);
       const TuningEntry & want = (blkCost <= alt[ni].non.ms) ? alt[ni].blk : alt[ni].non;
       if (node_choice_[ni].kernel != want.kernel || node_choice_[ni].options != want.options)
       {
@@ -1344,11 +1357,27 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
   BinaryEnergy en(static_cast<int>(varName.size()));
 
-  // pin：网络输入/输出、生产者无法产 FSV16、消费者无法读 FSV16 的张量 → 钉死 NCHW。
+  // pin：网络输入/输出、生产者无法产 FSV16、消费者无法读 FSV16、**通道非 16 对齐**的张量
+  // → 钉死 NCHW。最后一条是 R50 修的 correctness bug：`planBlockedLayout` 一直要求
+  // `Cout%16==0`（fsv16 按 16 通道补齐，否则池里 NCHW 大小的缓冲会越界），但 mincut 此前
+  // 漏了这条，把 88/120/144 等非对齐张量标成 fsv16 → 写出越界、整网输出错乱（mb mean_rel 0.44）。
   for (size_t v = 0; v < varName.size(); ++v)
   {
     const std::string & t = varName[v];
     bool pin = out_set.count(t) > 0 || !producerCanFsv16(t) || !consumerCanReadFsv16(t);
+    if (!pin)
+    {
+      auto tit = T_.find(t);
+      if (tit != T_.end())
+      {
+        const auto & d = tit->second.dims;
+        if (d.size() >= 3)
+        {
+          const int C = static_cast<int>(d[d.size() - 3]);
+          if (C > 0 && C % 16 != 0) pin = true;
+        }
+      }
+    }
     if (pin) en.fix(static_cast<int>(v), 0);
   }
 
@@ -1378,7 +1407,9 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     const OpSignature s = nodeSignature(n, &ok);
     const double eB = inCurveMs(alt[ni].blk, s), eN = inCurveMs(alt[ni].non, s),
                  r = alt[ni].reorder.ms;
-    const double f00 = std::min(eN, eB + r), f01 = eB + r, f10 = eB, f11 = eB;
+    // R50: 输出 fsv16 时用契约成本（同一 blk kernel + OUT_FSV16=1），否则用 bfyx 成本。
+    const double eBf = alt[ni].blkFsv16.kernel.empty() ? eB : inCurveMs(alt[ni].blkFsv16, s);
+    const double f00 = std::min(eN, eB + r), f01 = eBf + r, f10 = eB, f11 = eBf;
     if (!en.addPairwiseTable(a, b, f00, f01, f10, f11))
       return false;  // 非 submodular → 回退
   }
@@ -2629,6 +2660,7 @@ void PlanModel::run()
             return p == std::string::npos ? def : std::atoi(dwopts.c_str() + p + std::strlen(key));
           };
           const int xb = optInt("-DX_BLOCK=", 8);
+          const int yb = optInt("-DY_BLOCK=", 1);
           cl_mem dxb = blkInput(n.ins[0], in(0), Cin, H, W);
           cl_mem dwb = blkDwWeight(n.ins[1], in(1), Cin, K);
           std::string bopts = dwopts;
@@ -2645,7 +2677,7 @@ void PlanModel::run()
           int ho = Hout, wo = Wout;
           setArg(kd, 7, sizeof(ho), &ho);
           setArg(kd, 8, sizeof(wo), &wo);
-          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * Hout),
+          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * ((Hout + yb - 1) / yb)),
                                static_cast<size_t>(((Cin + 15) / 16) * 16), 1};
           const size_t l[3] = {1, 16, 1};
           timed("depthwise", kd, 3, g, l);
@@ -4019,6 +4051,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(key));
           };
           const int xb = optInt("-DX_BLOCK=", 8);
+          const int yb = optInt("-DY_BLOCK=", 1);
           cl_mem dxb = blkInput(n.ins[0], ref(n.ins[0]), Cin, H, W);
           cl_mem dwb = blkDwWeight(n.ins[1], ref(n.ins[1]), Cin, K);
           cl_kernel kd = getKernel("depthwise_blk", "depthwise_blk", c.options);
@@ -4032,7 +4065,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           int ho = Hout, wo = Wout;
           setArg(kd, 7, sizeof(ho), &ho);
           setArg(kd, 8, sizeof(wo), &wo);
-          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * Hout),
+          const size_t g[3] = {static_cast<size_t>(((Wout + xb - 1) / xb) * ((Hout + yb - 1) / yb)),
                                static_cast<size_t>(((Cin + 15) / 16) * 16), 1};
           const size_t l[3] = {1, 16, 1};
           return [this, kd, g, l]() {
@@ -4116,6 +4149,37 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);
           }
+          // R50: 同一 blk 配置在**输出 fsv16** 时的成本（布局契约 canOutFsv16）。depthwise_blk
+          // 的 fsv16 输出把 16 lane（通道）合并为连续写，实测比 bfyx 输出快 ~2×；布局规划据此
+          // 给「输出 fsv16」的节点定价（bfyx 成本仍用于输出 NCHW 的情形）。Cin%16==0 才能 fsv16。
+          TuningEntry ebFsv16;
+          if (Cin % 16 == 0 && !eb.options.empty())
+          {
+            Candidate c2;
+            c2.kernel = eb.kernel;
+            c2.config = eb.config;
+            c2.options = (eb.options.find("-DOUT_FSV16=") == std::string::npos)
+                           ? eb.options + " -DOUT_FSV16=1"
+                           : eb.options;
+            try
+            {
+              auto enq2 = makeEnqueue(c2);
+              double ms2 = 0, sp2 = 0;
+              if (benchCandidate(rt_, enq2, iters, &ms2, &sp2) && ms2 > 0.0)
+              {
+                ebFsv16 = eb;
+                ebFsv16.options = c2.options;
+                ebFsv16.ms = ms2;
+                ebFsv16.ops = rt_.opsPerEuCycle(flops, ms2);
+                ebFsv16.source = "tuned";
+                ebFsv16.ratio =
+                    ebFsv16.expected > 0 ? ebFsv16.ops / ebFsv16.expected : 0.0;
+                ebFsv16.hard_ratio =
+                    ebFsv16.hard_ceiling > 0 ? ebFsv16.ops / ebFsv16.hard_ceiling : 0.0;
+              }
+            }
+            catch (const std::exception &) {}
+          }
           if (merge) {
             tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
             TuningEntry er;
@@ -4126,6 +4190,8 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             tuning_.put(OpSignature::custom(sig.str() + "#reorder", {}), er);
             if (!eNon.kernel.empty())
               tuning_.put(OpSignature::custom(sig.str() + "#non", {}), eNon);
+            if (!ebFsv16.kernel.empty())
+              tuning_.put(OpSignature::custom(sig.str() + "#blkfsv16", {}), ebFsv16);
           }
           const double eff = eb.ms + reorderMs;   // billed selection cost
           if (eNon.kernel.empty() || eff < eNon.ms) e = eb;   // store kernel-only ms

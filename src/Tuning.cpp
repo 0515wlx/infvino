@@ -478,6 +478,21 @@ double occupancyPressure(const TuningEntry & e, const OpSignature & s)
     totalThreads = nwg * wgSize;
     perWg = 2.0 * s.Cin * tile;
   }
+  else if (s.op == "depthwise" && e.kernel == "depthwise_blk")
+  {
+    // R50: 与 depthwise_blk 的几何一致（SG=16 lane=通道、XB 列、YB 行）。签名 W/H 为输出空间。
+    const int xb = std::max(1, optIntOf(e.options, "-DX_BLOCK=", 8));
+    const int yb = std::max(1, optIntOf(e.options, "-DY_BLOCK=", 1));
+    wgSize = 16;
+    const double nwg = static_cast<double>((s.W + xb - 1) / xb) *
+                       static_cast<double>((s.H + yb - 1) / yb) *
+                       static_cast<double>((s.Cout + 15) / 16);
+    totalThreads = nwg * wgSize;
+    // 每 WG 触碰的输入 tile：16 通道 × 列 span × 行 span × 2B。
+    const double colSpan = (xb - 1) * s.stride + s.K;
+    const double rowSpan = (yb - 1) * s.stride + s.K;
+    perWg = 2.0 * 16.0 * colSpan * rowSpan;
+  }
   else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
   {
     const int M = (s.op == "gemm") ? s.M : s.Cout;

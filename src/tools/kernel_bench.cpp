@@ -882,7 +882,8 @@ int benchDepthwiseBlk(infvino::ClRuntime & rt, const infvino::DepthwiseBlkCfg & 
   clSetKernelArg(k, 8, sizeof(wo), &wo);
 
   const size_t lws[3] = {1, 16, 1};
-  const size_t gws[3] = {static_cast<size_t>(((Wo + c.XB - 1) / c.XB) * Ho),
+  const int yb = c.YB > 0 ? c.YB : 1;
+  const size_t gws[3] = {static_cast<size_t>(((Wo + c.XB - 1) / c.XB) * ((Ho + yb - 1) / yb)),
                          static_cast<size_t>(((C + 15) / 16) * 16), 1};
   const double med = rt.timeMs(
     [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws); }, 3, iters);
@@ -897,10 +898,12 @@ int benchDepthwiseBlk(infvino::ClRuntime & rt, const infvino::DepthwiseBlkCfg & 
     std::vector<uint16_t> raw((size_t)cb * Ho * Wo * 16);
     rt.read(dY, std::min<size_t>(raw.size() * 2, ybytes), raw.data());
     auto act = [&](double f) -> double {
+      // 规范激活码（与 depthwise_blk.cl 的 dwblk_activate 一致）：1=SiLU 2=ReLU 3=HardSwish
+      // 4=HardSigmoid。旧版把 2/3 写反（2=HardSwish,3=ReLU），使 --verify 在 act3 假 FAIL。
       switch (c.ACT) {
         case 1: return f / (1.0 + std::exp(-f));
-        case 2: return f * std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
-        case 3: return std::max(f, 0.0);
+        case 2: return std::max(f, 0.0);
+        case 3: return f * std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
         case 4: return std::min(std::max(f + 3.0, 0.0), 6.0) / 6.0;
         default: return f;
       }

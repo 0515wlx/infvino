@@ -151,11 +151,18 @@ def main():
         "| tee /work/krun.log",
         "if dmesg 2>/dev/null | grep -q 'GPU HANG'; then echo '[model_check] GPU HANG detected'; exit 3; fi",
     ]
+    # R50: 把调用方的 INFVINO_* 环境透传进容器。此前 docker run 不带 -e，导致
+    # `INFVINO_LAYOUT_MINCUT=1 python3 model_check.py` 实际跑的是**默认路径**——
+    # R49 的 mincut 数值问题因此被假 PASS 掩盖。显式透传后 model_check 才真正检验目标路径。
+    env_args = []
+    for k, v in os.environ.items():
+        if k.startswith("INFVINO_"):
+            env_args += ["-e", f"{k}={v}"]
     subprocess.run(["docker", "run", "--rm",
                     "--memory=3g", "--memory-swap=3g", "--pids-limit=256",
                     "--device=/dev/dri/renderD128",
                     "-v", f"{args.repo}:/workspace/infvino", "-w", "/workspace/infvino",
-                    "-v", f"{os.path.abspath(wd)}:/work", args.image, "bash", "-lc",
+                    "-v", f"{os.path.abspath(wd)}:/work", *env_args, args.image, "bash", "-lc",
                     "\n".join(inner)], check=True, capture_output=False)
 
     # 解析 kernel_run 报告的 "total kernel time"

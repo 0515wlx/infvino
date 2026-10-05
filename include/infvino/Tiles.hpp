@@ -288,22 +288,23 @@ struct DepthwiseBlkCfg
 {
   int XB = 8;        // X_BLOCK：每 lane 连续输出列数（2/4/8）
   int K = 3, S = 1, P = 1;
-  int ACT = 0;       // 1=SiLU 2=HardSwish 3=ReLU 4=HardSigmoid
+  int ACT = 0;       // 规范码：1=SiLU 2=ReLU 3=HardSwish 4=HardSigmoid
   int OUT_FSV16 = 0;
   int SG = 16;
+  int YB = 1;        // R50: 每 WI 的输出行数（输入行按滑动窗口复用）；1 = 原行为
 
   std::string options() const
   {
     std::ostringstream o;
     o << "-DX_BLOCK=" << XB << " -DDWK=" << K << " -DSTRIDE=" << S << " -DPAD=" << P
       << " -DACT=" << ACT << " -DOUT_FSV16=" << OUT_FSV16 << " -DSG=" << SG
-      << " -cl-mad-enable -cl-fast-relaxed-math";
+      << " -DY_BLOCK=" << YB << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
   std::string label() const
   {
     std::ostringstream o;
-    o << "XB" << XB << " K" << K << " s" << S << " p" << P << " act" << ACT
+    o << "XB" << XB << " YB" << YB << " K" << K << " s" << S << " p" << P << " act" << ACT
       << (OUT_FSV16 ? " fsv16" : " bfyx");
     return o.str();
   }
@@ -322,6 +323,7 @@ inline DepthwiseBlkCfg parseDepthwiseBlk(const std::string & s)
   if (v.size() > 3) c.P = v[3];
   if (v.size() > 4) c.ACT = v[4];
   if (v.size() > 5) c.OUT_FSV16 = v[5];
+  if (v.size() > 6) c.YB = v[6];
   return c;
 }
 

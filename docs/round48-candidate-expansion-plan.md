@@ -168,3 +168,13 @@
   （`ew_binary_ch`）生产者直写 fsv16。mobilenet **−2.8%**（交错 8/8 全胜），yolo 噪声内；
   三模型 model_check / reuse_check PASS。**建议继续 D4（conv 生产者直写），暂缓 D1/D2/D3/D6**。
 - `config/tuning.json` 未改动（D4 是布局/内核级改动，不改选择）。
+
+---
+
+## 8. 进展（R50：D6 depthwise）
+
+见 [`round50-depthwise-yblock-and-mincut-fix.md`](round50-depthwise-yblock-and-mincut-fix.md)：
+`depthwise_blk` 新增 `-DY_BLOCK`（多行/WI，逐位一致）+ 布局契约成本 `#blkfsv16`
+（输出 fsv16 比 bfyx 快 ~2–3×）+ 修复 R49 mincut 漏 `Cout%16` 门导致的数值错乱
+（并修复 `model_check` 未透传 env 的假 PASS）。mincut（opt-in）mb −3.9% / y11 −2.1%。
+

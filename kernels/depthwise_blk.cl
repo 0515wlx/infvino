@@ -18,6 +18,16 @@
 // Simplified vs upstream: stride=1 fast path + general scalar fallback for
 // stride>1 / boundaries, runtime leftovers, no JIT macro layer.
 //
+// R50: added `Y_BLOCK` (output rows per work-item).  The classic kernel loads
+// `K` input rows to produce ONE output row; `Y_BLOCK=T` produces T consecutive
+// rows while loading only `(T-1)*S + K` rows, so each input row is loaded once
+// and reused across the `K` output rows it contributes to (sliding window over
+// ir).  This is the depthwise analogue of `conv1x1_blk`'s Y_BLOCK (R48 D1) and
+// targets the instruction/feed bound measured by the ISA histogram (add/mov/shl/
+// send dominate over mad).  Accumulation order per output is unchanged
+// (kh = 0..K-1) => bit-identical to Y_BLOCK=1.  Default Y_BLOCK=1 keeps the
+// original behaviour.
+//
 // See THIRD_PARTY_NOTICES.md / third_party/openvino/LICENSE.
 // ---------------------------------------------------------------------------
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
@@ -41,11 +51,14 @@
 #ifndef PAD
 #define PAD 1
 #endif
-#ifndef ACT             // depthwise act codes (same as conv_general.cl):
-#define ACT 0           //  1=SiLU 2=HardSwish 3=ReLU 4=HardSigmoid 0=none
+#ifndef ACT             // depthwise 规范激活码（与 conv_general.cl 的 dw_activate 一致）：
+#define ACT 0           //  1=SiLU 2=ReLU 3=HardSwish 4=HardSigmoid 0=none
 #endif
 #ifndef OUT_FSV16
 #define OUT_FSV16 0
+#endif
+#ifndef Y_BLOCK         // R50: output rows per work-item (1 = original)
+#define Y_BLOCK 1
 #endif
 
 #if X_BLOCK == 8
@@ -66,6 +79,8 @@
 
 // Input columns spanned by one X_BLOCK output block: (X_BLOCK-1)*S + K.
 #define DW_SPAN ((X_BLOCK - 1) * STRIDE + DWK)
+// Input rows spanned by one Y_BLOCK output block: (Y_BLOCK-1)*S + K.
+#define DW_IRCOUNT ((Y_BLOCK - 1) * STRIDE + DWK)
 // Packed 8-wide block read used only for line loading (independent of X_BLOCK).
 #define DW_BLK8(p) as_half8(intel_sub_group_block_read_us8(p))
 
@@ -103,61 +118,85 @@ __kernel void depthwise_blk(
   const int X_BLOCKS = (Wo + X_BLOCK - 1) / X_BLOCK;
   const int xy = get_global_id(0);
   const int x0 = (xy % X_BLOCKS) * X_BLOCK;
-  const int y = xy / X_BLOCKS;
+  const int y0 = (xy / X_BLOCKS) * Y_BLOCK;   // first output row of this WI
 
   const int input_y_pitch = SG * W;
   const int input_fs_pitch = SG * W * H;
   const int base_cb = f_block * input_fs_pitch;
-  const int input_y0 = y * STRIDE - PAD;
+  const int colbase = x0 * STRIDE - PAD;
 
-  VEC_T dst = (VEC_T)0;
+  // R50: weights hoisted once per WI (reused across Y_BLOCK rows and X_BLOCK cols).
+  half wt[DWK * DWK];
+#pragma unroll
+  for (int i = 0; i < DWK * DWK; ++i) wt[i] = weights[(f_block * DWK * DWK + i) * SG + lane];
 
-  for (int kh = 0; kh < DWK; ++kh) {
-    const int iy = input_y0 + kh;
-    if (iy < 0 || iy >= H) continue;
-    const int row_base = base_cb + iy * input_y_pitch;
+  half acc[Y_BLOCK * X_BLOCK];
+#pragma unroll
+  for (int i = 0; i < Y_BLOCK * X_BLOCK; ++i) acc[i] = (half)0;
 
-    // Load the whole input span for this row ONCE (one register line), then reuse
-    // it across all kw taps — the key difference vs re-reading per tap.
+  // Sliding window over the (Y_BLOCK-1)*S + K input rows: each row is loaded once
+  // and applied to every output row t for which kh = ir - t*S lies in [0, K).
+#pragma unroll
+  for (int ir = 0; ir < DW_IRCOUNT; ++ir) {
+    const int iy = y0 * STRIDE - PAD + ir;
+    const bool rowok = (iy >= 0 && iy < H);
+
     half line[DW_SPAN];
-    const int colbase = x0 * STRIDE - PAD;
-    if (cok && colbase >= 0 && colbase + DW_SPAN <= W) {
-      int j = 0;
+    if (rowok) {
+      const int row_base = base_cb + iy * input_y_pitch;
+      // Load the whole input span for this row ONCE (one register line), then reuse
+      // it across all (t,kw) taps — the key difference vs re-reading per tap.
+      if (cok && colbase >= 0 && colbase + DW_SPAN <= W) {
+        int j = 0;
 #pragma unroll
-      for (; j + 8 <= DW_SPAN; j += 8) {
-        half8 v = DW_BLK8((__global const ushort *)input + row_base + (colbase + j) * SG);
+        for (; j + 8 <= DW_SPAN; j += 8) {
+          half8 v = DW_BLK8((__global const ushort *)input + row_base + (colbase + j) * SG);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) line[j + i] = v[i];
+          for (int i2 = 0; i2 < 8; ++i2) line[j + i2] = v[i2];
+        }
+#pragma unroll
+        for (; j < DW_SPAN; ++j) line[j] = input[row_base + (colbase + j) * SG + lane];
+      } else {
+#pragma unroll
+        for (int j = 0; j < DW_SPAN; ++j) {
+          const int col = colbase + j;
+          line[j] = (cok && col >= 0 && col < W) ? input[row_base + col * SG + lane] : (half)0;
+        }
       }
-#pragma unroll
-      for (; j < DW_SPAN; ++j) line[j] = input[row_base + (colbase + j) * SG + lane];
     } else {
 #pragma unroll
-      for (int j = 0; j < DW_SPAN; ++j) {
-        const int col = colbase + j;
-        line[j] = (cok && col >= 0 && col < W) ? input[row_base + col * SG + lane] : (half)0;
-      }
+      for (int j = 0; j < DW_SPAN; ++j) line[j] = (half)0;
     }
 
 #pragma unroll
-    for (int kw = 0; kw < DWK; ++kw) {
-      const half wv = weights[(f_block * DWK * DWK + kh * DWK + kw) * SG + lane];
+    for (int t = 0; t < Y_BLOCK; ++t) {
+      const int kh = ir - t * STRIDE;
+      if (kh < 0 || kh >= DWK) continue;   // compile-time after full unroll
 #pragma unroll
-      for (int t = 0; t < X_BLOCK; ++t)
-        dst[t] = mad(line[t * STRIDE + kw], wv, dst[t]);
+      for (int kw = 0; kw < DWK; ++kw) {
+#pragma unroll
+        for (int j = 0; j < X_BLOCK; ++j)
+          acc[t * X_BLOCK + j] =
+              mad(line[j * STRIDE + kw], wt[kh * DWK + kw], acc[t * X_BLOCK + j]);
+      }
     }
   }
 
   const half b = (bias != 0 && cok) ? bias[c] : (half)0;
 #pragma unroll
-  for (int t = 0; t < X_BLOCK; ++t) {
-    const int xx = x0 + t;
-    if (!cok || xx >= Wo) continue;
-    const half v = dwblk_activate((half)(dst[t] + b));
+  for (int t = 0; t < Y_BLOCK; ++t) {
+    const int yy = y0 + t;
+    if (yy >= Ho) continue;
+#pragma unroll
+    for (int j = 0; j < X_BLOCK; ++j) {
+      const int xx = x0 + j;
+      if (!cok || xx >= Wo) continue;
+      const half v = dwblk_activate((half)(acc[t * X_BLOCK + j] + b));
 #if OUT_FSV16
-    output[(((size_t)f_block * Ho + y) * Wo + xx) * SG + lane] = v;
+      output[(((size_t)f_block * Ho + yy) * Wo + xx) * SG + lane] = v;
 #else
-    output[((size_t)c * Ho + y) * Wo + xx] = v;
+      output[((size_t)c * Ho + yy) * Wo + xx] = v;
 #endif
+    }
   }
 }

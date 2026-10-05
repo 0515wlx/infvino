@@ -664,15 +664,22 @@ const std::vector<KernelFamily> & kernelFamilies()
       };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
-        for (int xb : {4, 8}) {
-          if (s.W > 0 && xb > s.W) continue;
-          std::ostringstream o;
-          o << "-DX_BLOCK=" << xb << " -DDWK=" << s.K << " -DSTRIDE=" << s.stride
-            << " -DPAD=" << s.pad << " -DACT=" << s.act
-            << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
-          std::ostringstream cc;
-          cc << "XB" << xb << " K" << s.K << " s" << s.stride << " act" << s.act;
-          out.push_back(mk("depthwise_blk", "depthwise_blk", o.str(), cc.str()));
+        // R50: Y_BLOCK = 每 WI 的输出行数（输入行滑动窗口复用）。K 个输入行服务 1 个输出行 →
+        // YB=T 时 (T-1)*S+K 个输入行服务 T 个输出行，输入 load/地址计算摊薄 ~K/T 倍。逐位一致
+        // （每个输出的 kh 累加顺序不变）。约束 XB*YB<=16（累加器/line 寄存器预算）。
+        for (int yb : {1, 2, 4}) {
+          if (s.H > 0 && yb > s.H) continue;
+          for (int xb : {4, 8}) {
+            if (s.W > 0 && xb > s.W) continue;
+            if (xb * yb > 16) continue;
+            std::ostringstream o;
+            o << "-DX_BLOCK=" << xb << " -DY_BLOCK=" << yb << " -DDWK=" << s.K
+              << " -DSTRIDE=" << s.stride << " -DPAD=" << s.pad << " -DACT=" << s.act
+              << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+            std::ostringstream cc;
+            cc << "XB" << xb << " YB" << yb << " K" << s.K << " s" << s.stride << " act" << s.act;
+            out.push_back(mk("depthwise_blk", "depthwise_blk", o.str(), cc.str()));
+          }
         }
         return out;
       };

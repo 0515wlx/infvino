@@ -304,3 +304,22 @@ blocked 且 C%16==0」时标记输出 fsv16；dispatch 据此编译。
 
 D4（§10）收益确认，已 commit（`fix(autotune)/docs: R48 D4 ...`）。
 `config/tuning.json` 仍未改动（D4 是布局/内核级改动，不改选择）。
+
+---
+
+## 12. R50：D6 depthwise 扩充 + mincut 数值修复
+
+见 [`round50-depthwise-yblock-and-mincut-fix.md`](round50-depthwise-yblock-and-mincut-fix.md)。
+要点：
+
+- **D6 候选**：`depthwise_blk` 新增 `-DY_BLOCK`（多行/WI，输入行滑动窗口复用），逐位一致；
+  大 spatial 有效、小 spatial 按签名分族。候选 2→5。
+- **契约成本 `#blkfsv16`**：depthwise_blk 输出 fsv16 比 bfyx 快 ~2–3×，但 autotune 一直按
+  bfyx 测量 → 布局规划成本系统性高估 blocked 族。新增输出 fsv16 的真实成本，y11 −1.3%。
+- **倒查出 R49 mincut 的 correctness bug**：漏了 `Cout%16==0` 持久化门 → 非 16 对齐张量写越界
+  → mb 输出错乱（mean_rel 0.44）。修复后 mb mincut 真实收益 −3.9%（原 −14% 含非法布局）。
+- **`model_check` 假 PASS 修复**：docker run 未透传 `INFVINO_*` env，R49 的「mincut PASS」实为
+  默认路径 PASS。已加 `-e` 透传。
+- 验收：mincut（opt-in）mb −3.9%（ACCEPT）/ y11 −2.1%（ACCEPT）/ y8 REJECT（无回归）；
+  `tuning_test`、model_check、位一致性均 PASS。`config/tuning.json` 未改动。
+
