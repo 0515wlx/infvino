@@ -4060,59 +4060,89 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     *sb = statsOf(bs);
   };
 
-  // R47 step2: **L3 溢出估计（确定性、零 GPU）**。用复用距离近似「张量在被消费前是否已被逐出 L3」：
-  //   对每个激活张量 t：pressure = 其生产者与最后消费者之间新写入的字节；若 pressure + bytes(t) > L3，
-  //   判为一次 DRAM 往返。另把「blk 输入未持久化时引入的 reorder 缓冲」计为额外 L3 占用。
-  // 折算成时间：spill × (1/BW_DRAM − 1/BW_L3)。这是对本机 OA 计数器不可用的**替代估计**。
-  std::vector<double> outBytes(nodes_.size(), 0.0);
-  std::vector<double> prefix(nodes_.size() + 1, 0.0);
-  for (size_t i = 0; i < nodes_.size(); ++i)
-  {
-    if (!nodes_[i].outs.empty())
-    {
-      auto it = T_.find(nodes_[i].outs[0]);
-      if (it != T_.end()) outBytes[i] = static_cast<double>(it->second.numel()) * 2.0;
-    }
-    prefix[i + 1] = prefix[i] + outBytes[i];
-  }
-  std::unordered_map<std::string, int> prod, lastUse;
-  for (size_t i = 0; i < nodes_.size(); ++i)
-    if (!nodes_[i].outs.empty()) prod[nodes_[i].outs[0]] = static_cast<int>(i);
-  for (size_t i = 0; i < nodes_.size(); ++i)
-    for (const auto & in : nodes_[i].ins)
-      if (in != "-") lastUse[in] = static_cast<int>(i);
-  constexpr double kL3 = 3.75e6;                          // 有效 L3（与 Tuning.cpp 一致）
+  // R47 step3: **全局 L3 模拟（LRU）** —— 占用会引入强耦合（A 的瞬时工作集逐出 B 的输入），
+  // 因此**不能**用逐算子独立项（会二次计费、且破坏可加性），而必须**按节点顺序跑一遍全局缓存
+  // 模拟**：维护容量 = L3 的常驻张量集合（LRU），每个节点先按其**瞬时占用**（并发 WG × 每 WG
+  // tile 字节）冲刷 LRU，再读输入（未命中 → 记一次 DRAM 往返）/写输出。耦合由模拟本身处理。
+  // 折算：miss_bytes × (1/BW_DRAM − 1/BW_L3)。这是对 OA 计数器不可用的替代估计。
+  constexpr double kL3 = 3.75e6;
   constexpr double kSpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;   // s/byte → ms/byte
-  auto spillMs = [&]() -> double {
-    double spill = 0.0;
-    for (const auto & kv : prod)
+  auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
+    const std::string k(key);
+    auto p = opts.find(k);
+    if (p == std::string::npos) return def;
+    return std::atoi(opts.c_str() + p + k.size());
+  };
+  // 每节点的瞬时 L3 占用（并发 WG × 每 WG 输入 tile 字节）——跨算子耦合的来源。
+  auto occupancyPressure = [&](const TuningEntry & e, const OpSignature & s) -> double {
+    double nwg = 1.0, perWg = 0.0;
+    if (s.op == "conv3x3")
     {
-      auto lu = lastUse.find(kv.first);
-      if (lu == lastUse.end()) continue;
-      auto ti = T_.find(kv.first);
-      if (ti == T_.end()) continue;
-      const double b = static_cast<double>(ti->second.numel()) * 2.0;
-      const int p = kv.second, c = lu->second;
-      if (c <= p) continue;
-      const double pressure = prefix[c + 1] - prefix[p + 1];   // 节点 (p, c] 产出的字节
-      if (pressure + b > kL3) spill += b;
+      const int obw = optIntOf(e.options, "-DOBW=", s.stride == 2 ? 5 : 8);
+      const int obh = optIntOf(e.options, "-DOBH=", s.stride == 2 ? 4 : 2);
+      nwg = static_cast<double>((s.W + obw - 1) / obw) * ((s.H + obh - 1) / obh) *
+            ((s.Cout + 15) / 16);
+      perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
     }
-    // reorder 缓冲（blk 输入未持久 fsv16）额外占用 L3。
-    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
+    {
+      const int M = (s.op == "gemm") ? s.M : s.Cout;
+      const int N = s.N;
+      const int bm = optIntOf(e.options, "-DBM=", 64);
+      const int bn = optIntOf(e.options, "-DBN=", 64);
+      const int bk = optIntOf(e.options, "-DBK=", 16);
+      nwg = static_cast<double>((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+      perWg = 2.0 * (static_cast<double>(bm) * bk + static_cast<double>(bn) * bk);
+    }
+    else
+      return 0.0;   // 小算子：占用并入其自身实测（launch/带宽受限）
+    const double concurrent = std::min(nwg, 80.0);   // 在飞 WG 上限（≈EU 数；可标定）
+    return concurrent * perWg;
+  };
+  auto spillMs = [&]() -> double {
+    std::vector<std::pair<std::string, double>> res;   // MRU 在尾部
+    double resBytes = 0.0, miss = 0.0;
+    auto touch = [&](const std::string & name, double bytes, bool write) {
+      for (size_t k = 0; k < res.size(); ++k)
+        if (res[k].first == name)
+        {
+          auto pv = res[k];
+          res.erase(res.begin() + static_cast<long>(k));
+          res.push_back(pv);
+          return;
+        }
+      if (!write) miss += bytes;
+      res.push_back({name, bytes});
+      resBytes += bytes;
+      while (resBytes > kL3 && !res.empty()) { resBytes -= res.front().second; res.erase(res.begin()); }
+    };
+    for (size_t i = 0; i < nodes_.size(); ++i)
     {
       bool ok = false;
-      const OpSignature s = nodeSignature(nodes_[ni], &ok);
-      if (!ok) continue;
-      const TuningEntry * e = choiceEntry(ni, s);
-      if (!e || e->kernel.find("_blk") == std::string::npos) continue;
-      const Node & n = nodes_[ni];
-      const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
-      if (n.ins.size() <= inIdx) continue;
-      auto xit = T_.find(n.ins[inIdx]);
-      if (xit == T_.end() || xit->second.fsv16) continue;
-      spill += static_cast<double>(xit->second.numel()) * 2.0;
+      const OpSignature s = nodeSignature(nodes_[i], &ok);
+      const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
+      // 占用压力：先冲刷 LRU，给本节点在飞工作集腾地方（跨算子耦合在此体现）。
+      const double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
+      while (resBytes + press > kL3 && !res.empty())
+      {
+        resBytes -= res.front().second;
+        res.erase(res.begin());
+      }
+      const Node & n = nodes_[i];
+      for (const auto & in : n.ins)
+      {
+        if (in == "-") continue;
+        auto it = T_.find(in);
+        if (it == T_.end()) continue;   // 权重/非激活 → 不计
+        touch(in, static_cast<double>(it->second.numel()) * 2.0, false);
+      }
+      if (!n.outs.empty())
+      {
+        auto it = T_.find(n.outs[0]);
+        if (it != T_.end()) touch(n.outs[0], static_cast<double>(it->second.numel()) * 2.0, true);
+      }
     }
-    return spill * kSpillPerByteMs;
+    return miss * kSpillPerByteMs;
   };
 
   // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的

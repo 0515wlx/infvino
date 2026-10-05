@@ -125,3 +125,44 @@ predictNet  = Σ 逐节点 kernel ms + Σ #reorder.ms + spill_ms
 都显式含内存层级。要把它变成**准确实用**的选择依据，缺的是可用计数器或一套校准实验来标定
 「每候选跨算子外溢」。在这些就位前，**保留隔离 `min` 作为选择主口径**，`predictNet` 仅用于
 拒绝明显更差的候选（S2 门）。
+
+---
+
+## 8. 第三步：占用建模 + 强耦合的全局处理（L3 LRU 模拟）
+
+**为什么不能逐算子相加**：瞬时占用会引入**强耦合**——候选 A 的在飞工作集会把候选 B 要读的输入
+逐出 L3，B 的代价依赖 A 的选择。逐算子独立项会（a）无法表达这种相互依赖，（b）二次计费
+（既算 `#reorder.ms` 又算张量逐出），（c）破坏可加性。**因此改为按节点顺序跑一遍全局缓存模拟。**
+
+**实现**（`PlanModel.cpp::globalRetune`，零 GPU）：
+
+```
+状态：容量 = L3 的常驻张量集合（MRU 在尾）
+每节点 i：
+  press = min(WG_count, 80) × perWG_bytes        # 瞬时占用（并发 WG × 每 WG tile）
+  while resident + press > L3: 逐出 LRU 头
+  for each 输入激活: touch(read)                  # 未命中 → miss += bytes
+  touch(输出, write)
+spill_ms = miss_bytes × (1/BW_DRAM − 1/BW_L3)
+```
+
+- `perWG`：conv3x3 = `2·Cin·(obw+2)(obh+2)`；gemm/conv1x1 = `2·(bm·bk + bn·bk)`（按候选 options
+  的 OBW/OBH/BM/BN/BK）；并发 WG ≈ min(grid, EU 数)。
+- **耦合由模拟整体处理**：每次 `predictNet(asg)` 都在**整张图上重跑**一遍模拟，因此 A 的占用
+  对 B 的影响会被一致地计入——这正是「全局、不可加」的部分。
+- 报告打印 `base(L3 spill est)`；mb 实测 ≈ **0.227 ms**（约 busy 的 **13%**，比 step2 的 0.035 ms
+  更贴近含占用后的真实压力）。
+
+**诚实的边界**：
+1. `perWG` 是**上界代理**（实际并发受寄存器/调度限制），是常量因子；`predictNet` 会把它当
+   单一未标定系数的 proxy。**可标定**：用 `kernel_bench --op bandwidth` 的 footprint 扫描 +
+   隔离实测来拟合该系数。
+2. 逐出按**字节**近似（张量粒度，非 cache-line 粒度），忽略了组相联/流式写占位。
+3. 仍然：**端到端噪声**（§见 findings §4.6）不因更准的模型而消失——模型提高的是**选择依据**的
+   质量，不是测量精度。因此 `predictNet` 的正确定位仍是「排序 / 拒绝明显更差者」，最终裁决在
+   测量可信度解决之前不宜依赖端到端。
+
+**意义**：至此，选择目标里**显式包含**了「计算 roofline + 内存 roofline（L3 断崖）+ 跨算子 L3
+占用耦合」，且耦合以全局模拟方式一致处理，而不是逐算子相加。这是让「选择」真正 LLC 感知的关键
+结构；剩下的是**标定**（把第 1 条的常量因子拟合准）。
+
