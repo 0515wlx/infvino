@@ -4096,7 +4096,10 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     }
     else
       return 0.0;   // 小算子：占用并入其自身实测（launch/带宽受限）
-    const double concurrent = std::min(nwg, 80.0);   // 在飞 WG 上限（≈EU 数；可标定）
+    // R47 标定（kernel_bench --op occ, 锁频）：ops/EU/cyc 线性升到 nwg≈128 才饱和
+    // （20 ops/EU/cyc），nwg≥160 进入第二波次 → 饱和并发 ≈ 128 个 64-WI WG。
+    constexpr double kSatWG = 128.0;
+    const double concurrent = std::min(nwg, kSatWG);
     return concurrent * perWg;
   };
   auto spillMs = [&]() -> double {
