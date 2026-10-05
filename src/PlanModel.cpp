@@ -4073,15 +4073,20 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     if (p == std::string::npos) return def;
     return std::atoi(opts.c_str() + p + k.size());
   };
-  // 每节点的瞬时 L3 占用（并发 WG × 每 WG 输入 tile 字节）——跨算子耦合的来源。
+  // R47 标定：饱和阈值是 **8192 个线程**（= 102.4 线程/EU），与 WG 大小、寄存器用量均无关
+  // （见 docs/round47-l3-model.md §9.2；此前写死「128 WG」只对 WG=64 成立）。按线程算并发。
   auto occupancyPressure = [&](const TuningEntry & e, const OpSignature & s) -> double {
-    double nwg = 1.0, perWg = 0.0;
+    double totalThreads = 1.0, perWg = 0.0;
+    int wgSize = 64;   // 生产 kernel 的 local size（conv3x3_blk=16·SLM；gemm 原约 64；此处近似）
     if (s.op == "conv3x3")
     {
       const int obw = optIntOf(e.options, "-DOBW=", s.stride == 2 ? 5 : 8);
       const int obh = optIntOf(e.options, "-DOBH=", s.stride == 2 ? 4 : 2);
-      nwg = static_cast<double>((s.W + obw - 1) / obw) * ((s.H + obh - 1) / obh) *
-            ((s.Cout + 15) / 16);
+      const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
+      wgSize = 16 * slm;
+      const double nwg = static_cast<double>((s.W + obw - 1) / obw) * ((s.H + obh - 1) / obh) *
+                         ((s.Cout + 15) / 16);
+      totalThreads = nwg * wgSize;
       perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
     }
     else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
@@ -4091,15 +4096,16 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       const int bm = optIntOf(e.options, "-DBM=", 64);
       const int bn = optIntOf(e.options, "-DBN=", 64);
       const int bk = optIntOf(e.options, "-DBK=", 16);
-      nwg = static_cast<double>((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+      const int tn = optIntOf(e.options, "-DTN=", 4);
+      wgSize = bn / tn;
+      const double nwg = static_cast<double>((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+      totalThreads = nwg * wgSize;
       perWg = 2.0 * (static_cast<double>(bm) * bk + static_cast<double>(bn) * bk);
     }
     else
       return 0.0;   // 小算子：占用并入其自身实测（launch/带宽受限）
-    // R47 标定（kernel_bench --op occ, 锁频）：ops/EU/cyc 线性升到 nwg≈128 才饱和
-    // （20 ops/EU/cyc），nwg≥160 进入第二波次 → 饱和并发 ≈ 128 个 64-WI WG。
-    constexpr double kSatWG = 128.0;
-    const double concurrent = std::min(nwg, kSatWG);
+    constexpr double kSatThreads = 8192.0;   // 实测：与 WG/寄存器无关的线程数上限
+    const double concurrent = std::min(totalThreads, kSatThreads);
     return concurrent * perWg;
   };
   auto spillMs = [&]() -> double {

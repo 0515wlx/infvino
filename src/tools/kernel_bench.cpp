@@ -1072,6 +1072,41 @@ int benchOcc(infvino::ClRuntime & rt, int depth, int sg, const std::string & wid
   return 0;
 }
 
+// R47: sweep work-group size + count to understand the EU saturation threshold
+// (is it 80 raw threads/EU, or a fixed #work-groups / scheduler slots?). Uses
+// fma_wgs built with -DWGS=<n> so the hardware WG-size is truthful.
+int benchOccWgs(infvino::ClRuntime & rt, int depth, int sg)
+{
+  std::printf("[occwgs] DEPTH=%d sg=%d : ops/EU/cyc vs (nwg, WG size)\n", depth, sg);
+  const int ITERS = 256;
+  for (int wg : {16, 32, 64, 128}) {
+    std::string opts = "-DDEPTH=" + std::to_string(depth) + " -DITERS=" + std::to_string(ITERS) +
+                       " -DWGS=" + std::to_string(wg) + " -cl-mad-enable -cl-fast-relaxed-math";
+    cl_kernel k;
+    try { k = rt.buildKernel("micro", "fma_wgs", opts); }
+    catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+    cl_mem out = rt.alloc(16, CL_MEM_WRITE_ONLY);
+    const uint16_t ah = infvino::f32_to_f16(1.0001f), bh = infvino::f32_to_f16(1e-4f);
+    clSetKernelArg(k, 0, sizeof(out), &out);
+    clSetKernelArg(k, 1, sizeof(ah), &ah);
+    clSetKernelArg(k, 2, sizeof(bh), &bh);
+    std::printf("  WG=%d:\n", wg);
+    for (int nwg : {16, 32, 48, 64, 80, 96, 112, 128, 160, 256, 512, 1024}) {
+      const size_t lws = static_cast<size_t>(wg);
+      const size_t gws = static_cast<size_t>(nwg) * lws;
+      const double med = rt.timeMs(
+        [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 5);
+      const double flops = 2.0 * static_cast<double>(gws) * ITERS * depth;
+      const double ops = rt.opsPerEuCycle(flops, med);
+      std::printf("    nwg=%-4d threads=%-6zu  %7.3f ms  ops/EU/cyc=%5.2f  (thr/EU=%.1f)\n",
+                  nwg, gws, med, ops, static_cast<double>(gws) / 80.0);
+    }
+    clReleaseMemObject(out);
+    clReleaseKernel(k);
+  }
+  return 0;
+}
+
 // Pointer chase: latency per access vs working-set size (bytes).
 int benchMemLat(infvino::ClRuntime & rt, const std::vector<size_t> & sizes_kb, int fi)
 {
@@ -1261,6 +1296,45 @@ int benchBarrier(infvino::ClRuntime & rt, int wg, int nwg, int iters, int mode)
   return 0;
 }
 
+// R47 calibration: occupancy footprint scan. Each WI keeps WS*4 bytes hot; the
+// resident footprint = gws * WS*4 is swept by --nwg (WIs) to find the knee where
+// bandwidth collapses (L3 capacity under occupancy). Also reports the linear
+// scaling (bytes/(WI*pass)) to calibrate perWG_bytes.
+int benchFootprintBw(infvino::ClRuntime & rt, int ws, int passes)
+{
+  const int maxWi = 4096;
+  const int PASSES = 64;  // fixed scan length per WI (constant work; residency swept by WI count)
+  (void)passes;
+  const size_t n = static_cast<size_t>(maxWi) * ws * 16;  // cache-line strided
+  cl_kernel k = rt.buildKernel("micro", "footprint_scan", "-cl-mad-enable");
+  cl_mem in = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(n, 1); rt.write(in, n * 4, z.data()); }
+  const uint nn = static_cast<uint>(n), pp = static_cast<uint>(PASSES), wsu = static_cast<uint>(ws);
+  clSetKernelArg(k, 0, sizeof(in), &in);
+  clSetKernelArg(k, 1, sizeof(sink), &sink);
+  clSetKernelArg(k, 2, sizeof(nn), &nn);
+  clSetKernelArg(k, 3, sizeof(pp), &pp);
+  clSetKernelArg(k, 4, sizeof(wsu), &wsu);
+  const size_t lws = 64;
+  std::printf("[footprint] ws=%d uints (%.1f KB/WI), passes=%d\n", ws, ws * 4.0 / 1024.0, PASSES);
+  for (int wi : {64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096}) {
+    const size_t gws = static_cast<size_t>(wi);
+    if (gws > static_cast<size_t>(maxWi)) break;
+    const double med = rt.timeMs(
+      [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 7);
+    const double bytes = static_cast<double>(wi) * ws * 4.0 * PASSES;
+    const double gbps = bytes / (med * 1e-3) / 1e9;
+    const double footMB = static_cast<double>(wi) * ws * 4.0 / 1e6;
+    std::printf("  footprint wi=%-4d WGs=%-4zu residency=%6.2f MB  %7.3f ms  %7.1f GB/s\n",
+                wi, gws / 64, footMB, med, gbps);
+  }
+  clReleaseMemObject(in);
+  clReleaseMemObject(sink);
+  clReleaseKernel(k);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -1409,6 +1483,8 @@ int main(int argc, char ** argv)
     std::printf("[occ] occupancy / register-pressure probe (--depth D --sg 16 --width h8|cyc)\n");
     if (sg == 0) sg = 16;
     rc = benchOcc(rt, depth, sg, width);
+  } else if (op == "occwgs") {
+    rc = benchOccWgs(rt, depth, sg == 0 ? 16 : sg);
   } else if (op == "memlat") {
     std::printf("[memlat] pointer-chase latency vs working set\n");
     if (sizes_kb.empty()) sizes_kb = {4, 16, 64, 256, 1024, 4096, 16384};
@@ -1430,6 +1506,8 @@ int main(int argc, char ** argv)
   } else if (op == "barrier") {
     std::printf("[barrier] work-group barrier decomposition (--wg --nwg --mode)\n");
     rc = benchBarrier(rt, wg, nwg, iters, mode);
+  } else if (op == "footprint") {
+    rc = benchFootprintBw(rt, depth, iters);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

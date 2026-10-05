@@ -166,6 +166,28 @@ __kernel void add_lat(__global int *out, const int a) {
   if (acc == 0x7fffffff) out[0] = acc;
 }
 
+// R47: work-group-size sweep for the occupancy probe. Same code as fma_cyc but
+// work-group size is a macro, so we can find whether the EU threshold scales
+// with WG size (raw threads) or is a fixed WG count (scheduler slots).
+#ifndef WGS
+#define WGS 64
+#endif
+__attribute__((reqd_work_group_size(WGS, 1, 1)))
+__kernel void fma_wgs(__global half *out, const half a, const half b) {
+  half r[DEPTH];
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d)
+    r[d] = (half)((get_global_id(0) + d) & 7) * (half)0.125f + (half)1.0f;
+  for (int i = 0; i < ITERS; ++i) {
+#pragma unroll
+    for (int d = 0; d < DEPTH; ++d) r[(d + 1) & (DEPTH - 1)] = mad(r[d], a, b);
+  }
+  half s = (half)0;
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d) s += r[d];
+  if (s == (half)-12345.0f) out[0] = s;
+}
+
 // ---------------------------------------------------------------------------
 // B. SLM (L1) FMA feeding: mad reading one operand from __local, one from a
 // register. Measures how fast the local-memory pipe can feed the FPU.
@@ -247,6 +269,24 @@ __kernel void scan_rep(__global const uint *restrict in, __global uint *sink,
   }
   if (acc == 0xdeadbeefu) sink[0] = acc;
 }
+
+// R47 calibration: per-work-item "footprint" load test. Each WI reads WS*uint
+// (WS*4 bytes) starting at its own base (gid*WS), WS times, many passes. The
+// RESIDENT working set = (concurrent WIs) * WS*4 — swept via the grid size. Used
+// to calibrate perWG_bytes: effective bandwidth vs concurrent occupancy footprint.
+// Layout is cache-line-strided (p*16 apart) so each WI keeps WS distinct lines hot.
+__kernel void footprint_scan(__global const uint *restrict in, __global uint *sink,
+                             const uint n, const uint passes, const uint ws) {
+  const uint gid = get_global_id(0);
+  const uint base = gid * ws;
+  if (base + ws > n) return;
+  uint acc = 0;
+  for (uint p = 0; p < passes; ++p) {
+    for (uint k = 0; k < ws; ++k) acc += in[base + ((k + p) % ws) * 16u];
+  }
+  if (acc == 0xdeadbeefu) sink[0] = acc;
+}
+
 
 // ---------------------------------------------------------------------------
 // H. Work-group barrier cost (Round 12). Each iteration does a real SLM store
