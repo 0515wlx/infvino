@@ -1183,6 +1183,7 @@ void PlanModel::resolveLayoutChoices()
         auto it = s.fsv.find(kv.first);
         if (it != s.fsv.end()) kv.second.fsv16 = (it->second != 0);
       }
+      invalidateCapture();  // 布局改变 ⇒ 已录制的 dispatch 失效（否则回退后仍重放旧录制）
     };
     const LayoutState base = snap();
     if (!resolveLayoutMinCut(alt))
@@ -1351,7 +1352,18 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     if (pin) en.fix(static_cast<int>(v), 0);
   }
 
-  // ---- 节点代价表 f(x_in, x_out)（含 reorder，submodular）→ unary + 吸引项。----
+  // ---- 节点代价表 f(x_in, x_out)（含 reorder + 可选 R47 L3/占用会计，submodular）。----
+  // R49 缺口 1：把 R47 的**占用压力会计**接进节点代价（线性、可加）。隔离 ms 之外再计一项
+  // `occupancyPressure × kL3SpillPerByteMs`。
+  //
+  // ⚠️ 负结果（见 docs/round49 §10）：逐节点 L3 项**破坏了可加性/量级校准**——占用压力是
+  // 「总并发足迹」而非「miss 字节」，直接当节点成本会压过隔离 ms、把选择推向过度持久化
+  // （mb 提案 1.57→2.46 ms）。R47 的正确形态是**整网 LRU 模拟**（顺序相关），不能塞进成对
+  // min-cut 的节点项。因此本项**默认关**，仅作消融/实验旋钮（`INFVINO_LAYOUT_L3=1`）。
+  const bool useL3 = std::getenv("INFVINO_LAYOUT_L3") != nullptr;
+  auto inCurveMs = [&](const TuningEntry & e, const OpSignature & s) -> double {
+    return e.ms + (useL3 ? occupancyPressure(e, s) * kL3SpillPerByteMs : 0.0);
+  };
   //   f(0,0) = min(eN, eB+r)   NCHW 入/出：non，或 blk 付输入 reorder 写 NCHW
   //   f(0,1) = eB + r          NCHW 入 / FSV16 出：必须 blk，付输入 reorder
   //   f(1,0) = eB              FSV16 入 / NCHW 出：blk
@@ -1362,7 +1374,10 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     const Node & n = nodes_[ni];
     const int a = varId(n.ins[static_cast<size_t>(actSlot(ni))]);
     const int b = varId(n.outs[0]);
-    const double eB = alt[ni].blk.ms, eN = alt[ni].non.ms, r = alt[ni].reorder.ms;
+    bool ok = false;
+    const OpSignature s = nodeSignature(n, &ok);
+    const double eB = inCurveMs(alt[ni].blk, s), eN = inCurveMs(alt[ni].non, s),
+                 r = alt[ni].reorder.ms;
     const double f00 = std::min(eN, eB + r), f01 = eB + r, f10 = eB, f11 = eB;
     if (!en.addPairwiseTable(a, b, f00, f01, f10, f11))
       return false;  // 非 submodular → 回退
@@ -1384,7 +1399,10 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     const int b = varId(n.outs[0]);
     const bool la = (sol.labels[static_cast<size_t>(a)] == 1);
     const bool lb = (sol.labels[static_cast<size_t>(b)] == 1);
-    const double eB = alt[ni].blk.ms, eN = alt[ni].non.ms, r = alt[ni].reorder.ms;
+    bool ok = false;
+    const OpSignature s = nodeSignature(n, &ok);
+    const double eB = inCurveMs(alt[ni].blk, s), eN = inCurveMs(alt[ni].non, s),
+                 r = alt[ni].reorder.ms;
     const bool useBlk = la || lb || (eB + r <= eN);
     node_choice_[ni] = useBlk ? alt[ni].blk : alt[ni].non;
   }
@@ -4386,7 +4404,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   // tile 字节）冲刷 LRU，再读输入（未命中 → 记一次 DRAM 往返）/写输出。耦合由模拟本身处理。
   // 折算：miss_bytes × (1/BW_DRAM − 1/BW_L3)。这是对 OA 计数器不可用的替代估计。
   constexpr double kL3 = 3.75e6;
-  constexpr double kSpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;   // s/byte → ms/byte
+  // R49: miss 折算系数已抽到 Tuning.cpp 的 `kL3SpillPerByteMs`（单一真相源，mincut 共用）。
   auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
     const std::string k(key);
     auto p = opts.find(k);
@@ -4395,53 +4413,8 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   };
   // R47 标定：饱和阈值是 **8192 个线程**（= 102.4 线程/EU），与 WG 大小、寄存器用量均无关
   // （见 docs/round47-l3-model.md §9.2；此前写死「128 WG」只对 WG=64 成立）。按线程算并发。
-  auto occupancyPressure = [&](const TuningEntry & e, const OpSignature & s) -> double {
-    double totalThreads = 1.0, perWg = 0.0;
-    int wgSize = 64;   // 生产 kernel 的 local size（conv3x3_blk=16·SLM；gemm 原约 64；此处近似）
-    if (s.op == "conv3x3")
-    {
-      const int obw = optIntOf(e.options, "-DOBW=", s.stride == 2 ? 5 : 8);
-      const int obh = optIntOf(e.options, "-DOBH=", s.stride == 2 ? 4 : 2);
-      const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
-      wgSize = 16 * slm;
-      const double nwg = static_cast<double>((s.W + obw - 1) / obw) * ((s.H + obh - 1) / obh) *
-                         ((s.Cout + 15) / 16);
-      totalThreads = nwg * wgSize;
-      perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
-    }
-    else if (s.op == "conv1x1" && e.kernel == "conv1x1_blk")
-    {
-      // R48 D1: blocked 1x1 的占用 = 空间 tile (XB×YB) × Cout/16 个 WG；每 WG 足迹
-      // = Cin×XB×YB 元素。让 L3 模型能看到 tiling 候选（否则模型看不到新几何）。
-      const int xb = std::max(1, optIntOf(e.options, "-DX_BLOCK=", 4));
-      const int yb = std::max(1, optIntOf(e.options, "-DY_BLOCK=", 1));
-      const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
-      wgSize = 16 * slm;
-      const int tile = xb * yb;
-      const double nwg = static_cast<double>((s.N + tile - 1) / tile) *
-                         static_cast<double>((s.Cout + 15) / 16);
-      totalThreads = nwg * wgSize;
-      perWg = 2.0 * s.Cin * tile;
-    }
-    else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
-    {
-      const int M = (s.op == "gemm") ? s.M : s.Cout;
-      const int N = s.N;
-      const int bm = optIntOf(e.options, "-DBM=", 64);
-      const int bn = optIntOf(e.options, "-DBN=", 64);
-      const int bk = optIntOf(e.options, "-DBK=", 16);
-      const int tn = optIntOf(e.options, "-DTN=", 4);
-      wgSize = bn / tn;
-      const double nwg = static_cast<double>((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-      totalThreads = nwg * wgSize;
-      perWg = 2.0 * (static_cast<double>(bm) * bk + static_cast<double>(bn) * bk);
-    }
-    else
-      return 0.0;   // 小算子：占用并入其自身实测（launch/带宽受限）
-    constexpr double kSatThreads = 8192.0;   // 实测：与 WG/寄存器无关的线程数上限
-    const double concurrent = std::min(totalThreads, kSatThreads);
-    return concurrent * perWg;
-  };
+  // R49：占用压力已抽成单一真相源 `infvino::occupancyPressure`（Tuning.cpp），
+  // mincut 的节点代价与这里的 L3 模拟共用，避免两处口径漂移。
   // R47 step4: 占用感知的**有效 L3 容量**（footprint 实测，§9.1）：驻留足迹 ≈1MB 即达
   // ~21GB/s 平台，之后断崖（组相联/流式占位放大有效占用）。把 LRU 容量按节点占用缩放：
   // 占用越大，留给「其他张量复用」的有效容量越小。以 footprint 平台 1MB 为容量锚点。
@@ -4545,7 +4518,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     }
     return miss;
   };
-  auto spillMs = [&]() -> double { return spillBytes() * kSpillPerByteMs; };
+  auto spillMs = [&]() -> double { return spillBytes() * kL3SpillPerByteMs; };
 
   // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的
   // reorder 成本 + R47 step2 的 L3 溢出估计。对应 TVM meta_schedule 的「Σ weight × 单算子 ms」，

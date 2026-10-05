@@ -442,6 +442,62 @@ double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
 // R47: 导出 copy 带宽插值（外层可见）：转发到匿名命名空间里的同名实现。
 double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
 
+/** @brief R47 标定：L3 miss 折算（1/BW_DRAM − 1/BW_L3），ms/byte。*/
+const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;
+
+double occupancyPressure(const TuningEntry & e, const OpSignature & s)
+{
+  auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
+    const std::string k(key);
+    const auto p = opts.find(k);
+    if (p == std::string::npos) return def;
+    return std::atoi(opts.c_str() + p + k.size());
+  };
+  double totalThreads = 1.0, perWg = 0.0;
+  int    wgSize = 64;
+  if (s.op == "conv3x3")
+  {
+    const int obw = optIntOf(e.options, "-DOBW=", s.stride == 2 ? 5 : 8);
+    const int obh = optIntOf(e.options, "-DOBH=", s.stride == 2 ? 4 : 2);
+    const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
+    wgSize = 16 * slm;
+    const double nwg = static_cast<double>((s.W + obw - 1) / obw) * ((s.H + obh - 1) / obh) *
+                       ((s.Cout + 15) / 16);
+    totalThreads = nwg * wgSize;
+    perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
+  }
+  else if (s.op == "conv1x1" && e.kernel == "conv1x1_blk")
+  {
+    const int xb = std::max(1, optIntOf(e.options, "-DX_BLOCK=", 4));
+    const int yb = std::max(1, optIntOf(e.options, "-DY_BLOCK=", 1));
+    const int slm = std::max(1, optIntOf(e.options, "-DSLM_DIV=", 1));
+    wgSize = 16 * slm;
+    const int tile = xb * yb;
+    const double nwg = static_cast<double>((s.N + tile - 1) / tile) *
+                       static_cast<double>((s.Cout + 15) / 16);
+    totalThreads = nwg * wgSize;
+    perWg = 2.0 * s.Cin * tile;
+  }
+  else if (s.op == "conv1x1" || s.op == "gemm" || s.op == "conv1x1_cat4")
+  {
+    const int M = (s.op == "gemm") ? s.M : s.Cout;
+    const int N = s.N;
+    const int bm = optIntOf(e.options, "-DBM=", 64);
+    const int bn = optIntOf(e.options, "-DBN=", 64);
+    const int bk = optIntOf(e.options, "-DBK=", 16);
+    const int tn = optIntOf(e.options, "-DTN=", 4);
+    wgSize = bn / tn;
+    const double nwg = static_cast<double>((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+    totalThreads = nwg * wgSize;
+    perWg = 2.0 * (static_cast<double>(bm) * bk + static_cast<double>(bn) * bk);
+  }
+  else
+    return 0.0;  // 小算子：占用并入其自身实测（launch/带宽受限）
+  constexpr double kSatThreads = 8192.0;  // 实测：与 WG/寄存器无关的线程数上限
+  const double     concurrent = std::min(totalThreads, kSatThreads);
+  return concurrent * perWg;
+}
+
 // R47: 导出的 launch 地板（供 PlanModel 的小算子外溢估计使用）。
 const double kSmallLaunchUs = 3.5;
 

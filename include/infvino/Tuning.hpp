@@ -153,6 +153,13 @@ double copyBwGbps(double footprint);
 /** @brief R47: 小算子每 dispatch 的 launch 地板（µs）。 */
 extern const double kSmallLaunchUs;
 
+/** @brief R47/R49: 一个候选在整网里的**瞬时占用压力**（并发线程 × 每 WG 足迹字节）。
+ *  线性、可加、设备无关（只依赖候选 options 与 shape）。是 L3/占用会计的单一真相源：
+ *  `globalRetune` 的 L3 模拟与 `resolveLayoutMinCut` 的节点代价共用。*/
+double occupancyPressure(const TuningEntry & e, const OpSignature & sig);
+/** @brief R47 标定：L3 miss 折算 (1/BW_DRAM − 1/BW_L3)，单位 ms/byte。*/
+extern const double kL3SpillPerByteMs;
+
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/
 constexpr double kPeakOpsPerEuCycle = 32.0;
 /** @brief 纯寄存器 FP16 FMA 的结构上限（R13/R18）。*/

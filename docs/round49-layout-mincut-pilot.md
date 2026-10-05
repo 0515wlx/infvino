@@ -225,9 +225,43 @@ mincut 节点集从 `op=="conv1x1"` 放宽到**任何声明了布局契约的族
 ### 9.5 剩余缺口（下一步）
 
 1. **目标仍是隔离 ms**（缺口 A）：门能防回归，但「提案质量」仍受隔离口径限制（y8 提案为
-   全 NCHW）。根治需把 R47 的 L3/占用**会计**接进节点代价（线性、可加）。
+   全 NCHW）。根治需把 R47 的 L3/占用**会计**接进节点代价（线性、可加）——见 §10（本轮
+   尝试后的结论：**逐节点 L3 是负结果**，正确形态是整网模拟/评分器）。
 2. **生产侧/布局契约仍是族级**：`Candidate.canOutFsv16` 是候选级声明，但 per-port
    `pref/firm/fusable` 尚未全部进 `KernelFamily`（当前够用，见用户决策 2）。
 3. **conv3x3 未纳入**（缺口 C）：需先让 `conv3x3_blk` 在契约上不弱于 ov，或明确放弃其 blocked 链。
 4. **门需要 profiling + 构造期多次整网执行**：生产应离线跑一次（kernel_autotune）后 bake 成
    per-plan 工件，而非运行时每次自检。
+
+---
+
+## 10. 缺口 1：把 R47 的 L3/占用会计接进节点代价（**负结果**）
+
+> 目标：让 mincut 的节点代价「看见」整网 L3 占用，而非只用隔离 ms。
+
+**已做（可复用，保留）**：
+- 把 `globalRetune` 里的局部 `occupancyPressure` 抽成**单一真相源** `infvino::occupancyPressure`
+  （`Tuning.cpp`）+ `kL3SpillPerByteMs`；`globalRetune` 的 L3 模拟与 mincut 共用，杜绝口径漂移。
+- mincut 节点代价加一项 `occupancyPressure(e,s) × kL3SpillPerByteMs`，**线性、可加**。
+
+**实测（锁频非全程，交错）**：
+
+| 模型 | base | mincut(默认) | mincut + 逐节点 L3 | 门裁决 |
+|---|---:|---:|---:|---|
+| mobilenet | 1.59 | **1.34** | 1.55（回退） | L3 提案 median 1.57→**2.46** → REJECT |
+| yolo11n | 11.48 | **11.33** | 11.51（回退） | REJECT |
+| yolov8n | 10.52 | 10.55 | 10.61（回退） | REJECT |
+
+**结论（缺口 1 的答案）**：**逐节点 L3 项破坏可加性/量级校准，是负结果**。
+- `occupancyPressure` 是**总并发足迹**，不是 **L3 miss 字节**；把它当节点成本会压过隔离 ms、
+  把选择推向**过度持久化**（mb 提案 1.57→2.46 ms，比 baseline 差 57%）。
+- R47 的正确形态是**整网 LRU 模拟（顺序相关）**，它**不能**塞进成对 min-cut 的节点项（会二次
+  计费、破坏可加性——R47 §5.2 已警告过这一点）。
+- 因此该**默认关**（`INFVINO_LAYOUT_L3=1` 仅作消融）；mincut 维持「隔离提案 + 稳态门」。
+- **正确的下一步**：把 L3 会计做成**整网评分器**（对 baseline/proposal 各跑一次 R47 `predictNet`
+  的 LRU 模拟，零 GPU），作为**提案预筛**，而不是节点代价；或对逐节点项做**独立标定**（用
+  受控微基准拟合系数），再评估是否值得进 mincut。
+
+> 附带修复一个真 bug：验收门回退（REJECT）后**没有 `invalidateCapture()`** → 回退后仍重放
+> mincut 的录制 dispatch，导致「门已拒绝但运行仍是坏布局」（L3 实验时 mb 显示 2.44 ms）。
+> 已在 `restore()` 里补 `invalidateCapture()`。
