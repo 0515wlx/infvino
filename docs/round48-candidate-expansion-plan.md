@@ -114,17 +114,66 @@
 
 ## 4. 里程碑（建议顺序，每步独立可验收）
 
-| M | 内容 | 依赖 | 验收 |
-|---|---|---|---|
-| M0 | 候选上限/配额 + 数值契约标记基础设施 | — | `tuning_test` PASS；候选数可控 |
-| M1 | D1 输出 tiling（conv3x3/conv1x1） | M0 | 大 spatial 层隔离 min↑；L3 spill↓ |
-| M2 | D2 split-K conv | M0 | 小网格层隔离 min↑ |
-| M3 | D5 小算子融合/向量变体 | M0 | dispatch↓；小算子分项↓ |
-| M4 | D3 数据通路（Winograd/CINC 泛化，先离线评估） | R47 模型 | 宽通道层隔离 min↑ 或明确负结果 |
-| M5 | D4 内核级 reorder 融合 | M1、S3 chain move | reorder ms↓；整网不回归 |
-| M6 | D6 全核内建（direct conv1x1 / depthwise_v2） | M0 | 窄通道/小 N 区间改善 |
+| M | 内容 | 依赖 | 验收 | 状态（R50 末） |
+|---|---|---|---|---|
+| M0 | 候选上限/配额 + 数值契约标记基础设施 | — | `tuning_test` PASS；候选数可控 | ✅ 已落地（R48） |
+| M1 | D1 输出 tiling（conv3x3/conv1x1） | M0 | 大 spatial 层隔离 min↑；L3 spill↓ | ◑ conv1x1 `Y_BLOCK` 已做（整网近零）；**conv3x3 未做** |
+| M2 | D2 split-K conv | M0 | 小网格层隔离 min↑ | ⏸ 暂缓（R41 判 conv3x3 结构墙；gemm_sk 已有） |
+| M3 | D5 小算子融合/向量变体 | M0 | dispatch↓；小算子分项↓ | ◑ 注册表已纳小算子；**launch 融合未做** |
+| M4 | D3 数据通路（Winograd/CINC 泛化，先离线评估） | R47 模型 | 宽通道层隔离 min↑ 或明确负结果 | ⏸ 负预期（R41）；可在布局链之后再评估 |
+| M5 | D4 内核级 reorder 融合 | M1、S3 chain move | reorder ms↓；整网不回归 | ◑ D4 + R49 mincut + R50 契约成本已做；**conv1x1_blk 的 fsv16 成本未纳入** |
+| M6 | D6 全核内建（direct conv1x1 / depthwise_v2） | M0 | 窄通道/小 N 区间改善 | ◑ depthwise `Y_BLOCK` 已做（R50）；**direct conv1x1 未做** |
 
 > 每步完成后：`model_check`/`reuse_check` 三模型回归 + 锁频稳态 A/B；负结果如实归档。
+
+---
+
+## 4bis. R50 后的系统性缺口盘点（还要补哪些 kernel）
+
+> 判据仍是 §0.1：每个「离硬上限最远」的签名至少覆盖 **≥2 个瓶颈类别**（Fma/Instruction/
+> Memory/Launch），且新候选要么**改变布局图**、要么**跨越物理瓶颈**。下表用
+> `kernel_autotune --candidates` + `kernel_run --report` 的**时间占比**与**族/瓶颈类别覆盖**
+> 组织（ratio 仅作参考，不作为立项标准）。
+
+**端到端时间占比**（`kernel_run --report --iters 20`，busy）：
+
+| 模型 | conv3x3 | conv1x1（含 cat4） | depthwise | 小算子 | bmm |
+|---|---:|---:|---:|---:|---:|
+| yolov8n-pose | **61.8%** | **30.2%** | 0% | ~6% | 0% |
+| yolo11n-pose | **43.6%** | **39.4%** | 4.4% | ~8% | 2.7% |
+| mobilenetv3-small | 3.3% | **57.7%** | **21.9%** | ~11% | 0% |
+
+**逐 op 的覆盖与缺口**：
+
+| op | 现有族 / 瓶颈类别 | 缺什么（候选同质化的地方） | 时间占比 | 结构判决（证据） | 优先级 |
+|---|---|---|---|---|---|
+| **conv1x1_cat4** | **注册表无族**（`--candidates`=`{}`）；ad-hoc 路径复用 gemm 候选（`-DCAT4=1`），**未进 mincut** | 一个 op 完全在「单一真相源 + 布局契约」之外 | y8/y11 的 conv1x1 大头（neck） | R30c 融合已落地，但未纳注册表 | **P0** |
+| **conv3x3** | ov/cin3/blk/f16 —— **仅 Fma** | Memory/Launch 轴；**且排除在 mincut 外** | 44–62% | R41：kernel 已到「无 L1+128-GRF」墙；R49 缺口C：blk 弱于 ov → 布局链断裂 | **P1**（高风险） |
+| **conv1x1（N>1）** | gemm/gemm_sk/blk —— **仅 Fma** | Memory、direct（非 im2col） | 30–40% | R48 §6.2：大 spatial GEMM 已最优；blk 只在持久 fsv16 链胜 | P3 |
+| **conv1x1（N=1）** | **仅 gemv（1 候选，Latency）** | 无调优空间；无 split-K/多输出 | mb head ~5% | 归约/网格受限 | P4 |
+| **depthwise** | f16/v/vp/blk(+YB) —— **仅 Instruction** | Memory（向量 store）/ Launch 轴 | mb 22%、y11 4% | R50：fsv16 输出快 2–3×；小 spatial 已近上限 | P4 |
+| **gemm** | gemm/gemm_sk —— **仅 Fma** | SLM staging / 双缓冲 K | 小算子级 | R47：大 spatial 已稠密 | P4 |
+| **小算子** | 每 op「标量 vs 向量/网格」—— **仅 Memory** | **launch 融合**（折进消费者）：`ew→conv prologue`、`gap+头`、`resize→conv`… | y8/y11 ~6–8% | R48 §4.7：小算子占 busy ~50% 的 **dispatch 数**；launch 地板 3.5µs | **P2** |
+| **布局：非 16 通道** | fsv16 持久化要求 `Cout%16==0` | 按 fsv16 补齐分配激活缓冲（解锁 88/120/144 链） | 影响 mb 全局布局 | R50 缺口 E：mincut 因此 pin 掉大量张量 | **P1** |
+
+**结论性排序（下一步该补的 kernel）**：
+
+1. **P0 — `conv1x1_cat4` 收口**：把 concat4→conv1x1 融合路径从 `Autotuner.cpp` 的 ad-hoc 分支
+   **迁进 `KernelFamily`**（声明 `conv1x1_cat4` 的 supports/candidates + 布局契约），并让它进入
+   mincut 的 (族,布局) 决策。**低成本、覆盖 yolo neck 主力、复用现有框架**。
+2. **P1 — 非 16 通道的 fsv16 持久化**：让激活池按 `ceil(C/16)*16` 分配（仅对可持久张量），
+   使 mb 的 88/120/144 也能进 blocked 链。直接放大 R49/R50 的布局收益。
+3. **P1（高风险）— conv3x3 的布局链**：给 `conv3x3` 一个能**输出 fsv16** 的 epilogue（或让
+   消费者 prologue 直读），把它纳入 mincut；否则维持 R49「明确放弃 3×3 blocked 链」。
+   R41 已证 kernel 侧无空间，价值全在布局。
+4. **P2 — 小算子 launch 融合（D5）**：把相邻逐元素/pool/gap 折进 conv 的 prologue/epilogue，
+   减少 dispatch 数（确定性杠杆）。
+5. **P3/P4 — 其余**：direct conv1x1（窄通道/小 N）、conv1x1 N=1 的 split-K、gemm staging、
+   depthwise 的 Memory/Launch 轴；Winograd/CINC 泛化维持「离线可证伪」定位。
+
+> **元结论**：R50 用一个 YB 变体验证了「同族候选 ROI 低」，而系统倒查把真正的缺口指向
+> **注册表/布局契约的覆盖**（cat4 未纳、非 16 通道不可持久、conv3x3 无 fsv16 出口）——
+> 与 R48 §10.6-E、R49 §9.5 一致：**先补契约覆盖面，再补 kernel。**
 
 ---
 
