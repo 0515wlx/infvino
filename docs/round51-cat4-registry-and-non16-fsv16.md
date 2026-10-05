@@ -222,6 +222,35 @@ fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
 **默认关** → 默认路径与 R50 逐位一致、零回归。若要转正，需与「value 生产者 fsv16 持久化」
 联合决策（即 D4 的延伸：让生产者直写 + prologue 直读/乘 scale 一步完成）。
 
+### 5.1 D4+ 联动（本轮续做）：让 `gap` 直读 fsv16 → D5 转正
+
+**根因（为何上面中性）**：SE 的 value 同时被 **`gap`**（算 scale）与 fused conv1x1 消费。
+`gap` 只吃 NCHW → 布局规划把 value **钉死 NCHW**，即使生产者是 `depthwise_blk`。于是融合
+只是把「Mul（读 NCHW、写 fsv16）」换成「reorder（读 NCHW、写 fsv16）」，成本相抵。
+
+**修复**：给 `gap`/`gap_r` 加 `-DGAP_IN_FSV16`（按 `[C/16][H][W][16]` 直读，输出仍 NCHW）；
+注册一个**无候选**的 `gap_fsv16` 布局契约族，让 `planBlockedLayout`/mincut 把 `gap` 当作
+「可读 fsv16 的消费者」；`run()` 在输入已持久 fsv16 时自动加宏。于是 **depthwise → (gap +
+fused conv1x1)** 整条链可持久 fsv16：既去 Mul 又免 reorder。
+
+**前提**：布局不动点需要 depthwise 的**输出 fsv16 成本**（R50 的 `#blkfsv16`），
+`config/tuning.json` 里没有 → 需 `--op depthwise --retune`（一次性写缓存）。
+
+**实测（mb，`--op depthwise --retune` 的临时缓存；同 binary，融合开/关，交错 ×8）**：
+
+| 路径 | off | on | Δ |
+|---|---:|---:|---:|
+| 默认 | 2.194 | **2.150** | **−2.0%（8/8）** |
+| mincut | 1.915 | **1.783** | **−6.9%（8/8）** |
+
+结构：ON 后 dispatch 83→77、reorder 10→13、fsv16 11→8（gap 直读 + value 持久抵消了 Mul 的
+消失）。**数值：同缓存下融合开/关逐位相同（mean_rel 9.109e-3）**。
+
+**结论**：D5「SE Mul→conv prologue」在与 **D4（生产者直写 fsv16）+ gap 直读** 联动后，
+从「中性」转为 **mb −2.0%~−6.9%**；代价是必须先把 depthwise 的 `#blkfsv16` 写进缓存
+（否则回退中性）。**下一步**：把该缓存并入 `config/tuning.json` 并把 D5 默认打开。
+
+
 ---
 
 ## 6. 下一步（回到 §4bis 排序）

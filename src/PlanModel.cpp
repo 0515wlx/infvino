@@ -1162,6 +1162,8 @@ void PlanModel::planBlockedLayout()
       const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "depthwise_blk") return familyByName("depthwise_blk");
     }
+    // R51 D4+: gap 视为「可读 fsv16」的消费者（kernel 侧 -DGAP_IN_FSV16）。
+    if (n.op == "gap") return familyByName("gap_fsv16");
     return nullptr;
   };
 
@@ -1443,7 +1445,10 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   };
   auto kernelConsumesFsv16 = [&](const std::string & kernel) -> const KernelFamily * {
     const KernelFamily * f = familyByName(kernel);
-    return (f && f->layout.in == Layout::FSV16) ? f : nullptr;
+    if (f && f->layout.in == Layout::FSV16) return f;
+    // R51 D4+: gap 变体（gap/gap_r）在输入 fsv16 时用 -DGAP_IN_FSV16 直读。
+    if (kernel == "gap" || kernel == "gap_r") return familyByName("gap_fsv16");
+    return nullptr;
   };
 
   // ---- 参与 mincut 的节点：有 #blk/#non 备选、blk 族声明了布局契约。----
@@ -3361,6 +3366,9 @@ void PlanModel::run()
         if (!e->kernel.empty()) kern = e->kernel;
         if (!e->options.empty()) opts = e->options;
       }
+      // R51 D4+: 输入已持久 fsv16（生产者直写）时，gap 直读 fsv16（免一趟 reorder）。
+      if (in(0).fsv16 && opts.find("-DGAP_IN_FSV16=") == std::string::npos)
+        opts += " -DGAP_IN_FSV16=1";
       cl_kernel k = getKernel("ops", kern, opts);
       cl_uint   dim;
       size_t    gws[3], lws[3];
