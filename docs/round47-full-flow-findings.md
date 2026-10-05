@@ -98,7 +98,71 @@ blocked chain 只能拿到部分收益**。
 
 ---
 
+## 4.1 reorder 为什么会产生负收益（实测 + 代码机理）
+
+### 机制
+
+infvino 全图默认保持普通 **bfyx(NCHW)**；blk 族（`conv3x3_blk / conv1x1_blk / depthwise_blk`）
+需要 **`b_fs_yx_fsv16`**。因此每个「输入不是已持久 fsv16」的 blk kernel，每帧都要插一趟
+`reorder_bfyx_to_fsv16`——它是**纯 gather/scatter：整张量 1 读 + 1 写 + 一个独立 dispatch**
+（`kernels/conv_blk.cl:300`），**与 kernel 的计算增益无关**，只随张量字节数和 launch 走。
+
+持久化规则是**全或无**（`planBlockedLayout`，`src/PlanModel.cpp:1003-1009`）：张量只有当
+**生产者能写 fsv16 且其所有消费者都只吃 fsv16（且读 slot 0）**时才持久；否则保持 bfyx，
+于是**每个 blk 消费者都要自己付 reorder**。
+
+### 实测（mb，`kernel_autotune --retune` 写出的 `#blk/#non/#reorder`）
+
+| 签名 | blk(ms) | non(ms) | reorder(ms) | blk+reorder | 判定 |
+|---|---:|---:|---:|---:|---|
+| `conv1x1\|Cout240_N196_Cin40` | 0.0253 | 0.0387 (gemm) | 0.0042 | 0.0295 | blk 划算 |
+| `conv1x1\|Cout576_N49_Cin96` | 0.0291 | 0.0604 (gemm) | 0.0047 | 0.0339 | blk 划算 |
+| `conv1x1\|Cout24_N784_Cin72` | 0.0180 | 0.0454 (gemm) | 0.0114 | 0.0294 | blk 划算 |
+| **`depthwise\|W14H14s1p2_Cin240_Cout240_K5`** | 0.0296 | 0.0348 (`depthwise_v`) | **0.0085** | **0.0381** | **净负** |
+
+**结论**：负收益只在「**带宽受限 op + blk 增益小**」时出现。1×1 的 non-blk 回退是 `gemm`（慢 1.5–2×），
+blk+reorder 仍赢；**depthwise 的 non-blk `depthwise_v` 本就不慢（内存墙为主，地址/边界开销小）**，
+blk 只快 ~0.005ms，而 reorder 要 0.0085ms → **净 +0.0033ms**。即：**blk 的收益跑不过一趟额外全张量访存**。
+
+### 为什么系统还会选中净负的 blk（真正的病灶）
+
+1. **族间计费口径不一致**：`conv3x3 / conv1x1` 的 base 判据是 `min(blk, non)`（`PlanModel.cpp:3263-3264`，
+   **不计 reorder**）；而 `depthwise` 分支却用 `eff = blk + reorder` 计费（`3775-3776`）。同一套机制两套口径。
+2. **布局 fixpoint 常常不生效**：reorder-aware 的联合不动点 `resolveLayoutChoices` **要求缓存里有
+   `#blk / #non / #reorder`**（`1047-1055`）；而**生产 `config/tuning.json` 里 513 条全是 base，一条 `#` 都没有**
+   → `any=false` → 退化成纯 `planBlockedLayout`，**reorder 从不参与决策**。
+3. **`globalRetune` 绕过 fixpoint**：回验期直接 `node_choice_=assign` + `planBlockedLayout`（`3963-3964`），
+   只按**端到端 busy** 接受；而端到端噪声 **±5%** 远大于 reorder 的符号量级（~2–4%）
+   → 会接受「kernel 更快但净负」的 blk（正是 R46 实测的 `depthwise_v → depthwise_blk`、reorder +0.036）。
+4. **耦合（用户担心的点）**：持久化是 producer→consumers 的**全或无**联合条件，而成本模型是**逐节点**
+   的（`blkCost = blk + reorder`，不知邻居的选择会让 reorder 变免费）。这是**反协同博弈**：贪心
+   best-response 可能停在「付了 reorder 却永远摊不掉」的混合解，**命中不了「整条链一起切 blk → reorder=0」的联合最优**。
+
+### 对 blocked chain 的判定
+
+- blocked chain **是正确方向**：若让生产者直接写 fsv16 并把链传下去，depthwise 的输入 reorder 归零，
+  `depthwise_blk`（0.0296）就重新赢过 `depthwise_v`（0.0348）——**把净负翻成净正**；mb 的 reorder
+  占 busy **8.3%**，即机会上限。
+- 但**耦合风险确实是真实的、且是核心难点**（全或无 + 跨 op 联合），并且**收益是模型相关的**
+  （mb ~8%、yolo <2%）。因此**不建议直接上完整 blocked-chain kernel 改造**，按下面分期。
+
+## 4.2 分期决策（先低复杂度，再决定是否动 kernel）
+
+| 阶段 | 动作 | 复杂度 | 收益预期 |
+|---|---|---|---|
+| **S1** | **统一计费口径**：让 `conv3x3/conv1x1` base 也按 `blk+reorder` 计费（与 depthwise 一致）；保证 fixpoint 所需 `#blk/#non/#reorder` 始终可得（缺失时即时估算）| 低 | 消除「不计 reorder」导致的净负 blk；让生产缓存也能正确退 blk |
+| **S2** | **`globalRetune` 尊重布局契约**：不再用「绕过 fixpoint 的裸 end-to-end」拍板；改成对**耦合连通分量**做联合 move，接受前用 fixpoint 的布局模型核对「是否维持/建立持久化」，端到端只做最终验收 | 中 | 让已有分组骨架真正表达「整链一起切」 |
+| **S3** | **决策级 chain move（opt-in，按 reorder 占比门控）**：把一条 producer→consumers 链整体切 blk 作为**一个 move** 端到端验证；mb 开启、yolo 跳过 | 中 | 拿到 §4.1 的联合最优，量化真实收益 |
+| **S4** | **完整 blocked chain（kernel/图改造）**：仅当 S3 在稳态 A/B 上给出可靠正收益再上 | 高 | 消除残余 reorder（≤8%）|
+
+> **据此的建议**：**暂不上完整 blocked chain**。先做 **S1+S2**（低成本、直接堵住负收益来源），
+> 用 **S3** 的 opt-in chain move 在 mb 上量化「整链持久化」的真实端到端收益；只有在 S3
+> 于锁频稳态 A/B 上可复现为正、且结算清耦合风险后，才投入 S4。
+
 ## 5. 下一步（按 ROI）
+
+> 实现顺序以 **§4.2 的 S1–S4** 为准（先统一计费口径 → 尊重布局契约 → 决策级 chain move →
+> 完整 blocked chain）。
 
 1. **确认 blocked chain 的机会上限**：离线算 mb 若 reorder→0（全部 fsv16 持久化）能省多少
    busy（当前估计 ~8%），再决定是否投入（对齐 R46「前置就位后另开」）。
