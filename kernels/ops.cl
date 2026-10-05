@@ -248,7 +248,8 @@ __kernel void bmm(__global const half *restrict A, __global const half *restrict
 // pattern (e.g. SE Mul: [C,1,1] * [C,HW]). 2-D grid (spatial, channel) removes the
 // rank loop/div/mod; `a_channel` says which input is the per-channel one. ----
 // R48 D4: OUT_FSV16=1 -> 直接写 b_fs_yx_fsv16（当唯一消费者是需要 fsv16 的 blocked 族时，
-// 省掉独立 reorder pass）。要求 C%16==0（由布局规划器保证）。
+// 省掉独立 reorder pass）。R51: 通道可非 16 对齐——分配池按 ceil(C/16)*16 补齐缓冲，
+// 尾部 lane 写不越界且不会被消费者读取。
 #ifndef EWCH_OUT_FSV16
 #define EWCH_OUT_FSV16 0
 #endif

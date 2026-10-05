@@ -48,6 +48,29 @@ std::string dirName(const std::string & path)
   const auto pos = path.find_last_of('/');
   return (pos == std::string::npos) ? std::string(".") : path.substr(0, pos);
 }
+
+// R51 (R48 §4bis P1): 激活张量的**分配元素数**。fsv16 (`b_fs_yx_fsv16` =
+// [C/16][H][W][16]) 会把通道数**补齐**到 16 的倍数，因此当 C%16!=0 时，若生产者
+// 直写 fsv16 就需要 ceil(C/16)*16*H*W 个元素，否则越界。此前布局规划把所有
+// C%16!=0 的张量钉死 NCHW（避免越界）——本函数让池按补齐尺寸分配，从而解锁
+// mb 的 88/120/144 等非对齐张量进入 blocked 链。
+//
+// **只对 4-D NCHW conv 张量**（dims = [N,C,H,W]）做补齐：3-D reshape/decode 张量的
+// `dims[size-3]` 是 batch 维（=1），若按其补齐会 16× 膨胀（y11 实测 requested
+// 69→140MB、busy +1.2%）。非 4-D 张量也从不被布局规划标记为 fsv16（其生产者不是
+// conv 族）。NCHW 消费者只读前 `numel` 个元素，多出的补齐区不被触碰，数值逐位一致。
+size_t paddedChannelNumel(const std::vector<int64_t> & d)
+{
+  int64_t n = 1;
+  for (int64_t v : d) n *= (v < 0 ? 0 : v);
+  if (d.size() == 4)
+  {
+    const int64_t c = d[1];
+    if (c > 0 && c % 16 != 0)
+      n = n / c * ((c + 15) / 16 * 16);
+  }
+  return static_cast<size_t>(n);
+}
 }  // namespace
 
 namespace { std::string sourceOfKernel(const std::string & kernel); }  // fwd (defined below)
@@ -389,10 +412,14 @@ void PlanModel::parse()
   std::istringstream iss(lines_owner);
   std::string        line;
 
-  auto alloc = [&](const std::string & name, const std::vector<int64_t> & d) -> Tensor & {
+  auto alloc = [&](const std::string & name, const std::vector<int64_t> & d,
+                   bool padChannels = false) -> Tensor & {
     Tensor t;
     t.dims = d;
-    t.mem  = rt_.alloc(static_cast<size_t>(t.numel()) * 2, CL_MEM_READ_WRITE);
+    // R51: 激活张量按补齐通道分配，使得「生产者直写 fsv16」对 C%16!=0 也安全
+    // （见 paddedChannelNumel）。input/init 非 fsv16，保持精确尺寸。
+    const size_t elems = padChannels ? paddedChannelNumel(d) : static_cast<size_t>(t.numel());
+    t.mem  = rt_.alloc(elems * 2, CL_MEM_READ_WRITE);
     t.base = t.mem;
     t.base_off = 0;
     owned_.push_back(t.mem);
@@ -440,7 +467,7 @@ void PlanModel::parse()
       ls >> name;
       int64_t v;
       while (ls >> v) d.push_back(v);
-      alloc(name, d);
+      alloc(name, d, /*padChannels=*/true);
       act_names_.push_back(name);
     }
     else if (kind == "node")
@@ -749,6 +776,65 @@ void PlanModel::allocateActivations()
   std::unordered_map<std::string, int> out_set;
   for (size_t i = 0; i < outputs_.size(); ++i) out_set[outputs_[i]] = 1;
 
+  // R51 (R48 §4bis P1): 只有**可能被持久化为 fsv16** 的张量才按补齐通道分配。否则
+  // 无谓地放大所有非对齐张量（y11 实测 requested 69→140MB，busy +1.2%）。
+  //
+  // 判据是 planBlockedLayout/mincut 标记条件的**超集**（按族 supports，而非当前选中）：
+  //   * 4-D conv 张量；
+  //   * 生产者 op 有族/候选声明 canOutFsv16（conv1x1/depthwise/conv3x3/ew_binary_ch）；
+  //   * 每个消费者都能在其「激活输入槽」读 fsv16（conv1x1/depthwise/conv3x3）。
+  // 超集保证：任何实际被标记 fsv16 的张量都已被补齐（不越界）。
+  auto opMayOutFsv16 = [&](const Node & nd) -> bool {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nd, &ok);
+    if (!ok) return false;
+    for (const auto & f : kernelFamilies())
+    {
+      if (!(f.actMask & (1 << s.act))) continue;
+      if (f.supports && !f.supports(s)) continue;
+      if (f.layout.canOutFsv16) return true;
+      if (f.candidates)
+        for (const auto & c : f.candidates(s))
+          if (c.canOutFsv16) return true;
+    }
+    return false;
+  };
+  auto opCanReadFsv16 = [&](const Node & nd, int slot) -> bool {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nd, &ok);
+    if (!ok) return false;
+    for (const auto & f : kernelFamilies())
+    {
+      if (f.layout.in != Layout::FSV16 || f.layout.inIndex != slot) continue;
+      if (!(f.actMask & (1 << s.act))) continue;
+      if (f.supports && !f.supports(s)) continue;
+      return true;
+    }
+    return false;
+  };
+  std::unordered_map<std::string, int> producerIdx;
+  for (size_t i = 0; i < N; ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producerIdx[o] = static_cast<int>(i);
+  std::unordered_map<std::string, std::vector<std::pair<int, int>>> consumerIdx;
+  for (size_t i = 0; i < N; ++i)
+    for (size_t s = 0; s < nodes_[i].ins.size(); ++s)
+      if (nodes_[i].ins[s] != "-")
+        consumerIdx[nodes_[i].ins[s]].push_back({static_cast<int>(i), static_cast<int>(s)});
+  auto mayBeFsv16 = [&](const std::string & name) -> bool {
+    auto bit = T_.find(name);
+    if (bit == T_.end() || bit->second.dims.size() != 4) return false;
+    if (out_set.count(name)) return false;               // 网络输出必须 NCHW
+    auto pit = producerIdx.find(name);
+    if (pit == producerIdx.end()) return false;          // 网络输入
+    if (!opMayOutFsv16(nodes_[pit->second])) return false;
+    auto cit = consumerIdx.find(name);
+    if (cit == consumerIdx.end() || cit->second.empty()) return false;
+    for (const auto & c : cit->second)
+      if (!opCanReadFsv16(nodes_[c.first], c.second)) return false;
+    return true;
+  };
+
   // 2) 标记哪些 activation 张量参与复用；给每个一个 id。
   struct Live { int id, birth, death; int64_t bytes; std::string name; };
   std::vector<Live> lives;
@@ -762,7 +848,12 @@ void PlanModel::allocateActivations()
     if (out_set.count(name)) d = static_cast<int>(N ? N - 1 : 0);   // 输出活到最后
     int id = static_cast<int>(lives.size());
     id_of[name] = id;
-    lives.push_back({id, b, d, bit->second.numel() * 2, name});
+    // R51: 与 parse 的分配一致 —— 按补齐通道计算 footprint（可容纳生产者直写 fsv16）。
+    const bool pad = mayBeFsv16(name);
+    if (pad) fsv16_capable_.insert(name);
+    const int64_t bytes =
+        static_cast<int64_t>(pad ? paddedChannelNumel(bit->second.dims) : bit->second.numel()) * 2;
+    lives.push_back({id, b, d, bytes, name});
   }
 
   // 3) 冲突集：生存期重叠（闭区间相交）的 id 集合。
@@ -1005,8 +1096,9 @@ void PlanModel::planBlockedLayout()
     const auto & od = tit->second.dims;
     const size_t ob = od.size() >= 3 ? od.size() - 3 : 0;
     const int Cout = static_cast<int>(od[ob]);
-    // fsv16 按 16 通道补齐；Cout%16!=0 会越界（也保证消费者 Cin 整块）。
-    if (Cout <= 0 || Cout % 16 != 0) continue;
+    // R51: fsv16 按 16 通道补齐；分配池已按 paddedChannelNumel 分配（含补齐），因此
+    // C%16!=0 不再越界 —— 移除此前的 NCHW pin，解锁非对齐张量进 blocked 链。
+    if (Cout <= 0) continue;
     auto cit = consumers.find(t);
     if (cit == consumers.end() || cit->second.empty()) continue;
     bool all_blk = true;
@@ -1040,7 +1132,7 @@ void PlanModel::planBlockedLayout()
     const auto & od = tit->second.dims;
     if (od.size() < 3) continue;
     const int C = static_cast<int>(od[od.size() - 3]);
-    if (C <= 0 || C % 16 != 0) continue;
+    if (C <= 0) continue;
     const OpSignature sig = smallSig(n);
     if (sig.op != "ew_binary_bcast") continue;   // 通道广播（bdims）才可能走 ew_binary_ch
     const long nn = sig.params.size() > 0 ? sig.params[0] : 0;
@@ -1357,27 +1449,14 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   const std::unordered_set<std::string> out_set(outputs_.begin(), outputs_.end());
   BinaryEnergy en(static_cast<int>(varName.size()));
 
-  // pin：网络输入/输出、生产者无法产 FSV16、消费者无法读 FSV16、**通道非 16 对齐**的张量
-  // → 钉死 NCHW。最后一条是 R50 修的 correctness bug：`planBlockedLayout` 一直要求
-  // `Cout%16==0`（fsv16 按 16 通道补齐，否则池里 NCHW 大小的缓冲会越界），但 mincut 此前
-  // 漏了这条，把 88/120/144 等非对齐张量标成 fsv16 → 写出越界、整网输出错乱（mb mean_rel 0.44）。
+  // pin：网络输入/输出、生产者无法产 FSV16、消费者无法读 FSV16 → 钉死 NCHW。
+  // R51: 移除了 R50 加的「通道非 16 对齐 → pin」——分配池现在按 paddedChannelNumel
+  // 补齐通道，非对齐张量也能安全持久 fsv16。producerCanFsv16/consumerCanReadFsv16
+  // 仍会 pin 掉「生产者不能直写 / 消费者不能直读」的张量。
   for (size_t v = 0; v < varName.size(); ++v)
   {
     const std::string & t = varName[v];
-    bool pin = out_set.count(t) > 0 || !producerCanFsv16(t) || !consumerCanReadFsv16(t);
-    if (!pin)
-    {
-      auto tit = T_.find(t);
-      if (tit != T_.end())
-      {
-        const auto & d = tit->second.dims;
-        if (d.size() >= 3)
-        {
-          const int C = static_cast<int>(d[d.size() - 3]);
-          if (C > 0 && C % 16 != 0) pin = true;
-        }
-      }
-    }
+    const bool pin = out_set.count(t) > 0 || !producerCanFsv16(t) || !consumerCanReadFsv16(t);
     if (pin) en.fix(static_cast<int>(v), 0);
   }
 
@@ -3243,16 +3322,18 @@ bool PlanModel::readTensor(const std::string & name, void * fp16_host) const
   const Tensor & t = it->second;
   const size_t   n = static_cast<size_t>(t.numel());
   const int64_t  C = t.dims.size() >= 3 ? t.dims[t.dims.size() - 3] : 0;
-  if (t.fsv16 && t.dims.size() >= 3 && C > 0 && C % 16 == 0)
+  if (t.fsv16 && t.dims.size() >= 3 && C > 0)
   {
-    // R36: 持久 blocked 张量在设备上是 [C/16][H][W][16]；诊断读回时转回 NCHW，
-    // 这样 `kernel_run --dump-tensor` 与数值检查看到的语义不变。
+    // R36/R51: 持久 blocked 张量在设备上是 [C/16][H][W][16]（通道补齐到 16 的倍数，
+    // 故 C%16!=0 时缓冲比 numel 大）；诊断读回时转回 NCHW，语义不变。
     const int64_t H = t.dims[t.dims.size() - 2];
     const int64_t W = t.dims[t.dims.size() - 1];
-    std::vector<uint16_t> tmp(n);
-    const_cast<ClRuntime &>(rt_).read(t.mem, n * 2, tmp.data());
+    const int64_t Cpad = (C + 15) / 16 * 16;
+    const int64_t nread = (n / C) * Cpad;   // 设备侧元素数（含补齐 lane）
+    std::vector<uint16_t> tmp(static_cast<size_t>(nread));
+    const_cast<ClRuntime &>(rt_).read(t.mem, tmp.size() * 2, tmp.data());
     uint16_t * dst = static_cast<uint16_t *>(fp16_host);
-    for (int64_t p = 0; p < static_cast<int64_t>(n); ++p)
+    for (int64_t p = 0; p < nread; ++p)
     {
       const int64_t l  = p % 16;
       const int64_t q  = p / 16;
@@ -3261,7 +3342,7 @@ bool PlanModel::readTensor(const std::string & name, void * fp16_host) const
       const int64_t y  = q2 % H;
       const int64_t cb = q2 / H;
       const int64_t c  = cb * 16 + l;
-      dst[(c * H + y) * W + x] = tmp[p];
+      if (c < C) dst[(c * H + y) * W + x] = tmp[static_cast<size_t>(p)];
     }
     return true;
   }
@@ -3767,12 +3848,9 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
       if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(HW) * Cin;
-      // reuse the gemm candidate spectrum; each candidate is compiled with -DCAT4=1.
-      std::vector<Candidate> cands = candidatesGemm(OpSignature::gemm(Cout, HW, Cin, act));
-      for (auto & c : cands) {
-        c.options += " -DCAT4=1";
-        c.options += " -DEPI=1 -DACT=" + std::to_string(act);
-      }
+      // R48 §4bis P0: 候选谱改由注册表（gemm_cat4_f16 族）给出——不再在此手工复制
+      // gemm 谱并追加 -DCAT4=1（单一真相源）；每个候选已带 -DCAT4=1 -DEPI=1 -DACT=。
+      const std::vector<Candidate> cands = candidatesFromRegistry(sig);
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
         cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
         auto optInt = [&](const char * k, int def) {
@@ -4151,9 +4229,12 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           }
           // R50: 同一 blk 配置在**输出 fsv16** 时的成本（布局契约 canOutFsv16）。depthwise_blk
           // 的 fsv16 输出把 16 lane（通道）合并为连续写，实测比 bfyx 输出快 ~2×；布局规划据此
-          // 给「输出 fsv16」的节点定价（bfyx 成本仍用于输出 NCHW 的情形）。Cin%16==0 才能 fsv16。
+          // 给「输出 fsv16」的节点定价（bfyx 成本仍用于输出 NCHW 的情形）。R51：分配池已按
+          // 补齐通道分配，故 C%16!=0 也能量/走 fsv16 —— 但仅当输出缓冲确实被补齐（capable），
+          // 否则 OUT_FSV16 会越界（输出永远无法被标记 fsv16 时也无需测其成本）。
+          const std::string & oname = n.outs[0];
           TuningEntry ebFsv16;
-          if (Cin % 16 == 0 && !eb.options.empty())
+          if ((Cin % 16 == 0 || fsv16_capable_.count(oname)) && !eb.options.empty())
           {
             Candidate c2;
             c2.kernel = eb.kernel;

@@ -161,8 +161,12 @@
 1. **P0 — `conv1x1_cat4` 收口**：把 concat4→conv1x1 融合路径从 `Autotuner.cpp` 的 ad-hoc 分支
    **迁进 `KernelFamily`**（声明 `conv1x1_cat4` 的 supports/candidates + 布局契约），并让它进入
    mincut 的 (族,布局) 决策。**低成本、覆盖 yolo neck 主力、复用现有框架**。
+   → ✅ **R51 已完成（契约层面）**：新增 `gemm_cat4_f16` 族；见
+   [`round51-cat4-registry-and-non16-fsv16.md`](round51-cat4-registry-and-non16-fsv16.md)。
+   （进入 mincut 的布局决策仍需 blocked cat4 变体，属 P3。）
 2. **P1 — 非 16 通道的 fsv16 持久化**：让激活池按 `ceil(C/16)*16` 分配（仅对可持久张量），
    使 mb 的 88/120/144 也能进 blocked 链。直接放大 R49/R50 的布局收益。
+   → ✅ **R51 已完成**：mb 默认 −2.7%、mincut −10.3%，y8/y11 噪声内（见同上文档）。
 3. **P1（高风险）— conv3x3 的布局链**：给 `conv3x3` 一个能**输出 fsv16** 的 epilogue（或让
    消费者 prologue 直读），把它纳入 mincut；否则维持 R49「明确放弃 3×3 blocked 链」。
    R41 已证 kernel 侧无空间，价值全在布局。
@@ -226,4 +230,18 @@
 `depthwise_blk` 新增 `-DY_BLOCK`（多行/WI，逐位一致）+ 布局契约成本 `#blkfsv16`
 （输出 fsv16 比 bfyx 快 ~2–3×）+ 修复 R49 mincut 漏 `Cout%16` 门导致的数值错乱
 （并修复 `model_check` 未透传 env 的假 PASS）。mincut（opt-in）mb −3.9% / y11 −2.1%。
+
+---
+
+## 9. 进展（R51：§4bis P0/P1 契约覆盖面）
+
+见 [`round51-cat4-registry-and-non16-fsv16.md`](round51-cat4-registry-and-non16-fsv16.md)：
+
+- **P0 `conv1x1_cat4` 收口**：新增 `gemm_cat4_f16` 族（单一真相源），`--candidates` 从 `{}` →
+  7 候选/签名；Autotuner/PlanModel 不再手工复制 gemm 谱。数值/选择逐位不变。
+- **P1 非 16 通道 fsv16 持久化**：激活池按 `ceil(C/16)*16` 分配（仅对能力集合），移除
+  `C%16!=0 → NCHW` 的 pin。mb 持久 fsv16 张量 9→12（默认）/ 22（mincut）；外部稳态 A/B：
+  mb 默认 **−2.7%**、mincut **−10.3%**，y8/y11 噪声内；三模型 model_check + reuse_check PASS。
+- **修正**：首版按 `dims[size-3]` 补齐导致 rank-3 张量 16× 膨胀（y11 +1.2%）；改为
+  只补 4-D conv 张量 + 只补「可能被标记 fsv16」的能力集合。
 

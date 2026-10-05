@@ -72,6 +72,62 @@ Candidate mk(const char * kernel, const char * source, const std::string & optio
   return c;
 }
 
+// GEMM 族的**单一**候选配置谱（gemm_f16 / gemm_cat4_f16 共用，避免两处漂移）。
+// `cat4=true` 时编译 `-DCAT4=1`：B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量
+// （见 kernels/gemm.cl 与 PlanModel::fuseConcatConv1x1），从而让 concat4→conv1x1 融合
+// 复用同一 tile/流水谱。此前的 ad-hoc 路径在 PlanModel 里手工复制这份列表并追加宏，
+// 属「单一真相源」缺口（R48 §4bis P0）。
+std::vector<Candidate> gemmSpectrum(const OpSignature & s, bool cat4)
+{
+  struct Opt { int BM, BN, BK, TM, TN, DBUF; };
+  const Opt opts[] = {
+    {128, 64, 32, 8, 4, 0}, {128, 64, 16, 8, 4, 1}, {128, 64, 8, 8, 4, 0},
+    {64, 64, 16, 8, 4, 1}, {64, 64, 8, 8, 4, 0}, {64, 32, 32, 8, 4, 0},
+    {32, 64, 32, 8, 4, 0},
+  };
+  const int K = (s.op == "gemm") ? s.K : s.Cin;
+  std::vector<Candidate> out;
+  for (const auto & o : opts)
+  {
+    Tiles t;
+    t.BM = o.BM; t.BN = o.BN; t.BK = o.BK; t.TM = o.TM; t.TN = o.TN; t.DBUF = o.DBUF;
+    if (K < 32) t.SG = 0;
+    std::string optsS = t.options();
+    std::string cfgS = t.label();
+    const std::string actS = std::to_string(s.act);
+    if (cat4)
+    {
+      optsS += " -DEPI=1 -DACT=" + actS + " -DCAT4=1";
+      cfgS += " epi=1 act=" + actS + " cat4";
+      out.push_back(mk("gemm_cat4_f16", "gemm", optsS, cfgS));
+    }
+    else
+    {
+      if (s.op == "conv1x1")
+      {
+        optsS += " -DEPI=1 -DACT=" + actS;
+        cfgS += " epi=1 act=" + actS;
+      }
+      out.push_back(mk("gemm_f16", "gemm", optsS, cfgS));
+    }
+  }
+  return out;
+}
+
+// GEMM 族的软上限模型（gemm_f16 / gemm_cat4_f16 / conv1x1 N>1 共用）。
+// R32 修正：grid 用实际 BM=64/BN=64；短 K 摊薄不足；上界 13.7（R14 整核）。
+double gemmCeiling(const OpSignature & s)
+{
+  const int M = (s.op == "gemm") ? s.M : s.Cout;
+  const int N = s.N;
+  const int K = (s.op == "gemm") ? s.K : s.Cin;
+  const long grid = ((M + 63) / 64) * ((N + 63) / 64);
+  double e = 13.7;
+  e *= std::min(1.0, static_cast<double>(grid) / 64.0);
+  e *= static_cast<double>(K) / (static_cast<double>(K) + 64.0);
+  return std::max(0.5, e);
+}
+
 // 小算子候选（launch/带宽受限，无数值语义差异）。原在 Autotuner.cpp，现为注册表真相源。
 std::vector<Candidate> smallCandidates(const OpSignature & sig)
 {
@@ -419,39 +475,8 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.supports = [](const OpSignature & s) {
         return s.op == "gemm" || (s.op == "conv1x1" && s.N > 1);
       };
-      f.candidates = [](const OpSignature & s) {
-        struct Opt { int BM, BN, BK, TM, TN, DBUF; };
-        const Opt opts[] = {
-          {128, 64, 32, 8, 4, 0}, {128, 64, 16, 8, 4, 1}, {128, 64, 8, 8, 4, 0},
-          {64, 64, 16, 8, 4, 1}, {64, 64, 8, 8, 4, 0}, {64, 32, 32, 8, 4, 0},
-          {32, 64, 32, 8, 4, 0},
-        };
-        const int K = (s.op == "gemm") ? s.K : s.Cin;
-        std::vector<Candidate> out;
-        for (const auto & o : opts) {
-          Tiles t;
-          t.BM = o.BM; t.BN = o.BN; t.BK = o.BK; t.TM = o.TM; t.TN = o.TN; t.DBUF = o.DBUF;
-          if (K < 32) t.SG = 0;
-          std::string optsS = t.options();
-          std::string cfgS = t.label();
-          if (s.op == "conv1x1") {
-            optsS += " -DEPI=1 -DACT=" + std::to_string(s.act);
-            cfgS += " epi=1 act=" + std::to_string(s.act);
-          }
-          out.push_back(mk("gemm_f16", "gemm", optsS, cfgS));
-        }
-        return out;
-      };
-      f.ceiling = [](const OpSignature & s, const ClDeviceInfo &) {
-        const int M = (s.op == "gemm") ? s.M : s.Cout;
-        const int N = (s.op == "gemm") ? s.N : s.N;
-        const int K = (s.op == "gemm") ? s.K : s.Cin;
-        const long grid = ((M + 63) / 64) * ((N + 63) / 64);
-        double e = 13.7;
-        e *= std::min(1.0, static_cast<double>(grid) / 64.0);
-        e *= static_cast<double>(K) / (static_cast<double>(K) + 64.0);
-        return std::max(0.5, e);
-      };
+      f.candidates = [](const OpSignature & s) { return gemmSpectrum(s, false); };
+      f.ceiling = [](const OpSignature & s, const ClDeviceInfo &) { return gemmCeiling(s); };
       v.push_back(std::move(f));
     }
     {
@@ -482,6 +507,27 @@ const std::vector<KernelFamily> & kernelFamilies()
         double e = 13.7 * std::min(1.0, static_cast<double>(grid) / 64.0);
         return std::max(0.5, e);
       };
+      v.push_back(std::move(f));
+    }
+    {
+      // R48 §4bis P0: concat4→conv1x1 融合（R30c Route A）。此前完全在注册表之外：
+      // `--candidates` 显示 `{}`，Autotuner/PlanModel 里手工复制 gemm 谱 + 追加 -DCAT4。
+      // 现在作为独立族声明：布局契约（inIndex=1，激活在槽 1..4）、上限模型、候选谱
+      // 全部走单一真相源，可被 mincut/报告/审计看见。
+      //
+      // 数据通路：A=权重[Cout][Cin]；C=输出[Cout][HW]；逻辑 B[Cin][HW] 由 4 个连续源
+      // (b0..b3, 通道数 ca/cb/cc/cd) 拼接而成，由 CA/CB/CC/O0..O3 在 kernel 内重定向。
+      // 当前只有 NCHW 变体（canOutFsv16=false）；blocked 变体是后续「扩充算子族」的项。
+      KernelFamily f;
+      f.name = "gemm_cat4_f16";
+      f.op = "conv1x1_cat4";
+      f.source = "gemm";
+      f.layout = {Layout::NCHW, Layout::NCHW, false, false};
+      f.layout.inIndex = 1;   // 槽 0 = 权重，激活源在槽 1..4（与 gemm_f16 同约定）
+      f.bottleneck = Bottleneck::Fma;
+      f.supports = [](const OpSignature & s) { return s.op == "conv1x1_cat4"; };
+      f.candidates = [](const OpSignature & s) { return gemmSpectrum(s, true); };
+      f.ceiling = [](const OpSignature & s, const ClDeviceInfo &) { return gemmCeiling(s); };
       v.push_back(std::move(f));
     }
 
@@ -719,7 +765,8 @@ const std::vector<KernelFamily> & kernelFamilies()
       else if (n == "conv3x3_blk")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 16.9; };
       else if (n == "conv3x3_f16")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return kConvStagingFreeCeiling; };
       else if (n == "conv3x3_cin3")  f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 12.0; };
-      else if (n == "gemm_f16" || n == "gemm_sk_f16") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 13.7; };
+      else if (n == "gemm_f16" || n == "gemm_sk_f16" || n == "gemm_cat4_f16")
+        f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 13.7; };
       else if (n == "conv1x1_blk")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 11.5; };
       else if (n == "conv1x1_gemv_f16") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 8.0; };
       else if (n == "depthwise_f16" || n == "depthwise_v") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.086; };

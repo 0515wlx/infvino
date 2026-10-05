@@ -419,6 +419,9 @@ private:
   std::vector<std::string>               act_names_;   // P0: activation tensors in the pool
   std::vector<cl_mem>                    alias_subs_;  // P0: sub-buffers for sliced aliases
   std::vector<char>                      node_skipped_;  // P0: per-node "alias, don't launch"
+  // R51 (P1): 可能被持久化为 fsv16 的激活张量（4-D conv + 生产者可直写 + 消费者可直读）。
+  // 这些张量的缓冲按补齐通道分配；也是「输出 fsv16 成本」可安全测量的集合。
+  std::unordered_set<std::string>        fsv16_capable_;
   // R38: per-node resolved (family, layout) choice from the joint fixpoint. Empty kernel
   // = no override (fall back to the signature cache).
   std::vector<TuningEntry>               node_choice_;
