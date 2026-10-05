@@ -5,6 +5,7 @@
 #include <CL/cl_ext.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1757,6 +1758,38 @@ void PlanModel::noteNode(size_t ni, const std::string & tag, double ms)
   // tag 取该节点的主要算子：reorder(blk) 是该节点的附属 dispatch，不要占主标签。
   if (node_tag_[ni].empty() || (node_tag_[ni] == "reorder(blk)" && tag != "reorder(blk)"))
     node_tag_[ni] = tag;
+  // R51 诊断：INFVINO_SNAP=<name[,name..]> + INFVINO_SNAP_DIR=<dir> → 每个节点主 dispatch
+  // 结束后（池重用前）把指定中间张量按**逻辑 NCHW** 落盘，用于逐层对比 fsv16 链读写。
+  if (const char * sn = std::getenv("INFVINO_SNAP"))
+  {
+    if (ni < nodes_.size() && tag != "reorder(blk)" && !nodes_[ni].outs.empty())
+    {
+      const std::string & out = nodes_[ni].outs[0];
+      std::string list(sn);
+      size_t p = 0;
+      while (p <= list.size())
+      {
+        const size_t e = list.find(',', p);
+        const std::string name = list.substr(p, e == std::string::npos ? std::string::npos : e - p);
+        if (!name.empty() && name == out)
+        {
+          const char * dir = std::getenv("INFVINO_SNAP_DIR");
+          std::string safe;
+          for (char ch : name) safe += (std::isalnum(static_cast<unsigned char>(ch)) ? ch : '_');
+          const std::string path = std::string(dir ? dir : ".") + "/snap_" + safe + ".bin";
+          std::vector<uint16_t> buf(tensorNumel(name));
+          if (!buf.empty() && readTensor(name, buf.data()))
+          {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char *>(buf.data()),
+                    static_cast<std::streamsize>(buf.size() * 2));
+          }
+        }
+        if (e == std::string::npos) break;
+        p = e + 1;
+      }
+    }
+  }
 }
 
 void PlanModel::invalidateCapture()

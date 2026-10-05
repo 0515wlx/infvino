@@ -240,30 +240,35 @@ fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
 进一步发现**旧缓存 + 默认路径 + 融合**也 FAIL。即 **`gap` 直读 fsv16 与布局规划的组合
 会产生错误的激活读取**。
 
-**单元级定位（本轮）**：给 `kernel_numtest` 加了两个用例，逐元素对照 numpy：
+**单元级定位（本轮）**：给 `kernel_numtest` 加了三个用例，逐元素对照 numpy：
 - `--op gap`（NCHW→reorder 成 fsv16→`gap_r -DGAP_IN_FSV16=1`）：C∈{16,96,120,144,240,576}
   **全部 PASS**（max_abs ~2.4e-4）。
-- `--op conv1x1blk`（fsv16 输入 + `-DMUL_SCALE=1`，osv16 权重 + scale）：4 组形状含
-  Cin=120/576 **全部 PASS**。
+- `--op conv1x1blk`（fsv16 输入 + `-DMUL_SCALE=1`，osv16 权重 + scale）：含 Cin=120/576、
+  SLM_DIV=4 **全部 PASS**。
+- `--op depthwiseblk`（fsv16 输入 + `OUT_FSV16=1`，`[C/16][K][K][16]` 权重）：含 C=120/144/576、
+  X_BLOCK=4 **全部 PASS**。
 
 期间发现并修复 `conv1x1_blk` 的**真实 kernel bug**：`MUL_SCALE` 在 **packed `BLOCK_READ`
 路径**下，lane 并不等于「自己的通道」（是 16×8 的 OV tile），直接乘 `Scale[gc]` 会乘错通道。
-修复：`-DMUL_SCALE=1` 时强制走**标量逐通道载入**（`input[base + i*FS + sglid]`），使
-lane 的 `src` 确为通道 `gc`。
+修复：`-DMUL_SCALE=1` 时强制走**标量逐通道载入**。
 
-**但整网组合仍 FAIL**（两个 kernel 各自正确 → 问题在**图级**：某条
-`depthwise_blk(OUT_FSV16) → gap(直读 fsv16) + fused conv(直读 fsv16)` 链上仍有一致性缺口，
-本轮**未定位**）。
+**逐层快照诊断**（`INFVINO_SNAP=<name,..> INFVINO_SNAP_DIR=<dir>`：在 `noteNode` 里于每个
+节点主 dispatch 后、池重用前把张量按逻辑 NCHW 落盘）。以 features.7 为例：
+- 深度算子输入 `block.0.2` 在 ON/OFF **逐位相同**；
+- 但**深度算子输出 `block.1.2`**：OFF 与 numpy 参考 rel=5.5e-4 **PASS**，ON 与参考 rel=3.3e-2
+  **FAIL（max 2.57）**。
+
+即：三个 kernel 各自在真实配置下都正确、输入也正确，**但组合进图后 ON 的深度输出错**。
+**问题在图级**（生产者/消费者的 fsv16 记账、或池/重排路径），本轮**未定位**。
 
 **决策（安全优先）**：
-- **回退 `gap_fsv16` 的 planner/dispatch 接线**（`gap_fsv16` 族、nodeFamily、mincut、
-  run() 宏）；**保留** `ops.cl` 的 `GAP_IN_FSV16`（供单元测试）与两个 kernel_numtest 用例，
-  以及上面的 `conv1x1_blk` packed-read 修复。
-- D5 保持 **opt-in**；回退后 mb 四种组合（默认/mincut × 融合开/关）**全部 PASS 且逐位相同**
-  （默认 1.069e-2、mincut 1.215e-2）。
-- **`config/tuning.json` 未改动**（缓存烘焙一并回退）。
-- **重启 D4+ 的前置**：用单元用例进一步逼近「生产者写 fsv16 → 消费者读」的真实链
-  （例如 depthwise_blk OUT_FSV16 → gap），定位图级缺口。
+- **回退 `gap_fsv16` 的 planner/dispatch 接线**；保留 `ops.cl` 的 `GAP_IN_FSV16`（供单元测试）、
+  三个 kernel_numtest 用例、`conv1x1_blk` 的 packed-read 修复、以及快照诊断开关。
+- D5 保持 **opt-in**；回退后 mb 四种组合（默认/mincut × 融合开/关）**全部 PASS 且逐位相同**。
+- **`config/tuning.json` 未改动**。
+- **重启 D4+ 的前置**：用 `INFVINO_SNAP` 继续逼近——生产端 `depthwise_blk(OUT_FSV16)` 的
+  输入在 ON 下是否真的来自 conv1x1_blk 直写、以及 `blkInput`/池在该链上的实际行为。
+
 
 
 

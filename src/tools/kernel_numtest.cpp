@@ -478,8 +478,8 @@ int main(int argc, char ** argv)
                          rt.write(dB, static_cast<size_t>(Cout) * 2, hB.data()); }
       cl_mem dRes = nullptr;
       cl_mem dY = rt.alloc(static_cast<size_t>(Cout) * H * W * 2, CL_MEM_WRITE_ONLY);
-      const int XB = 4, YB = 1, SLM = 1;
-      const std::string o = "-DX_BLOCK=4 -DY_BLOCK=1 -DSLM_DIV=1 -DACT=0 -DMUL_SCALE=1 -DSG=16 "
+      const int XB = 4, YB = 1, SLM = 4;
+      const std::string o = "-DX_BLOCK=4 -DY_BLOCK=1 -DSLM_DIV=4 -DACT=0 -DMUL_SCALE=1 -DSG=16 "
                             "-cl-mad-enable -cl-fast-relaxed-math";
       cl_kernel k = rt.buildKernel("conv1x1_blk", "conv1x1_blk", o);
       clSetKernelArg(k, 0, sizeof(dF), &dF);
@@ -508,6 +508,82 @@ int main(int argc, char ** argv)
       }
       clReleaseMemObject(dX); clReleaseMemObject(dF); clReleaseMemObject(dWo);
       clReleaseMemObject(dS); clReleaseMemObject(dY);
+      if (dB) clReleaseMemObject(dB);
+      clReleaseKernel(k);
+    } else if (op == "depthwiseblk") {
+      // R51 D4+ unit test: depthwise_blk with OUT_FSV16=1 (fsv16 in/out).
+      if (Cin <= 0 || H <= 0 || W <= 0) throw std::runtime_error("need --cin --h --w");
+      const int S = stride >= 0 ? stride : 1, P = pad >= 0 ? pad : 1;
+      const int Ho = (H + 2 * P - dwK) / S + 1, Wo = (W + 2 * P - dwK) / S + 1;
+      const int Cpad = (Cin + 15) / 16 * 16;
+      auto hX = readBin(in_x, static_cast<size_t>(Cin) * H * W);
+      auto hW = readBin(in_w, static_cast<size_t>(Cin) * dwK * dwK);
+      std::vector<uint16_t> hB;
+      if (!in_bias.empty()) hB = readBin(in_bias, static_cast<size_t>(Cin));
+      // [C/16][K][K][16] weight repack.
+      std::vector<uint16_t> hWo(static_cast<size_t>((Cin + 15) / 16) * dwK * dwK * 16, 0);
+      for (int c = 0; c < Cin; ++c)
+        for (int kk = 0; kk < dwK * dwK; ++kk)
+          hWo[((static_cast<size_t>(c / 16) * dwK * dwK) + kk) * 16 + (c % 16)] =
+              hW[static_cast<size_t>(c) * dwK * dwK + kk];
+      // reorder X -> fsv16.
+      cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * H * W * 2, CL_MEM_READ_ONLY);
+      cl_mem dF = rt.alloc(static_cast<size_t>(Cpad) * H * W * 2, CL_MEM_READ_WRITE);
+      rt.write(dX, static_cast<size_t>(Cin) * H * W * 2, hX.data());
+      std::vector<uint16_t> zeros(static_cast<size_t>(Cpad) * H * W, 0);
+      rt.write(dF, zeros.size() * 2, zeros.data());
+      cl_kernel kr = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+      clSetKernelArg(kr, 0, sizeof(dX), &dX);
+      clSetKernelArg(kr, 1, sizeof(dF), &dF);
+      clSetKernelArg(kr, 2, sizeof(Cin), &Cin);
+      clSetKernelArg(kr, 3, sizeof(H), &H);
+      clSetKernelArg(kr, 4, sizeof(W), &W);
+      const size_t rg[3] = {(size_t)W, (size_t)H, (size_t)Cin};
+      infvino::ClRuntime::enqueueND(rt.queue(), kr, 3, rg, nullptr);
+      clReleaseKernel(kr);
+      cl_mem dWo = rt.alloc(hWo.size() * 2, CL_MEM_READ_ONLY);
+      rt.write(dWo, hWo.size() * 2, hWo.data());
+      cl_mem dB = nullptr;
+      if (!hB.empty()) { dB = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_READ_ONLY);
+                         rt.write(dB, static_cast<size_t>(Cin) * 2, hB.data()); }
+      cl_mem dY = rt.alloc(static_cast<size_t>(Cpad) * Ho * Wo * 2, CL_MEM_WRITE_ONLY);
+      char ob[192];
+      std::snprintf(ob, sizeof(ob),
+                    "-DX_BLOCK=4 -DY_BLOCK=1 -DDWK=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
+                    "-DOUT_FSV16=1 -cl-mad-enable -cl-fast-relaxed-math", dwK, S, P, act);
+      cl_kernel k = rt.buildKernel("depthwise_blk", "depthwise_blk", ob);
+      clSetKernelArg(k, 0, sizeof(dF), &dF);
+      clSetKernelArg(k, 1, sizeof(dWo), &dWo);
+      clSetKernelArg(k, 2, sizeof(dB), &dB);
+      clSetKernelArg(k, 3, sizeof(dY), &dY);
+      clSetKernelArg(k, 4, sizeof(Cin), &Cin);
+      clSetKernelArg(k, 5, sizeof(H), &H);
+      clSetKernelArg(k, 6, sizeof(W), &W);
+      clSetKernelArg(k, 7, sizeof(Ho), &Ho);
+      clSetKernelArg(k, 8, sizeof(Wo), &Wo);
+      const size_t lws[3] = {1, 16, 1};
+      const int XB = 4;
+      const size_t gws[3] = {static_cast<size_t>(((Wo + XB - 1) / XB) * ((Ho + 1 - 1) / 1)),
+                             static_cast<size_t>(((Cin + 15) / 16) * 16), 1};
+      for (int i = 0; i < iters; ++i)
+        infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, lws);
+      rt.finish();
+      if (!dump.empty()) {
+        std::vector<uint16_t> hYf(static_cast<size_t>(Cpad) * Ho * Wo, 0);
+        rt.read(dY, hYf.size() * 2, hYf.data());
+        // de-fsv16 -> NCHW.
+        std::vector<uint16_t> hY(static_cast<size_t>(Cin) * Ho * Wo);
+        for (int p = 0; p < Cpad * Ho * Wo; ++p) {
+          const int l = p % 16, q = p / 16, x = q % Wo, q2 = q / Wo, y = q2 % Ho, cb = q2 / Ho;
+          const int c = cb * 16 + l;
+          if (c < Cin) hY[(static_cast<size_t>(c) * Ho + y) * Wo + x] = hYf[p];
+        }
+        writeBin(dump, hY);
+        std::fprintf(stderr, "[kernel_numtest] wrote %s (depthwiseblk %dx%dx%d fp16)\n",
+                     dump.c_str(), Cin, Ho, Wo);
+      }
+      clReleaseMemObject(dX); clReleaseMemObject(dF); clReleaseMemObject(dWo);
+      clReleaseMemObject(dY);
       if (dB) clReleaseMemObject(dB);
       clReleaseKernel(k);
     } else if (op == "depthwise") {
