@@ -234,6 +234,29 @@ spill_ms = miss_bytes × (1/BW_DRAM − 1/BW_L3)
 且「7 线程/EU」的公开值说明某些 Xe-LP 配置确实是 7 —— 本机 Julia 变体/步进不同。如需跨设备
 可移植，应把该阈值作为**设备探测项**而非常量。
 
+---
+
+## 10. 第四步：占用感知的有效 L3 容量（step4）
+
+`footprint` 实测（§9.1）表明有效带宽在**驻留足迹 ≈1MB** 就到平台、之后断崖——因为组相联/
+流式占位把**有效占用**放大了。据此把全局 LRU 模拟的**容量**改为随节点占用缩放：
+
+```
+currentCap = max(1MB, L3 − 0.5 × press)          # press = 该节点瞬时占用
+逐出 LRU 至 resident ≤ currentCap
+spill_bytes = Σ 未命中输入激活字节               # 读 miss
+spill_ms    = spill_bytes × (1/BW_DRAM − 1/BW_L3)
+```
+
+即：**高占用的节点会压缩"其他人可用"的有效容量**，从而对邻居输入造成更多逐出——把 §9.1 的
+「占用→带宽断崖」现象以容量形式编码进全局模拟。这是把「几何 perWG」升级为「占用感知有效容量」
+的最后一块。构建/`tuning_test` PASS。
+
+**性能验证**：用这套新模型对三模型（先 mb）做 `--global` retune，再以**锁频交错稳态 A/B**
+（`kernel_run --report --iters 15`，base/iso/pponly/full 各 4 rep）裁决是否带来提升。结果见
+[`round47-full-flow-findings.md`](round47-full-flow-findings.md) §4.7。
+
+
 
 
 ### 9.1 `perWG_bytes` 标定（`kernel_bench --op footprint`）
