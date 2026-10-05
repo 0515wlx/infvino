@@ -509,6 +509,13 @@ void PlanModel::parse()
   // INFVINO_NO_FUSE_RES=1 可关闭以做 A/B。
   if (!std::getenv("INFVINO_NO_FUSE_RES")) fuseResidualAdd();
 
+  // R51 D5：把「x * scale[c]」（通道广播 Mul，如 SE）折进**消费它的 conv1x1** 的 prologue：
+  // conv 直接读未缩放的 value + 每输入通道 scale（kernel -DMUL_SCALE=1），省掉 Mul 的
+  // 独立 launch 与其物化张量。**opt-in**（`INFVINO_FUSE_SCALE=1`）：实测整网中性，根因是
+  // 被去掉的 Mul 同时承担了 D4 的 fsv16 布局转换（见 docs/round51 §7）；仅当 value 生产者
+  // 本就输出 fsv16 时才是纯收益。默认关 → 默认路径与 R50 逐位一致。
+  if (std::getenv("INFVINO_FUSE_SCALE")) fuseChannelScaleMul();
+
   // P0：把激活张量改分配到按生存期复用的缓冲池（须在 fusion 之后，节点列表已定稿）。
   allocateActivations();
 
@@ -674,6 +681,82 @@ void PlanModel::fuseResidualAdd()
   for (size_t i = 0; i < nodes_.size(); ++i)
     if (!remove[i]) kept.push_back(std::move(nodes_[i]));
   nodes_ = std::move(kept);
+}
+
+// R51 D5: `x * scale[c]`（通道广播 Mul，如 SE）折进消费它的 conv1x1 的 **prologue**。
+// 形态：ew_binary(op=2, bdims) 输出是某个 conv1x1 的**激活**（ins[1]）且只有这一个消费者；
+// 两个操作数按空间范围区分——scale 是 [1,C,1,1]（H*W==1），value 是 [1,C,H,W]。
+// 改写：conv1x1.ins[1] = value，新增 ins[4] = scale；删除 Mul 及其实的名字。
+// kernel 侧 `-DMUL_SCALE=1` 在载入激活时做 `half(value*scale[gc])`（与 Mul 的 half 舍入
+// 一致）→ 逐位等价，同时省掉 Mul 的独立 launch 与物化张量。
+void PlanModel::fuseChannelScaleMul()
+{
+  std::map<std::string, size_t> producer;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producer[o] = i;
+  std::map<std::string, int> useCount;
+  for (const auto & n : nodes_)
+    for (const auto & in : n.ins)
+      if (in != "-") ++useCount[in];
+
+  std::vector<char> remove(nodes_.size(), 0);
+  std::vector<std::string> dead;
+  auto spatial = [](const std::vector<int64_t> & d) -> int64_t {
+    return (d.size() >= 2) ? d[d.size() - 1] * d[d.size() - 2] : 1;
+  };
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    Node & m = nodes_[i];
+    if (m.op != "ew_binary" || !m.attr.count("bdims")) continue;   // 广播乘
+    if (attrInt(m, "op", 0) != 2) continue;                        // multiply only
+    if (m.ins.size() < 2 || m.outs.empty() || m.outs[0] == "-") continue;
+    const std::string & mulOut = m.outs[0];
+    auto d0 = T_.find(m.ins[0]), d1 = T_.find(m.ins[1]);
+    if (d0 == T_.end() || d1 == T_.end()) continue;
+    int scaleIdx = -1, valIdx = -1;
+    if (spatial(d0->second.dims) == 1 && spatial(d1->second.dims) > 1) { scaleIdx = 0; valIdx = 1; }
+    else if (spatial(d1->second.dims) == 1 && spatial(d0->second.dims) > 1) { scaleIdx = 1; valIdx = 0; }
+    else continue;
+    const std::string valT = m.ins[valIdx], scaleT = m.ins[scaleIdx];
+    if (valT == "-" || scaleT == "-") continue;
+    if (useCount[mulOut] != 1) continue;
+    if (std::find(outputs_.begin(), outputs_.end(), mulOut) != outputs_.end()) continue;  // 模型输出
+    // 唯一消费者必须是 conv1x1 且在激活槽 1。
+    size_t ci = nodes_.size();
+    int slot = -1;
+    for (size_t j = 0; j < nodes_.size(); ++j)
+      for (size_t s = 0; s < nodes_[j].ins.size(); ++s)
+        if (nodes_[j].ins[s] == mulOut) { ci = j; slot = static_cast<int>(s); }
+    if (ci >= nodes_.size()) continue;
+    Node & c = nodes_[ci];
+    if (c.op != "conv1x1" || slot != 1) continue;
+    if (!T_.count(valT) || !T_.count(scaleT)) continue;
+    if (c.ins.size() > 4 && c.ins[4] != "-") continue;             // 已有 scale
+    auto vit = producer.find(valT);
+    if (vit == producer.end() || vit->second >= ci) continue;      // value 须在 conv 前产出
+    const auto & vd = T_[valT].dims, &sd = T_[scaleT].dims;
+    if (vd.size() < 3 || sd.size() < 3) continue;
+    if (vd[vd.size() - 3] <= 0 || vd[vd.size() - 3] != sd[sd.size() - 3]) continue;
+    if (c.ins.size() <= 4) c.ins.resize(5, "-");
+    c.ins[1] = valT;
+    c.ins[4] = scaleT;
+    remove[i] = 1;
+    dead.push_back(mulOut);
+    ++fusions_scale_;
+  }
+  if (dead.empty()) return;
+  std::vector<Node> kept;
+  kept.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    if (!remove[i]) kept.push_back(std::move(nodes_[i]));
+  nodes_ = std::move(kept);
+  // Mul 输出张量已死：从池候选与 T_ 中移除（避免按「活到最后」多占一块缓冲）。
+  for (const auto & t : dead)
+  {
+    T_.erase(t);
+    act_names_.erase(std::remove(act_names_.begin(), act_names_.end(), t), act_names_.end());
+  }
 }
 
 void PlanModel::allocateActivations()
@@ -1059,8 +1142,7 @@ void PlanModel::planBlockedLayout()
       const int64_t xn = xit->second.numel();
       const int N = Cin > 0 ? static_cast<int>(xn / Cin) : 0;
       const int act = attrInt(n, "act", 0);
-      const bool dres = n.ins.size() > 3 && n.ins[3] != "-";
-      const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+      const OpSignature sig = conv1x1Sig(n, Cout, N, Cin, act);
       const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "conv1x1_blk") return familyByName("conv1x1_blk");
     }
@@ -2580,13 +2662,15 @@ void PlanModel::run()
       cl_mem dw = w.mem, dx = in(1).mem, dy = out.mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? in(2).mem : nullptr;
       cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? in(3).mem : nullptr;
+      // R51 D5: 融合的逐输入通道 scale（SE Mul 折进 prologue）。
+      cl_mem dscale = (n.ins.size() > 4 && n.ins[4] != "-") ? in(4).mem : nullptr;
       if (N == 1) {
         Conv1x1Cfg cfg;
         cfg.ACT = act;
         cfg.RES = dres ? 1 : 0;
         cfg.SG  = 16;
         std::string gopts = cfg.options();
-        const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+        const OpSignature sig = conv1x1Sig(n, Cout, N, Cin, act);
         // R45 P0#6: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
         if (const TuningEntry * e = choiceEntry(ni, sig)) gopts = e->options;
         if (dres) setResOpt(gopts, true);  // R33 融合残差
@@ -2618,7 +2702,7 @@ void PlanModel::run()
         t.EPI = 1;
         t.ACT = act;
         std::string gopts = t.options();
-        const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+        const OpSignature sig = conv1x1Sig(n, Cout, N, Cin, act);
         std::string gkernel = "gemm_f16";
         const size_t ni1 = static_cast<size_t>(&n - nodes_.data());
         if (const TuningEntry * e = choiceEntry(ni1, sig)) {
@@ -2652,6 +2736,7 @@ void PlanModel::run()
           if (out.fsv16 && kbopts.find("-DOUT_FSV16=") == std::string::npos)
             kbopts += " -DOUT_FSV16=1";
           if (dres) setResOpt(kbopts, true);
+          if (dscale) kbopts += " -DMUL_SCALE=1";   // R51 D5
           cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", kbopts);
           setArg(kb, 0, sizeof(dxb), &dxb);
           setArg(kb, 1, sizeof(dwb), &dwb);
@@ -2662,6 +2747,7 @@ void PlanModel::run()
           setArg(kb, 6, sizeof(Hin), &Hin);
           setArg(kb, 7, sizeof(Win), &Win);
           setArg(kb, 8, sizeof(Cout), &Cout);
+          if (dscale) setArg(kb, 9, sizeof(dscale), &dscale);
           const size_t blws[3] = {1, static_cast<size_t>(16 * slm), 1};
           const size_t ybCount = static_cast<size_t>((Hin + yb - 1) / yb);  // R48 D1
           const size_t bgws[3] = {static_cast<size_t>(((Win + xb - 1) / xb)) * ybCount,
@@ -2673,6 +2759,7 @@ void PlanModel::run()
         // R32: split-K（lane 沿 K）候选走 gemm_sk_f16，几何不同；两者参数表相同。
         const bool sk = (gkernel == "gemm_sk_f16");
         if (dres) setResOpt(gopts, true);  // R33 融合残差（gemm_f16/gemm_sk 都支持 RES）
+        if (dscale) gopts += " -DMUL_SCALE=1";   // R51 D5
         cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", gkernel, gopts);
         setArg(kg, 0, sizeof(dw), &dw);
         setArg(kg, 1, sizeof(dx), &dx);
@@ -2682,6 +2769,7 @@ void PlanModel::run()
         setArg(kg, 5, sizeof(Cin), &Cin);
         setArg(kg, 6, sizeof(db), &db);
         setArg(kg, 7, sizeof(dres), &dres);
+        if (dscale) setArg(kg, 8, sizeof(dscale), &dscale);
         size_t lws[2], gws[2];
         if (sk) {
           auto optInt = [&](const char * k, int def) {
@@ -3369,6 +3457,12 @@ bool opInList(const std::vector<std::string> & ops, const std::string & op)
 }
 }  // namespace
 
+OpSignature PlanModel::conv1x1Sig(const Node & n, int Cout, int N, int Cin, int act) const
+{
+  const bool res = n.ins.size() > 3 && n.ins[3] != "-";
+  return OpSignature::conv1x1(Cout, N, Cin, act, res ? 1 : 0);
+}
+
 OpSignature PlanModel::nodeSignature(const Node & n, bool * ok) const
 {
   if (ok) *ok = true;
@@ -3408,8 +3502,7 @@ OpSignature PlanModel::nodeSignature(const Node & n, bool * ok) const
     const auto & wd = T_.at(n.ins[0]).dims;
     const int Cout = (int)wd[0], Cin = (int)wd[1];
     const int N = Cin > 0 ? (int)(T_.at(n.ins[1]).numel() / Cin) : 0;
-    const bool res = n.ins.size() > 3 && n.ins[3] != "-";
-    return OpSignature::conv1x1(Cout, N, Cin, act, res ? 1 : 0);
+    return conv1x1Sig(n, Cout, N, Cin, act);
   }
   if (n.op == "conv_general")
   {
@@ -3922,7 +4015,9 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       cl_mem dw = w.mem, dx = ref(n.ins[1]).mem, dy = ref(n.outs[0]).mem;
       cl_mem db = (n.ins.size() > 2 && n.ins[2] != "-") ? ref(n.ins[2]).mem : nullptr;
       cl_mem dres = (n.ins.size() > 3 && n.ins[3] != "-") ? ref(n.ins[3]).mem : nullptr;
-      const OpSignature sig = OpSignature::conv1x1(Cout, N, Cin, act, dres ? 1 : 0);
+      // R51 D5: 融合的逐输入通道 scale（SE Mul 折进 prologue）。
+      cl_mem dscale = (n.ins.size() > 4 && n.ins[4] != "-") ? ref(n.ins[4]).mem : nullptr;
+      const OpSignature sig = conv1x1Sig(n, Cout, N, Cin, act);
       if (!onlySubstr.empty() && sig.str().find(onlySubstr) == std::string::npos) continue;
       if (!shouldTune(sig, n)) continue;
       const double flops = 2.0 * Cout * static_cast<double>(N) * Cin;
@@ -3955,6 +4050,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
           std::string bopts = c.options;
           if (dres) setResOpt(bopts, true);
+          if (dscale) bopts += " -DMUL_SCALE=1";   // R51 D5
           cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", bopts);
           setArg(kb, 0, sizeof(dxb), &dxb);
           setArg(kb, 1, sizeof(dwb), &dwb);
@@ -3965,6 +4061,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kb, 6, sizeof(Hin), &Hin);
           setArg(kb, 7, sizeof(Win), &Win);
           setArg(kb, 8, sizeof(Cout), &Cout);
+          if (dscale) setArg(kb, 9, sizeof(dscale), &dscale);
           const size_t lws[3] = {1, static_cast<size_t>(16 * slm), 1};
           const size_t ybCount = static_cast<size_t>((Hin + yb - 1) / yb);  // R48 D1
           const size_t gws[3] = {static_cast<size_t>(((Win + xb - 1) / xb)) * ybCount,
@@ -3974,7 +4071,9 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           };
         }
         const bool sk = (c.kernel == "gemm_sk_f16");
-        cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", c.kernel, c.options);
+        std::string gopts = c.options;
+        if (dscale) gopts += " -DMUL_SCALE=1";   // R51 D5
+        cl_kernel kg = getKernel(sk ? "gemm_sk" : "gemm", c.kernel, gopts);
         auto optInt = [&](const char * k, int def) {
           const auto p = c.options.find(k);
           return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
@@ -3987,6 +4086,7 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         setArg(kg, 5, sizeof(Cin), &Cin);
         setArg(kg, 6, sizeof(db), &db);
         setArg(kg, 7, sizeof(dres), &dres);
+        if (dscale) setArg(kg, 8, sizeof(dscale), &dscale);
         size_t lws[2], gws[2];
         if (sk) {
           const int TM = optInt("-DSK_TM=", 8), TN = optInt("-DSK_TN=", 4),

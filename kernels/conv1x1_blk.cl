@@ -79,6 +79,12 @@
 #ifndef FIT_WH          // W % X_BLOCK == 0 -> no column-wrap predicate
 #define FIT_WH 0
 #endif
+// R51 D5: MUL_SCALE=1 -> activation scaled per input channel (lane's gc) on load,
+// fusing a channel-broadcast Mul (SE `x*scale[c]`) into the conv prologue (removes the
+// separate elementwise pass). Product rounded to half before mad -> bitwise-identical.
+#ifndef MUL_SCALE
+#define MUL_SCALE 0
+#endif
 
 #define FS 16           // FEATURE_SLICE_SIZE
 
@@ -135,7 +141,12 @@ __kernel void conv1x1_blk(
   __global half *restrict output,         // fsv16 or bfyx (OUT_FSV16)
   __global const half *restrict residual, // [Cout][H][W] NCHW or null (RES=1)
   const int Cin, const int H, const int W,
-  const int Cout) {
+  const int Cout
+#if MUL_SCALE
+  , __global const half *restrict Scale    // [Cin] (MUL_SCALE=1)
+#endif
+)
+{
   const int sglid = get_sub_group_local_id();
   const int lid1  = get_local_id(1);
   const int feature_per_wg = SG;
@@ -225,6 +236,13 @@ __kernel void conv1x1_blk(
 #endif
 #endif
       }
+#if MUL_SCALE
+      if (Scale != 0 && !in_left) {
+#pragma unroll
+        for (int i = 0; i < X_BLOCK; ++i)
+          src[i] = (half)((float)src[i] * (float)Scale[gc]);
+      }
+#endif
 #pragma unroll
       for (int id = 0; id < 16; ++id)
         dst[r] = mad(wei[id], GET_SRC(src, id), dst[r]);

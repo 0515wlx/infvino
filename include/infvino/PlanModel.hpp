@@ -318,6 +318,10 @@ private:
   /** @brief R33: fuse `conv -> ew_binary(add)` into the conv epilogue (RES), removing the
    *  standalone elementwise add launch. Only for producers whose kernel supports RES. */
   void    fuseResidualAdd();
+  /** @brief R51 D5: fuse `x * scale[c]` (channel-broadcast Mul, e.g. SE) into the conv1x1
+   *  that consumes it as its activation, so the Mul pass + its tensor disappear; the conv
+   *  reads the unscaled value + a per-input-channel `scale` (kernel `-DMUL_SCALE=1`). */
+  void    fuseChannelScaleMul();
   void    buildKernels();
   void    releaseKernels();
   void    dispatch(const Node & n);
@@ -384,6 +388,8 @@ private:
   void    noteNode(size_t ni, const std::string & tag, double ms);
   /** @brief 求一个节点的调优签名（与 `tuningTargets` 同源；不支持的 op 置 ok=false）。 */
   OpSignature nodeSignature(const Node & n, bool * ok = nullptr) const;
+  /** @brief R51 D5: conv1x1 节点的签名（含 RES/MUL_SCALE 位；从 ins 槽 3/4 派生）。 */
+  OpSignature conv1x1Sig(const Node & n, int Cout, int N, int Cin, int act) const;
   /** @brief P2: 克隆一个 kernel（独立参数状态，用于跨帧跳过 setArg）。 */
   cl_kernel cloneKernel(cl_kernel src);
   /** @brief P2: 让已录制的 dispatch 失效（调优/布局改变后必须重录）。 */
@@ -497,6 +503,7 @@ private:
   size_t                                        cur_node_{0};   // run() 当前节点序号
   int                                           fusions_res_{0};    // R33 残差融合次数
   int                                           fusions_concat_{0}; // R30c concat->conv1x1 次数
+  int                                           fusions_scale_{0};  // R51 D5 Mul->conv1x1 prologue 次数
   double                                        last_run_ms_{0.0};
   // P2: host-side segmentation (only filled when profiling_): cumulative time in
   // clEnqueueNDRangeKernel and in clWaitForEvents.

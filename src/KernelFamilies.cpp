@@ -494,7 +494,7 @@ const std::vector<KernelFamily> & kernelFamilies()
         for (const auto & o : skopts) {
           std::ostringstream os;
           os << "-DSK_TM=" << o.TM << " -DSK_TN=" << o.TN << " -DSK_SG=16 -DSK_UK=" << o.UK
-             << " -DACT=" << s.act << " -DRES=" << ((s.groups == 2) ? 1 : 0)
+             << " -DACT=" << s.act << " -DRES=" << ((s.groups & 2) ? 1 : 0)
              << " -cl-mad-enable -cl-fast-relaxed-math";
           std::ostringstream cc;
           cc << "sk TM" << o.TM << " TN" << o.TN << " u" << o.UK << " act" << s.act;
@@ -546,7 +546,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.candidates = [](const OpSignature & s) {
         Conv1x1Cfg cfg;
         cfg.ACT = s.act;
-        cfg.RES = (s.groups == 2) ? 1 : 0;
+        cfg.RES = (s.groups & 2) ? 1 : 0;
         cfg.SG = 16;
         return std::vector<Candidate>{mk("conv1x1_gemv_f16", "conv1x1", cfg.options(), cfg.label())};
       };

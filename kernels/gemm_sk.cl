@@ -44,6 +44,13 @@
 #ifndef RES
 #define RES 0
 #endif
+// R51 D5: MUL_SCALE=1 -> activation is scaled per input channel (k) on load, fusing a
+// one-operand channel-broadcast Mul (SE `x * scale[c]`) into the conv prologue so the
+// separate elementwise pass (and its materialised output) disappears. Rounds the
+// product to half before mad -> numerically identical to conv(scaled-half-tensor).
+#ifndef MUL_SCALE
+#define MUL_SCALE 0
+#endif
 
 inline half sk_activate(half v)
 {
@@ -73,7 +80,11 @@ __kernel void gemm_sk_f16(
   __global half *restrict C,           // [M][N]
   const int M, const int N, const int K,
   __global const half *restrict Bias,  // [M] or null
-  __global const half *restrict Res)   // [M][N] or null (RES=1)
+  __global const half *restrict Res    // [M][N] or null (RES=1)
+#if MUL_SCALE
+  , __global const half *restrict Scale // [K] (MUL_SCALE=1)
+#endif
+)
 {
   const int lane = get_local_id(0);
   const int n0 = get_group_id(0) * SK_TN;
@@ -102,6 +113,9 @@ __kernel void gemm_sk_f16(
       for (int j = 0; j < SK_TN; ++j) {
         const int n = n0 + j;
         b[j] = (n < N) ? B[(size_t)kk * N + n] : (half)0;
+#if MUL_SCALE
+        if (Scale != 0) b[j] = (half)((float)b[j] * (float)Scale[kk]);
+#endif
       }
 #pragma unroll
       for (int i = 0; i < SK_TM; ++i)
@@ -121,6 +135,9 @@ __kernel void gemm_sk_f16(
     for (int j = 0; j < SK_TN; ++j) {
       const int n = n0 + j;
       b[j] = (n < N) ? B[(size_t)k * N + n] : (half)0;
+#if MUL_SCALE
+      if (Scale != 0) b[j] = (half)((float)b[j] * (float)Scale[k]);
+#endif
     }
 #pragma unroll
     for (int i = 0; i < SK_TM; ++i)

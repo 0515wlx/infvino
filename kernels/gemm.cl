@@ -123,6 +123,16 @@
 #ifndef RES
 #define RES 0
 #endif
+// R51 D5: MUL_SCALE=1 -> B (activation [K][N]) is scaled per row k by Scale[k] right
+// after staging, fusing a channel-broadcast Mul (SE `x*scale[c]`) into the prologue.
+// Product is rounded to half before mad -> bitwise-identical to feeding the Mul's
+// materialised half output.
+#ifndef MUL_SCALE
+#define MUL_SCALE 0
+#endif
+#if !MUL_SCALE
+#define Scale ((__global const half *)0)   // 未启用时占位，使 STAGE_B 的 dead 分支可编译
+#endif
 
 inline half gemm_activate(half v) {
 #if ACT == 1
@@ -188,6 +198,9 @@ __kernel void gemm_f16(__global const half *restrict A,
                        , __global const half *restrict B3
                        , const int ca, const int cb, const int cc
                        , const int o0, const int o1, const int o2, const int o3
+#endif
+#if MUL_SCALE
+                       , __global const half *restrict Scale  // [K] (MUL_SCALE=1)
 #endif
                        ) {
 #if CAT4
@@ -322,6 +335,16 @@ __kernel void gemm_f16(__global const half *restrict A,
           int r = idx / BN, c = idx % BN;                                           \
           int gr = k0_ + r, gc = blockCol + c;                                      \
           Bs[r][c] = (gr < K && gc < N) ? BROW(gr)[gc] : (half)0;                   \
+        }                                                                           \
+      }                                                                             \
+    }                                                                               \
+    if (MUL_SCALE && Scale != 0) {                                                  \
+      _Pragma("unroll") for (int si = 0; si < (BK * BN + NTHR - 1) / NTHR; ++si) {  \
+        int sidx = tid + si * NTHR;                                                 \
+        if (sidx < BK * BN) {                                                       \
+          int sr = sidx / BN, sc = sidx % BN;                                       \
+          if (k0_ + sr < K)                                                         \
+            Bs[sr][sc] = (half)((float)Bs[sr][sc] * (float)Scale[k0_ + sr]);        \
         }                                                                           \
       }                                                                             \
     }                                                                               \

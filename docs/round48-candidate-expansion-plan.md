@@ -172,6 +172,10 @@
    R41 已证 kernel 侧无空间，价值全在布局。
 4. **P2 — 小算子 launch 融合（D5）**：把相邻逐元素/pool/gap 折进 conv 的 prologue/epilogue，
    减少 dispatch 数（确定性杠杆）。
+   → ◑ **R51 已试 SE Mul→conv1x1 prologue 融合（`-DMUL_SCALE`）**：逐位一致、dispatch↓，
+   但整网**中性**（与 D4 的 fsv16 转换相抵），保持 opt-in；见
+   [`round51-cat4-registry-and-non16-fsv16.md`](round51-cat4-registry-and-non16-fsv16.md) §5。
+   （下一步做 gap+fc / resize→conv 等不与布局转换冲突的融合。）
 5. **P3/P4 — 其余**：direct conv1x1（窄通道/小 N）、conv1x1 N=1 的 split-K、gemm staging、
    depthwise 的 Memory/Launch 轴；Winograd/CINC 泛化维持「离线可证伪」定位。
 

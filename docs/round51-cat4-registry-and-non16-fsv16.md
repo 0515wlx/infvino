@@ -190,10 +190,46 @@ R50 只给 `depthwise_blk` 测了「输出 fsv16」的真实成本；`conv1x1_bl
 
 ---
 
-## 5. 下一步（回到 §4bis 排序）
+## 5. 追加：D5 小算子 launch 融合 —— SE Mul 折进 conv1x1 prologue（**中性，opt-in**）
+
+**动机**（计划 §D5 / §4bis P2）：小算子占 busy ~50% 的 **dispatch 数**，launch 地板 3.5µs；
+把相邻逐元素折进 conv 的 prologue/epilogue 是确定性杠杆。
+
+**实现**：识别 `x * scale[c]`（`ew_binary` op=2、`bdims` 通道广播，如 SE）——其输出是某个
+`conv1x1` 的**激活**（槽 1）且唯一消费者；把该 conv1x1 改为读**未缩放的 value** + 新增
+`ins[4]=scale`，删除 Mul 及其实的名字。kernel 侧新增 `-DMUL_SCALE=1`：
+`gemm_f16` / `gemm_sk_f16` 在 B 载入后按行 `k` 乘 `Scale[k]`；`conv1x1_blk` 在 lane 的输入通道
+`gc` 上乘 `Scale[gc]`。**乘积舍入到 half**（与 Mul 的 half 输出一致）→ **逐位等价**。
+`MUL_SCALE` 的 `Scale` 参数用 `#if MUL_SCALE` 条件声明，未启用时内核签名不变（不破坏
+cat4/gemm/kernel_bench 等调用点）。
+
+**验证**：mb `model_check` 融合开/关 **逐位相同**（mean_rel 1.069e-2）；y8/y11 默认不变。
+
+**整网 A/B（同 binary，融合开/关，交错 ×8，busy median）**：
+
+| 模型 | 路径 | off | on | Δ |
+|---|---|---:|---:|---:|
+| mobilenetv3-small | 默认 | 2.173 | 2.184 | +0.5%（噪声内） |
+| mobilenetv3-small | mincut | 1.953 | 1.937 | −0.8%（噪声内） |
+
+**结构性负结果（根因）**：融合确实**减少 dispatch**（mb 83→79，节点 74→65），但同时
+`fsv16` 张量 12→7、reorder 10→15（0.079→0.114 ms）——**被去掉的 Mul 同时承担了 D4 的
+fsv16 布局转换**（`ew_binary_ch` 的 `-DEWCH_OUT_FSV16`：读 NCHW value、写 fsv16）。
+融合后这个转换重新变成独立 `reorder`，两者成本相抵 → 净中性。**仅当 value 生产者本就输出
+fsv16 时，融合才是纯收益**（省一趟全激活读+写）。
+
+**决策**：按 R31 `depthwise_pad` 先例，保留实现但 **opt-in**（`INFVINO_FUSE_SCALE=1`），
+**默认关** → 默认路径与 R50 逐位一致、零回归。若要转正，需与「value 生产者 fsv16 持久化」
+联合决策（即 D4 的延伸：让生产者直写 + prologue 直读/乘 scale 一步完成）。
+
+---
+
+## 6. 下一步（回到 §4bis 排序）
 
 1. **P1（高风险）conv3x3 的布局链**：给 `conv3x3` 一个能输出 fsv16 的 epilogue（或让消费者
    prologue 直读），纳入 mincut；否则维持 R49「明确放弃 3×3 blocked 链」。
-2. **P2 小算子 launch 融合（D5）**：把相邻逐元素/pool/gap 折进 conv prologue/epilogue。
+2. ✅/⚠ **P2 小算子 launch 融合（D5）已试（本文 §5）**：SE Mul→conv1x1 prologue 融合
+   （`MUL_SCALE`）逐位一致、减少 dispatch，但整网**中性**（与 D4 的布局转换相抵），按先例
+   保持 **opt-in**。下一步可做 **gap+fc / resize→conv** 等不与布局转换冲突的融合。
 3. **P3 direct conv1x1（窄通道/小 N）**、conv1x1 N=1 split-K、gemm staging。
 4. ✅ **M5 收尾已完成（本文 §4）**：`conv1x1_blk` 的输出 fsv16 成本（`#blkfsv16`）纳入 autotune。
