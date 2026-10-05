@@ -3260,32 +3260,42 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         cs.cands = shortNon;
         cs.cands.insert(cs.cands.end(), shortBlk.begin(), shortBlk.end());
       }
-      TuningEntry e = en;
-      if (!eb.kernel.empty() && (en.kernel.empty() || eb.ms < en.ms)) e = eb;
-      if (merge && !eb.kernel.empty())
+      // R47 S1: 统一计费口径。conv3x3 的 base 选择此前用 min(blk, non)（**不计 reorder**），
+      // 与 conv1x1/depthwise 的 `blk+reorder` 口径不一致——会把「kernel 快但净负」的 blk
+      // 写进 base 条目（尤其生产缓存没有 #blk/#non/#reorder 时，fixpoint 退化、无任何
+      // reorder 计费）。现统一为先测本节点输入的一趟 reorder，再按 `blk+reorder` 选，
+      // 存 kernel-only ms（与 conv1x1/depthwise 完全一致）。
+      double reorderMs = 0.0;
+      if (!eb.kernel.empty())
       {
         // Measure one bfyx->fsv16 reorder for this node's input (the cost the blk
         // alternative incurs when the input is NOT persisted fsv16).
-        double reorderMs = 0.0;
-        {
-          Tensor & xt = ref(n.ins[0]);
-          const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
-          cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
-          cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
-          cl_mem xm = xt.mem;
-          setArg(kr, 0, sizeof(xm), &xm);
-          setArg(kr, 1, sizeof(scratch), &scratch);
-          setArg(kr, 2, sizeof(Cin), &Cin);
-          setArg(kr, 3, sizeof(H), &H);
-          setArg(kr, 4, sizeof(W), &W);
-          const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
-                                static_cast<size_t>(Cin)};
-          std::function<cl_event()> renq = [this, kr, rg]() {
-            return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
-          };
-          benchCandidate(rt_, renq, iters, &reorderMs);
-          clReleaseMemObject(scratch);
-        }
+        Tensor & xt = ref(n.ins[0]);
+        const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
+        cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
+        cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+        cl_mem xm = xt.mem;
+        setArg(kr, 0, sizeof(xm), &xm);
+        setArg(kr, 1, sizeof(scratch), &scratch);
+        setArg(kr, 2, sizeof(Cin), &Cin);
+        setArg(kr, 3, sizeof(H), &H);
+        setArg(kr, 4, sizeof(W), &W);
+        const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
+                              static_cast<size_t>(Cin)};
+        std::function<cl_event()> renq = [this, kr, rg]() {
+          return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+        };
+        benchCandidate(rt_, renq, iters, &reorderMs);
+        clReleaseMemObject(scratch);
+      }
+      TuningEntry e = en;
+      if (!eb.kernel.empty())
+      {
+        const double eff = eb.ms + reorderMs;   // billed selection cost
+        if (en.kernel.empty() || eff < en.ms) e = eb;   // store kernel-only ms
+      }
+      if (merge && !eb.kernel.empty())
+      {
         tuning_.put(OpSignature::custom(sig.str() + "#blk", {}), eb);
         TuningEntry er;
         er.kernel = "reorder_bfyx_to_fsv16";

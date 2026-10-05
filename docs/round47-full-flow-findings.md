@@ -126,8 +126,9 @@ blk 只快 ~0.005ms，而 reorder 要 0.0085ms → **净 +0.0033ms**。即：**b
 
 ### 为什么系统还会选中净负的 blk（真正的病灶）
 
-1. **族间计费口径不一致**：`conv3x3 / conv1x1` 的 base 判据是 `min(blk, non)`（`PlanModel.cpp:3263-3264`，
-   **不计 reorder**）；而 `depthwise` 分支却用 `eff = blk + reorder` 计费（`3775-3776`）。同一套机制两套口径。
+1. **族间计费口径不一致（已定位，S1 修正）**：`conv3x3` 的 base 判据是 `min(blk, non)`（`PlanModel.cpp:3263-3264`，**不计 reorder**）；
+   而 `conv1x1`（`3591-3592`）与 `depthwise`（`3775-3776`）早已用 `eff = blk + reorder` 计费。
+   **先前误写为「conv3x3/conv1x1 都不计」，实际只有 conv3x3 漏计**——已按 S1 对齐（见 §4.3）。
 2. **布局 fixpoint 常常不生效**：reorder-aware 的联合不动点 `resolveLayoutChoices` **要求缓存里有
    `#blk / #non / #reorder`**（`1047-1055`）；而**生产 `config/tuning.json` 里 513 条全是 base，一条 `#` 都没有**
    → `any=false` → 退化成纯 `planBlockedLayout`，**reorder 从不参与决策**。
@@ -158,6 +159,29 @@ blk 只快 ~0.005ms，而 reorder 要 0.0085ms → **净 +0.0033ms**。即：**b
 > **据此的建议**：**暂不上完整 blocked chain**。先做 **S1+S2**（低成本、直接堵住负收益来源），
 > 用 **S3** 的 opt-in chain move 在 mb 上量化「整链持久化」的真实端到端收益；只有在 S3
 > 于锁频稳态 A/B 上可复现为正、且结算清耦合风险后，才投入 S4。
+
+## 4.3 实施记录（S1–S4）
+
+### S1 统一计费口径 —— 已落地（待全量 retune 验证）
+
+- **修改**：`src/PlanModel.cpp` conv3x3 分支——先把该节点输入的一趟 `reorder` 测出来，
+  再按 **`blk+reorder`** 选 base（存 kernel-only ms），与 conv1x1/depthwise 完全一致。
+- **发现问题（记录）**：先前 findings 误写「conv3x3/conv1x1 都不计 reorder」；实测代码
+  `conv1x1` 早已按 `blk+reorder` 计费（`3591-3592`），**只有 conv3x3 漏计**。已更正文档。
+- **验证（GPU 定向 retune, y11 conv3x3×3）**：base 选择已与计费规则一致——三签名
+  `blk+reorder` 均 > `non`，base 都选了 non（`conv3x3_f16 / conv3x3_ov / conv3x3_cin3`），
+  `#blk/#non/#reorder` 三键齐全。构建通过、`tuning_test` PASS。
+- **发现（记录）**：conv3x3_blk 普遍慢于 OV（实测 `0.125 vs 0.108`、`0.313 vs 0.257`、
+  `0.884 vs 0.213`），所以该修复对 **yolo 实际影响有限**（与 yolo `fsv16=0` 一致）；
+  真正的负收益来自 conv1x1/depthwise + `globalRetune` 绕过布局契约（→ S2）。
+- **发现（记录，独立 bug 线索）**：`reorder_bfyx_to_fsv16` 按 fsv16 把通道**补齐到 16 的倍数**，
+  对 `Cin<16` 的输入有**写放大**：`Cin=3` 的 320×320 输入 reorder 实测 **3.55 ms**（≈写的
+  1.6M half vs 读的 0.31M），是 stem conv 本身（0.21 ms）的 16 倍。小 `Cin` 层应避免经由
+  fsv16 reorder（除非上游能直接产出 fsv16）。
+- **残留（S1 的边界）**：`#blk/#non/#reorder` 只在 `autotune(merge)` 时写入；生产
+  `config/tuning.json` 无这些键 → 布局 fixpoint 仍退化。S1 保证 **base 条目本身**已
+  reorder-aware（即使无 `#`），但要让**跨节点** fixpoint 生效需一次**全量 retune**
+  重新生成缓存（S2/S3 会用到）。
 
 ## 5. 下一步（按 ROI）
 
