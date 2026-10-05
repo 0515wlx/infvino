@@ -60,7 +60,7 @@ def main() -> int:
     ap.add_argument("--global-margin", type=float, default=0.0,
                     help="隔离 margin 剪枝（默认 0=关；>0 有剪掉流水线更快候选的风险）")
     ap.add_argument("--global-budget", type=int, default=0,
-                    help="整网测量总预算（0 = 不限）")
+                    help="整网执行次数总预算（0 = 不限；R47 口径改为整网执行次数，更贴近 GPU 风险）")
     ap.add_argument("--lock", action="store_true",
                     help="跑基准前 scripts/gpu_clocks.sh lock，结束后 unlock（推荐用于 --global）")
     args = ap.parse_args()
@@ -70,10 +70,21 @@ def main() -> int:
     cache_abs = os.path.join(repo, args.cache)
     os.makedirs(os.path.dirname(cache_abs), exist_ok=True)
 
+    # R47 fix: 绝对 --cache（如 /tmp/t.json）此前会被拼成容器内 `/workspace/infvino//tmp/t.json`
+    # → 缓存写到错误位置甚至静默丢失（R46 文档正是这么用的）。改为 bind-mount 其所在目录，
+    # 并把绝对路径**原样**传给容器；相对路径仍映射到仓库内。
+    extra_mounts = []
+    if os.path.isabs(args.cache):
+        cache_in_container = args.cache
+        extra_mounts = ["-v", f"{os.path.dirname(cache_abs)}:{os.path.dirname(cache_abs)}"]
+    else:
+        cache_in_container = f"/workspace/infvino/{args.cache}"
+    dcmd = DOCKER_BASE + extra_mounts
+
     ops = [o for o in args.ops.split(",") if o]
 
     def in_container(inner: str, timeout: int = 240) -> int:
-        cmd = DOCKER_BASE + [
+        cmd = dcmd + [
             "-v", f"{repo}:/workspace/infvino", "-w", "/workspace/infvino",
             args.image, "bash", "-lc",
             "set -e\n"
@@ -116,6 +127,9 @@ def main() -> int:
         # 整网回验须重扫隔离候选；分批进度由 per-plan 工件承载（不能靠共享缓存的 tuned 跳过）。
         retune = "--retune"
         loop.append("export INFVINO_GLOBAL_PROGRESS=1")
+        # R47: 打开整网回验报告（此前 autotune.py grep 了 'global-retune' 却没 export，
+        # 导致回验日志从不出现——可观测性缺陷）。
+        loop.append("export INFVINO_GLOBAL_RETUNE_REPORT=1")
         # 新一轮 campaign：清掉旧 per-plan 工件（否则所有节点都被判为「已回验」而全跳过）。
         loop.append(f"rm -f /workspace/infvino/models/{args.model}/model.plan.tuning.json")
     for op in ops:
@@ -124,7 +138,7 @@ def main() -> int:
         loop.append(
             f"for b in $(seq 1 64); do\n"
             f"  out=$(timeout 200 /workspace/infvino/build-ct/kernel_autotune "
-            f"--plan {plan} --cache /workspace/infvino/{args.cache} "
+            f"--plan {plan} --cache {cache_in_container} "
             f"--op {op} --limit {args.batch} --iters {args.iters} {retune} {gargs} --expected 2>&1) || {{\n"
             f"    echo \"$out\"; echo '[autotune] batch failed; stop'; exit 1; }}\n"
             f"  echo \"$out\" | grep -E 'expected vs|ratio|wrote|global-retune|WARN' || true\n"
@@ -137,7 +151,7 @@ def main() -> int:
     if args.lock:
         subprocess.run([os.path.join(repo, "scripts", "gpu_clocks.sh"), "lock"], check=False)
         locked = True
-    rc = run(DOCKER_BASE + [
+    rc = run(dcmd + [
         "-v", f"{repo}:/workspace/infvino", "-w", "/workspace/infvino",
         args.image, "bash", "-lc", "\n".join(loop),
     ])
@@ -152,7 +166,7 @@ def main() -> int:
         baked = f"/workspace/infvino/models/{args.model}/model.plan.baked"
         in_container(
             f"/workspace/infvino/build-ct/kernel_autotune --plan {plan} "
-            f"--cache /workspace/infvino/{args.cache} --op conv3x3 --limit 0 --iters 1 "
+            f"--cache {cache_in_container} --op conv3x3 --limit 0 --iters 1 "
             f"--bake {baked} >/dev/null 2>&1 || true")
 
     print(f"\n[autotune] done. cache = {args.cache} ({os.path.getsize(cache_abs) if os.path.exists(cache_abs) else 0} bytes)")

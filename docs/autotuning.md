@@ -617,4 +617,19 @@ R31 增加了 `depthwise_vp`（零边 `depthwise_pad` + 无边界卷积）候选
 - **offline 融合**：`config/tuning.json`（可移植隔离默认）+ `<plan>.tuning.json`（本图全局）
   两级缓存；回退 = 删/换工件，运行时零感知、免重搜。
 
+### 13.2 R47：TVM 借鉴 —— 双口径/交错 + 可加目标 + 布局耦合分组 move
+
+完整分析见 [`round47-tvm-strategy.md`](round47-tvm-strategy.md)。要点：
+
+- **测量口径**：`globalRetune` 的目标从单一 `min` 改为 **min+median 双口径**；接受/最终裁决
+  在 **median（典型口径）** 成立，min 仅作内禀地板守卫。基线与候选**交错测量**（同 rep 内先后
+  测），抵消 R46 实测的 ±5% 热漂移。
+- **可加目标**：`predictNet(asg) = Σ 节点 kernel ms + 未持久化 blk 输入的 #reorder.ms`（零 GPU），
+  用于**目标优先级**与分组；对应 TVM 的「Σ weight × 单算子 ms」。最终仍由端到端 median 回验裁决。
+- **布局耦合分组 move**：union-find 把「共享输入 / 生产者→消费者」的节点聚成耦合分量；只对
+  分量做联合重优化 + **整体一次**端到端回验（治 R46 §4.1「逐 op 独立选 blk 组合在一起可能更差」）。
+  `INFVINO_NO_GLOBAL_GROUPED=1` 可关。
+- **预算**：`--global-budget` 语义改为**整网执行次数**（含 capture），更贴近 GPU HANG 风险口径。
+- **边界**：默认仍 `--global` opt-in；**持久 fsv16 blocked chain 暂缓**（R46 前置就位后另开）。
+
 

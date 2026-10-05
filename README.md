@@ -159,6 +159,8 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round44-global-objective.md`](docs/round44-global-objective.md) | **R44 autotune 目标函数修正 + 体系缺陷倒查**：隔离 min → 整网 busy 坐标下降回验（`--global`）；分层列出目标/表示/测量/安全/指标五类漏洞 |
 | [`docs/round45-perplan-and-search.md`](docs/round45-perplan-and-search.md) | **R45 P0–P2 落地 + 整网搜索/offline 探索**：per-plan 选择覆盖、`choiceEntry` 统一、kernel 源指纹守卫、噪声地板/预算/top-K∪每族代表；两级缓存融合与回退快路径 |
 | [`docs/round46-global-flow-findings.md`](docs/round46-global-flow-findings.md) | **R46 整网调优全流程实测**：暴露并修复 3 个基础设施 bug（`--global` 空操作/分批推进、N==1 GEMV 漏改、缺最终验收门）；实证「整网回验暂无可靠正收益」与 in-situ/稳态口径错配；**blocked chain 前置条件** |
+| [`docs/round47-tvm-strategy.md`](docs/round47-tvm-strategy.md) | **R47 TVM meta_schedule 策略借鉴**：可加目标/代理剪枝/梯度预算三层对照；测量 min+median 双口径与交错；按 R46 前置排序的落地路线（blocked chain 暂缓） |
+| [`docs/round47-full-flow-findings.md`](docs/round47-full-flow-findings.md) | **R47 三模型全流程实测**：mb −2.2%（仅布局耦合型模型有收益）、yolo ≈0；逐节点归因（收益全在 blk 族、reorder 反升）；倒查 8 项 bug/设计缺陷；判定 blocked chain 是 mb 的主矛盾、非 yolo |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，

@@ -3971,72 +3971,174 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     }
   const std::vector<TuningEntry> baseline = assign;  // R45: 最终验收门的对照
 
-  int evals = 0;   // 整网测量次数（预算控制）
-  auto busyFor = [&](const std::vector<size_t> & nodes, const TuningEntry & e,
-                     double * spread) -> double {
-    if (spread) *spread = 0.0;
-    for (size_t ni : nodes) assign[ni] = e;
-    node_choice_ = assign;
+  int evals = 0;   // 整网测量批次数（预算控制；每批 ≈ 一个 assignment 的 reps 次执行）
+  const bool groupedOn = std::getenv("INFVINO_NO_GLOBAL_GROUPED") == nullptr;
+  // R47 §5.1/§5.2: in-situ **双口径（min + median）+ 交错**，替代 R44 的单一 min。
+  //   min    —— 内禀地板（R42 口径）：外部干扰只会加时间，min 稳，但会低估稳态典型值；
+  //   median —— 典型口径：与外部稳态 A/B（kernel_run --report）一致；
+  //   交错    —— 同一 rep 内先后测 base/candidate，抵消热漂移（R46：同 assignment 前后差 ±5%）。
+  // 改善必须在 **median** 口径成立；min 只做地板守卫与报告。
+  struct NetStat { double mn = 1e300, med = 1e300, spread = 0.0; bool ok = false; };
+  auto statsOf = [](std::vector<double> & v) -> NetStat {
+    NetStat s;
+    if (v.empty()) return s;
+    std::sort(v.begin(), v.end());
+    s.mn = v.front();
+    s.med = v[v.size() / 2];
+    s.spread = s.mn > 0.0 ? (v.back() - s.mn) / s.mn : 0.0;
+    s.ok = (s.mn < 1e299);
+    return s;
+  };
+  // 测一个 assignment（capture 后采样 nreps 次），返回 min/median 双口径。
+  auto measureAssign = [&](const std::vector<TuningEntry> & asg, int nreps) -> NetStat {
+    node_choice_ = asg;
     invalidateCapture();
-    planBlockedLayout();   // 只重规划布局，不覆盖 assign
-    ++evals;
-    double best = 1e300, worst = 0.0;
+    planBlockedLayout();
+    evals += nreps + 1;   // R47: 预算按**整网执行次数**计（含 capture），更贴近 GPU 风险口径
+    std::vector<double> samples;
     try
     {
-      for (int r = 0; r <= reps; ++r)
+      for (int r = 0; r <= nreps; ++r)
       {
         clearProfile();
         run();
         if (r == 0) continue;  // 第 1 次是 capture/热身
         const double b = profile().busy_ms;
-        if (b > 0.0)
-        {
-          if (b < best) best = b;
-          if (b > worst) worst = b;
-        }
+        if (b > 0.0) samples.push_back(b);
       }
     }
     catch (const std::exception & ex)
     {
-      // 候选无法执行（几何/资源）→ 用极大值拒绝，不中断整轮回验。
       if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
-        std::fprintf(stderr, "[global-retune] candidate %s rejected: %s\n", e.kernel.c_str(),
-                     ex.what());
-      return 1e300;
+        std::fprintf(stderr, "[global-retune] measure rejected: %s\n", ex.what());
+      return NetStat{};
     }
-    if (spread && best > 0.0 && best < 1e299) *spread = (worst - best) / best;
-    return best;
+    return statsOf(samples);
   };
-
-  // 整网测量当前 assign（用于最终验收门）。
-  auto measureWhole = [&]() -> double {
-    node_choice_ = assign;
-    invalidateCapture();
-    planBlockedLayout();
-    ++evals;
-    double best = 1e300;
-    try
-    {
-      for (int r = 0; r <= reps; ++r)
+  // 交错测 A/B：同一 rep 内先后测两者（各自先 capture 再采样），抵消热漂移。
+  auto measurePair = [&](const std::vector<TuningEntry> & A, const std::vector<TuningEntry> & B,
+                         int nreps, NetStat * sa, NetStat * sb) {
+    std::vector<double> as, bs;
+    auto one = [&](const std::vector<TuningEntry> & asg, std::vector<double> & out) {
+      node_choice_ = asg;
+      invalidateCapture();
+      planBlockedLayout();
+      try
       {
         clearProfile();
-        run();
-        if (r == 0) continue;
+        run();  // capture/热身（丢弃）
+        clearProfile();
+        run();  // 采样
         const double b = profile().busy_ms;
-        if (b > 0.0 && b < best) best = b;
+        if (b > 0.0) out.push_back(b);
       }
-    }
-    catch (const std::exception &) { return 1e300; }
-    return best;
+      catch (const std::exception &) { out.clear(); }
+    };
+    for (int r = 0; r < nreps; ++r) { one(A, as); one(B, bs); evals += 4; }  // 2 次执行/状态/rep
+    *sa = statsOf(as);
+    *sb = statsOf(bs);
   };
 
-  // R45: 最终验收门 —— 先量基线，坐标下降结束后再量最终组合。若**最终整网反而更慢**
-  // （超过噪声地板），整轮回退。修「逐签名贪心改坏整体、且没有对照」的缺口（全流程实测 mb +6~7%）。
-  const double baseNet = measureWhole();
+  // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的
+  // reorder 成本。对应 TVM meta_schedule 的「Σ weight × 单算子 ms」。用于排序 / 剪枝 / 分组，
+  // **不用于最终裁决**（最终仍由端到端 median 口径回验）。
+  auto predictNet = [&](const std::vector<TuningEntry> & asg) -> double {
+    node_choice_ = asg;
+    planBlockedLayout();  // 只更新 fsv16 标志，不触碰 dispatch
+    double net = 0.0;
+    for (size_t ni = 0; ni < nodes_.size(); ++ni)
+    {
+      const TuningEntry & e = asg[ni];
+      if (!e.kernel.empty()) net += e.ms;
+      if (e.kernel.find("_blk") == std::string::npos) continue;
+      const Node & n = nodes_[ni];
+      const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
+      if (n.ins.size() <= inIdx) continue;
+      auto xit = T_.find(n.ins[inIdx]);
+      if (xit == T_.end() || xit->second.fsv16) continue;
+      bool ok2 = false;
+      const OpSignature s = nodeSignature(n, &ok2);
+      if (!ok2) continue;
+      if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
+        net += r->ms;
+    }
+    return net;
+  };
+
+  // R47 §3-P0: **布局耦合连通分量**。共享「可能被重排的输入张量」、或「blk 生产者→消费者」
+  // 的节点，其选择互相影响（改一个会改变另一个的 reorder / 持久化）——这些才是必须联合
+  // 端到端回验的「不可加残差」；其余签名按可加目标 per-node 决定即可。
+  std::vector<int> comp(nodes_.size(), -1);
+  {
+    std::vector<int> par(nodes_.size());
+    for (size_t i = 0; i < nodes_.size(); ++i) par[i] = static_cast<int>(i);
+    auto find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    auto uni = [&](int a, int b) { a = find(a); b = find(b); if (a != b) par[a] = b; };
+    std::unordered_map<std::string, std::vector<size_t>> cons;
+    for (size_t i = 0; i < nodes_.size(); ++i)
+      for (const auto & t : nodes_[i].ins)
+        if (t != "-") cons[t].push_back(i);
+    // (a) 共享输入张量（同帧 reorder 去重的受益者）→ 同分量。
+    for (auto & kv : cons)
+      for (size_t k = 1; k < kv.second.size(); ++k) uni(static_cast<int>(kv.second[0]),
+                                                        static_cast<int>(kv.second[k]));
+    // (b) 生产者输出 → 消费者（fsv16 持久化契约）。
+    for (size_t i = 0; i < nodes_.size(); ++i)
+      if (!nodes_[i].outs.empty())
+      {
+        auto it = cons.find(nodes_[i].outs[0]);
+        if (it != cons.end())
+          for (size_t j : it->second) uni(static_cast<int>(i), static_cast<int>(j));
+      }
+    for (size_t i = 0; i < nodes_.size(); ++i) comp[i] = find(static_cast<int>(i));
+  }
+  std::unordered_map<int, int> compSize;
+  for (int c : comp) ++compSize[c];
+  auto coupled = [&](size_t ni) { return compSize[comp[ni]] > 1; };
+
+  // R47: 目标优先级 = 可加目标的预测 headroom 降序（TVM gradient 的静态近似）：
+  // 先投给「最可能有收益」的签名。headroom = predictNet(base) − min_c predictNet(base,c)。
+  struct TgtMeta { double headroom = 0.0; bool coupled = false; };
+  std::vector<TgtMeta> tmeta(targets.size());
+  {
+    const double basePred = predictNet(baseline);
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+    {
+      tmeta[ti].coupled = !targets[ti].nodes.empty() && coupled(targets[ti].nodes[0]);
+      std::vector<TuningEntry> tmp = baseline;
+      double best = basePred;
+      for (const auto & c : targets[ti].cs.cands)
+      {
+        tmp = baseline;
+        for (size_t ni : targets[ti].nodes) tmp[ni] = c;
+        const double p = predictNet(tmp);
+        if (p < best) best = p;
+      }
+      tmeta[ti].headroom = basePred - best;
+    }
+    std::vector<size_t> order(targets.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return tmeta[a].headroom > tmeta[b].headroom; });
+    std::vector<Target> sorted;
+    std::vector<TgtMeta> smeta;
+    sorted.reserve(order.size());
+    smeta.reserve(order.size());
+    for (size_t i : order) { sorted.push_back(targets[i]); smeta.push_back(tmeta[i]); }
+    targets.swap(sorted);
+    tmeta.swap(smeta);
+  }
+  assign = baseline;  // predictNet 只改 node_choice_/fsv16，这里确保赋值向量回到基线
+
+  // R47: 先量基线（双口径），最终验收门再与它交错对照。
+  const NetStat baseStat = measureAssign(assign, reps);
+  const double baseNet = baseStat.med;
 
   if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
-    std::fprintf(stderr, "[global-retune] %zu signatures, topK=%d reps=%d rounds=%d\n",
-                 targets.size(), topK, reps, rounds);
+    std::fprintf(stderr,
+                 "[global-retune] %zu signatures, topK=%d reps=%d rounds=%d, metric=min+median, "
+                 "accept=median, interleave=on, additive-priority=on, grouped=%s, base(med)=%.4f\n",
+                 targets.size(), topK, reps, rounds, groupedOn ? "on" : "off", baseNet);
 
   // 落盘：base 签名写回 winner；同时把**同族**的 #blk / #non 备选更新为 winner，使运行时
   // 的联合布局不动点在本 plan 上复现出同一个选择（跨 plan 的 #blk/#non 唯一分解限制见审计）。
@@ -4059,67 +4161,123 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       auto & t = targets[ti];
       if (t.nodes.empty()) continue;
       const TuningEntry base = assign[t.nodes[0]];
+      std::vector<TuningEntry> baseAssign = assign;   // 该 target 的对照（全局赋值快照）
       TuningEntry bestE = base;
-      double baseSpread = 0.0;
-      double bestBusy = busyFor(t.nodes, base, &baseSpread);
-      const double baseBusy = bestBusy;
-      if (baseSpread > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+      NetStat bestStat = measureAssign(baseAssign, reps);
+      if (!bestStat.ok) continue;
+      const double baseMed = bestStat.med;
+      if (bestStat.spread > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
         std::fprintf(stderr, "[global-retune] WARN %s base noisy (spread %.0f%%)\n",
-                     t.cs.sig.str().c_str(), baseSpread * 100.0);
+                     t.cs.sig.str().c_str(), bestStat.spread * 100.0);
+      std::vector<TuningEntry> bestAssign = baseAssign;
       for (const auto & c : t.cs.cands)
       {
         if (c.kernel == bestE.kernel && c.options == bestE.options) continue;
-        double sc = 0.0;
-        const double b = busyFor(t.nodes, c, &sc);
-        // R45 P2#8: 噪声地板 —— 改善必须超过固定地板（默认 1%，来自 noise_check）。
-        // 采样极差只用于告警：reps 很小时「极差」会把真实改善也当成噪声拒掉。
-        if (sc > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
-          std::fprintf(stderr, "[global-retune] WARN %s candidate %s noisy (spread %.0f%%)\n",
-                       t.cs.sig.str().c_str(), c.kernel.c_str(), sc * 100.0);
-        if (b > 0.0 && b < bestBusy * (1.0 - kMinGain))
+        std::vector<TuningEntry> candAssign = baseAssign;
+        for (size_t ni : t.nodes) candAssign[ni] = c;
+        NetStat bs, cs;
+        measurePair(baseAssign, candAssign, reps, &bs, &cs);   // R47: 交错，抵消热漂移
+        if (!cs.ok) continue;
+        // R47: 改善必须在 **median**（典型口径）成立；min 仅做地板守卫（内禀地板不得明显变差）。
+        const bool medBetter = cs.med < bestStat.med * (1.0 - kMinGain);
+        const bool floorOk = (bs.mn >= 1e299) || (cs.mn <= bs.mn * (1.0 + 0.02));
+        if (medBetter && floorOk)
         {
-          bestBusy = b;
+          bestStat = cs;
           bestE = c;
+          bestAssign = candAssign;
         }
       }
-      for (size_t ni : t.nodes) assign[ni] = bestE;   // busyFor 会把 assign 留在最后一个候选
+      assign = bestAssign;
       if (bestE.kernel != base.kernel || bestE.options != base.options)
       {
         ++changed;
         won[ti] = 1;
         if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
           std::fprintf(stderr,
-                       "[global-retune] %-40s %s -> %s  busy %.4f -> %.4f ms (%.1f%%)\n",
+                       "[global-retune] %-40s %s -> %s  med %.4f -> %.4f ms (%.1f%%)  [%s]\n",
                        t.cs.sig.str().c_str(), base.kernel.c_str(), bestE.kernel.c_str(),
-                       baseBusy, bestBusy,
-                       baseBusy > 0.0 ? (baseBusy - bestBusy) / baseBusy * 100.0 : 0.0);
+                       baseMed, bestStat.med,
+                       baseMed > 0.0 ? (baseMed - bestStat.med) / baseMed * 100.0 : 0.0,
+                       tmeta[ti].coupled ? "coupled" : "additive");
       }
     }
     if (budgetHit || changed == 0) break;
   }
+
+  // R47 §3-P0: **布局耦合分组 move** —— 对每个耦合连通分量，用可加目标在分量内联合重优化
+  // （每个 target 在分量上下文里选使 predictNet 最小的候选），把整分量的 joint assignment
+  // 作为**一个 move** 端到端回验一次。解决 R46 §4.1：逐 op 独立选的 blk 组合在一起可能更差
+  // （跨 op reorder）。blocked chain 未落地前，这里只在「现有 blk/non 耦合」上分组。
+  if (groupedOn)
+  {
+    std::unordered_map<int, std::vector<size_t>> compTargets;
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+      if (!targets[ti].nodes.empty()) compTargets[comp[targets[ti].nodes[0]]].push_back(ti);
+    for (auto & kv : compTargets)
+    {
+      if (kv.second.size() < 2) continue;   // 非耦合分量无需分组（逐节点已最优）
+      if (budget > 0 && evals >= budget) { budgetHit = true; break; }
+      std::vector<TuningEntry> baseAssign = assign;
+      std::vector<TuningEntry> joint = assign;
+      std::vector<size_t> order = kv.second;
+      std::stable_sort(order.begin(), order.end(),
+                       [&](size_t a, size_t b) { return tmeta[a].headroom > tmeta[b].headroom; });
+      bool anyChange = false;
+      for (size_t ti : order)
+      {
+        auto & t = targets[ti];
+        const TuningEntry cur = joint[t.nodes[0]];
+        double bestPred = predictNet(joint);
+        TuningEntry bestE = cur;
+        for (const auto & c : t.cs.cands)
+        {
+          std::vector<TuningEntry> tmp = joint;
+          for (size_t ni : t.nodes) tmp[ni] = c;
+          const double p = predictNet(tmp);
+          if (p < bestPred * (1.0 - kMinGain)) { bestPred = p; bestE = c; }
+        }
+        if (bestE.kernel != cur.kernel || bestE.options != cur.options) anyChange = true;
+        for (size_t ni : t.nodes) joint[ni] = bestE;
+      }
+      if (!anyChange) continue;
+      NetStat bs, js;
+      measurePair(baseAssign, joint, reps, &bs, &js);
+      if (js.ok && bs.ok && js.med < bs.med * (1.0 - kMinGain))
+      {
+        assign = joint;
+        for (size_t ti : kv.second) won[ti] = 1;
+        if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+          std::fprintf(stderr,
+                       "[global-retune] grouped move (comp=%d, %zu targets): med %.4f -> %.4f ms "
+                       "(%.1f%%)\n",
+                       kv.first, kv.second.size(), bs.med, js.med,
+                       bs.med > 0.0 ? (bs.med - js.med) / bs.med * 100.0 : 0.0);
+      }
+    }
+  }
   if (budgetHit && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
     std::fprintf(stderr, "[global-retune] budget hit (%d evals); stopped early\n", evals);
-  int changed_total = 0;
-  for (char w : won) if (w) ++changed_total;
 
-  // R45 最终验收门：只有最终整网组合确实不慢于基线，才把选择**落盘**；否则整轮回退。
-  // （全流程实测：逐签名/逐批贪心可把 mb 改慢 6–7%——逐 op 分批看不到跨 op 的布局交互。）
+  // R47 最终验收门：交错测「初始基线」vs「最终组合」，用 **median**（典型口径）裁决：只有最终
+  // 组合不慢于基线才落盘，否则整轮回退。（R45 门用单一 min；R46 证明其与稳态口径错配。）
   {
-    const double finalNet = measureWhole();
-    const bool revert = (baseNet > 0.0 && finalNet > baseNet * (1.0 + kMinGain));
+    std::vector<TuningEntry> finalAssign = assign;
+    NetStat bls, fs;
+    measurePair(baseline, finalAssign, std::max(reps, 3), &bls, &fs);
+    const bool revert = (bls.ok && fs.ok && fs.med > bls.med * (1.0 + kMinGain));
     if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
-      std::fprintf(stderr, "[global-retune] net %.4f -> %.4f ms (%+.1f%%)%s\n", baseNet, finalNet,
-                   baseNet > 0.0 ? (finalNet - baseNet) / baseNet * 100.0 : 0.0,
+      std::fprintf(stderr, "[global-retune] net(median) %.4f -> %.4f ms (%+.1f%%)%s\n", bls.med,
+                   fs.med, bls.med > 0.0 ? (fs.med - bls.med) / bls.med * 100.0 : 0.0,
                    revert ? "  REVERT (final worse than baseline)" : "");
     if (revert)
     {
       assign = baseline;
       std::fill(won.begin(), won.end(), 0);
-      changed_total = 0;
     }
     else
     {
-      // 通过验收：把**真正改变**的 target 写回（base 签名 + 同族备选）；未改变的不动共享缓存。
+      // 通过验收：只把**真正改变**的 target 写回（base 签名 + 同族备选）；未改变的不动共享缓存。
       for (size_t ti = 0; ti < targets.size(); ++ti)
       {
         auto & t = targets[ti];
@@ -4128,6 +4286,8 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       }
     }
   }
+  int changed_total = 0;
+  for (char w : won) if (w) ++changed_total;
 
   // R45 P0#4: 把本图的位置相关选择写进 per-plan 覆盖（node 输出名为键），与跨模型共享的
   // tuning_ 分离——避免「在 y8 上做的全局选择覆盖掉 y11 需要的那份」。
