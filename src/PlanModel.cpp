@@ -4195,14 +4195,21 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
   bool budgetHit = false;
   for (int round = 0; round < rounds; ++round)
   {
-    int changed = 0;
+    if (budget > 0 && evals >= budget) { budgetHit = true; break; }
+    // R47 前置①: **整赋值验收** —— 本轮所有逐节点决定都相对**同一个固定上下文** `committed`
+    // 评估（而不是随提交演进的 assign），汇总成一个整赋值候选 `proposal`；只有 `proposal`
+    // 相对 `committed` 的**整网稳态**（median、多 rep）确实改善时才提交整轮。这堵住
+    // 「逐节点小改善不组合、累积成净回归」的非组合性（实测 +0.8% 漏网 / +2.9% 才回退）。
+    const std::vector<TuningEntry> committed = assign;
+    int proposed = 0;
+    std::vector<TuningEntry> proposal = committed;
     for (size_t ti = 0; ti < targets.size(); ++ti)
     {
       if (budget > 0 && evals >= budget) { budgetHit = true; break; }
       auto & t = targets[ti];
       if (t.nodes.empty()) continue;
-      const TuningEntry base = assign[t.nodes[0]];
-      std::vector<TuningEntry> baseAssign = assign;   // 该 target 的对照（全局赋值快照）
+      const TuningEntry base = committed[t.nodes[0]];
+      std::vector<TuningEntry> baseAssign = committed;   // 固定上下文（不随本轮提交演进）
       TuningEntry bestE = base;
       NetStat bestStat = measureAssign(baseAssign, reps);
       if (!bestStat.ok) continue;
@@ -4211,14 +4218,12 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
       if (bestStat.spread > 0.05 && std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
         std::fprintf(stderr, "[global-retune] WARN %s base noisy (spread %.0f%%)\n",
                      t.cs.sig.str().c_str(), bestStat.spread * 100.0);
-      std::vector<TuningEntry> bestAssign = baseAssign;
       for (const auto & c : t.cs.cands)
       {
         if (c.kernel == bestE.kernel && c.options == bestE.options) continue;
         std::vector<TuningEntry> candAssign = baseAssign;
         for (size_t ni : t.nodes) candAssign[ni] = c;
         // R47 S2: 布局契约门 —— 预测净（含 reorder）明显变差的候选直接拒绝，不做端到端测量。
-        // 这堵住「多付 reorder、全靠噪声过关」的净负 blk（如 depthwise_v→blk）。
         const double candPred = predictNet(candAssign);
         if (candPred > basePred * (1.0 + kPredTol))
         {
@@ -4232,31 +4237,44 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         NetStat bs, cs;
         measurePair(baseAssign, candAssign, reps, &bs, &cs);   // R47: 交错，抵消热漂移
         if (!cs.ok) continue;
-        // R47: 改善必须在 **median**（典型口径）成立；min 仅做地板守卫（内禀地板不得明显变差）。
+        // R47: 改善必须在 **median**（典型口径）成立；min 仅做地板守卫。
         const bool medBetter = cs.med < bestStat.med * (1.0 - kMinGain);
         const bool floorOk = (bs.mn >= 1e299) || (cs.mn <= bs.mn * (1.0 + 0.02));
-        if (medBetter && floorOk)
-        {
-          bestStat = cs;
-          bestE = c;
-          bestAssign = candAssign;
-        }
+        if (medBetter && floorOk) { bestStat = cs; bestE = c; }
       }
-      assign = bestAssign;
       if (bestE.kernel != base.kernel || bestE.options != base.options)
       {
-        ++changed;
-        won[ti] = 1;
+        for (size_t ni : t.nodes) proposal[ni] = bestE;
+        ++proposed;
         if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
           std::fprintf(stderr,
-                       "[global-retune] %-40s %s -> %s  med %.4f -> %.4f ms (%.1f%%)  [%s]\n",
-                       t.cs.sig.str().c_str(), base.kernel.c_str(), bestE.kernel.c_str(),
-                       baseMed, bestStat.med,
-                       baseMed > 0.0 ? (baseMed - bestStat.med) / baseMed * 100.0 : 0.0,
-                       tmeta[ti].coupled ? "coupled" : "additive");
+                       "[global-retune] round%d propose %-38s %s -> %s  (target med %.4f -> %.4f)\n",
+                       round, t.cs.sig.str().c_str(), base.kernel.c_str(), bestE.kernel.c_str(),
+                       baseMed, bestStat.med);
       }
     }
-    if (budgetHit || changed == 0) break;
+    if (proposed == 0) break;
+    // 整赋值验收：committed vs proposal 的**整网稳态**（median、多 rep）——通过才提交整轮，
+    // 否则整轮拒绝（不回退、不部分提交）。
+    NetStat bsW, psW;
+    measurePair(committed, proposal, std::max(reps, 3), &bsW, &psW);
+    const bool wholeBetter = psW.ok && bsW.ok && psW.med < bsW.med * (1.0 - kMinGain);
+    if (std::getenv("INFVINO_GLOBAL_RETUNE_REPORT"))
+      std::fprintf(stderr, "[global-retune] round%d whole-net(median) %.4f -> %.4f ms (%+.1f%%) %s\n",
+                   round, bsW.med, psW.med,
+                   bsW.med > 0.0 ? (psW.med - bsW.med) / bsW.med * 100.0 : 0.0,
+                   wholeBetter ? "COMMIT" : "REJECT (no commit)");
+    if (!wholeBetter) break;
+    for (size_t ti = 0; ti < targets.size(); ++ti)
+    {
+      auto & t = targets[ti];
+      if (t.nodes.empty()) continue;
+      if (proposal[t.nodes[0]].kernel != committed[t.nodes[0]].kernel ||
+          proposal[t.nodes[0]].options != committed[t.nodes[0]].options)
+        won[ti] = 1;
+    }
+    assign = proposal;
+    if (budgetHit) break;
   }
 
   // R47 S3: **决策级 chain move** —— 对每个布局耦合连通分量，显式尝试
