@@ -287,3 +287,18 @@
   多消费者摊销。
 - **未做（需新 kernel）**：② direct conv1x1、③ split-K/Winograd conv。
 
+---
+
+## 12. 进展（R54：链假设进 plan 期默认 + 移植 OV reorder）
+
+见 [`round54-chain-layout-default-and-ov-reorder.md`](round54-chain-layout-default-and-ov-reorder.md)：
+
+- **链假设默认化**（用户决策 A）：精确最小割从 opt-in 提升为 plan 期默认求解器（修 R53
+  §4.3 的 chicken-and-egg）。外部稳态 A/B（交错 8×）：**mb −11.2%（8/8）、y11 −1.4%（8/8）、
+  y8 −0.2%（噪声）**；mb 持久 fsv16 13→23、reorder 10→9。`INFVINO_NO_LAYOUT_MINCUT=1` 回退。
+- **移植 OV `reorder_data_bfyx_to_blocked_format.cl`**（SLM transpose）：逐位一致；
+  大空间小 Cin **2.6×**（Cin3 640² 8.5→22.4 GB/s）；按 `W>=256` 分派（网络小空间仍走旧
+  kernel）。
+- 数值三模型 PASS、reuse diff=0、tuning_test PASS；config 未改。
+- 未修模型缺口：软标尺对 `20×20 256→64` ratio 1.53（留文档）。
+

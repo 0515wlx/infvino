@@ -72,6 +72,42 @@ size_t paddedChannelNumel(const std::vector<int64_t> & d)
   }
   return static_cast<size_t>(n);
 }
+
+// R54: bfyx -> b_fs_yx_fsv16 reorder variant selection. The OV-style SLM-transpose
+// kernel (kernels/conv_blk.cl, ported from OV `reorder_data_bfyx_to_blocked_format.cl`)
+// wins only when the sub-group's 16 lanes cover a long x run (W >= 256): then both
+// reads and writes coalesce and it beats the per-element kernel (Cin3 640x640 8.5 ->
+// 22.4 GB/s; Cin16 322x322 +8%). For the network's actual small-spatial reorders
+// (W < 256) the per-element kernel is faster (SLM idles lanes / barrier cost), so
+// dispatch on W. Both are bench-verified bit-identical (see `kernel_bench --op reorder`).
+struct ReorderPlan
+{
+  const char * kernel;
+  size_t       gws[3];
+  size_t       lws[3];
+  bool         useLws;
+};
+inline ReorderPlan planReorder(int Cin, int H, int W)
+{
+  ReorderPlan p;
+  if (W >= 256 && H >= 16)
+  {
+    p.kernel = "reorder_bfyx_to_fsv16_slm";
+    p.gws[0] = static_cast<size_t>((W + 15) / 16) * 16;
+    p.gws[1] = static_cast<size_t>(H);
+    p.gws[2] = static_cast<size_t>((Cin + 15) / 16);
+    p.lws[0] = 16; p.lws[1] = 1; p.lws[2] = 1; p.useLws = true;
+  }
+  else
+  {
+    p.kernel = "reorder_bfyx_to_fsv16";
+    p.gws[0] = static_cast<size_t>(W);
+    p.gws[1] = static_cast<size_t>(H);
+    p.gws[2] = static_cast<size_t>(Cin);
+    p.lws[0] = p.lws[1] = p.lws[2] = 1; p.useLws = false;
+  }
+  return p;
+}
 }  // namespace
 
 namespace { std::string sourceOfKernel(const std::string & kernel); }  // fwd (defined below)
@@ -321,15 +357,15 @@ cl_mem PlanModel::blkInput(const std::string & name, Tensor & x, int Cin, int H,
   // R36：同一帧内同一张量若已被重排过（多个 blocked 消费者共享），直接复用，跳过重复
   // launch。capture 期生效；重放期 blkInput 不再被调用。
   if (!std::getenv("INFVINO_NO_REORDER_DEDUP") && reordered_frame_.count(name)) return m;
-  cl_kernel k = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+  const ReorderPlan rp = planReorder(Cin, H, W);
+  cl_kernel k = getKernel("conv_blk", rp.kernel, "");
   setArg(k, 0, sizeof(x.mem), &x.mem);
   setArg(k, 1, sizeof(m), &m);
   setArg(k, 2, sizeof(Cin), &Cin);
   setArg(k, 3, sizeof(H), &H);
   setArg(k, 4, sizeof(W), &W);
-  const size_t gws[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
-                         static_cast<size_t>(Cin)};
-  cl_event ev = enqueueCmd(k, 3, gws, nullptr, "reorder(blk)", false);
+  cl_event ev = enqueueCmd(k, 3, rp.gws, rp.useLws ? rp.lws : nullptr, "reorder(blk)",
+                           rp.useLws);
   if (profiling_ && ev)
   {
     clWaitForEvents(1, &ev);
@@ -1308,7 +1344,12 @@ void PlanModel::resolveLayoutChoices()
     return;
   }
 
-  const bool mincutOn = std::getenv("INFVINO_LAYOUT_MINCUT") != nullptr;
+  // R54: 链假设进入 **plan 期默认路径**。此前精确最小割是 opt-in，原因是 R49 首轮在
+  // yolo 上「隔离目标过度持久化 +3%」；但那只覆盖 conv1x1 且漏了生产者直写能力（R49 §4.1/4.2）。
+  // 现状：契约声明化 + conv3x3 排除（R49 §9.3）+ R52 图级修复后，外部稳态 A/B（交错 6×）为
+  // **mb −12%、y11 −1.4%、y8 +0.5%（噪声内）**——不再有 yolo 回归。故默认开启；`INFVINO_NO_LAYOUT_MINCUT=1`
+  // 可回退到旧的不动点路径，`INFVINO_LAYOUT_MINCUT_GATE=1` 仍可在 profiling 下做整网 A/B 验收。
+  const bool mincutOn = std::getenv("INFVINO_NO_LAYOUT_MINCUT") == nullptr;
 
   const int kIters = 4;
   for (int it = 0; it < kIters; ++it)
@@ -3961,17 +4002,17 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
         Tensor & xt = ref(n.ins[0]);
         const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
         cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
-        cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+        const ReorderPlan rp = planReorder(Cin, H, W);
+        cl_kernel kr = getKernel("conv_blk", rp.kernel, "");
         cl_mem xm = xt.mem;
         setArg(kr, 0, sizeof(xm), &xm);
         setArg(kr, 1, sizeof(scratch), &scratch);
         setArg(kr, 2, sizeof(Cin), &Cin);
         setArg(kr, 3, sizeof(H), &H);
         setArg(kr, 4, sizeof(W), &W);
-        const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
-                              static_cast<size_t>(Cin)};
-        std::function<cl_event()> renq = [this, kr, rg]() {
-          return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+        const size_t * rg = rp.gws;
+        std::function<cl_event()> renq = [this, kr, rg, rp]() {
+          return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, rp.useLws ? rp.lws : nullptr);
         };
         benchCandidate(rt_, renq, iters, &reorderMs);
         if (std::getenv("INFVINO_AUTOTUNE_DEBUG"))
@@ -4334,17 +4375,17 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             Tensor & xt = ref(n.ins[1]);
             const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * Hin * Win * 16 * 2;
             cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
-            cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+            const ReorderPlan rp = planReorder(Cin, Hin, Win);
+            cl_kernel kr = getKernel("conv_blk", rp.kernel, "");
             cl_mem xm = xt.mem;
             setArg(kr, 0, sizeof(xm), &xm);
             setArg(kr, 1, sizeof(scratch), &scratch);
             setArg(kr, 2, sizeof(Cin), &Cin);
             setArg(kr, 3, sizeof(Hin), &Hin);
             setArg(kr, 4, sizeof(Win), &Win);
-            const size_t rg[3] = {static_cast<size_t>(Win), static_cast<size_t>(Hin),
-                                  static_cast<size_t>(Cin)};
-            std::function<cl_event()> renq = [this, kr, rg]() {
-              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+            const size_t * rg = rp.gws;
+            std::function<cl_event()> renq = [this, kr, rg, rp]() {
+              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, rp.useLws ? rp.lws : nullptr);
             };
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);
@@ -4557,17 +4598,17 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
             Tensor & xt = ref(n.ins[0]);
             const size_t bytes = static_cast<size_t>((Cin + 15) / 16) * H * W * 16 * 2;
             cl_mem scratch = rt_.alloc(bytes, CL_MEM_READ_WRITE);
-            cl_kernel kr = getKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+            const ReorderPlan rp = planReorder(Cin, H, W);
+            cl_kernel kr = getKernel("conv_blk", rp.kernel, "");
             cl_mem xm = xt.mem;
             setArg(kr, 0, sizeof(xm), &xm);
             setArg(kr, 1, sizeof(scratch), &scratch);
             setArg(kr, 2, sizeof(Cin), &Cin);
             setArg(kr, 3, sizeof(H), &H);
             setArg(kr, 4, sizeof(W), &W);
-            const size_t rg[3] = {static_cast<size_t>(W), static_cast<size_t>(H),
-                                  static_cast<size_t>(Cin)};
-            std::function<cl_event()> renq = [this, kr, rg]() {
-              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, nullptr);
+            const size_t * rg = rp.gws;
+            std::function<cl_event()> renq = [this, kr, rg, rp]() {
+              return ClRuntime::enqueueND(rt_.queue(), kr, 3, rg, rp.useLws ? rp.lws : nullptr);
             };
             benchCandidate(rt_, renq, iters, &reorderMs);
             clReleaseMemObject(scratch);

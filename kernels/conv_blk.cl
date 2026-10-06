@@ -317,3 +317,39 @@ __kernel void reorder_bfyx_to_fsv16(
   out[(((size_t)(c / 16) * H + y) * W + x) * 16 + (c % 16)] =
       in[((size_t)c * H + y) * W + x];
 }
+
+// R54 (ported from OV `reorder_data_bfyx_to_blocked_format.cl`): SLM-transpose
+// bfyx -> b_fs_yx_fsv16. One work-group per (16-channel block, row y, 16-wide x
+// tile); 16 lanes = 16 x positions. Each lane drives 16 coalesced per-channel
+// loads (lane = x), transposes in SLM, then writes one contiguous 32-B
+// (16-channel) vector store -> both sides coalesced. This fixes the per-element
+// kernel's defect for large-spatial tiny/non-aligned Cin (Cin=3 640x640: 8.5 ->
+// ~near roofline), where the per-element mapping writes 2 B at a 32-B stride.
+// For small W (<16) most lanes idle, so the host keeps the per-element kernel.
+__kernel void reorder_bfyx_to_fsv16_slm(
+  __global const half *restrict in,
+  __global half *restrict out,
+  const int C, const int H, const int W) {
+  const int xt = get_group_id(0);            // x tile of 16
+  const int y = get_global_id(1);
+  const int cb = get_global_id(2);           // 16-channel block
+  const int lid = get_local_id(0);           // 0..15
+  const int x = xt * 16 + lid;
+  const int c0 = cb * 16;
+  __local half tile[16][16];                  // [channel-in-block][x-lane]
+  const int HW = H * W;
+  const bool xok = (x < W);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int c = c0 + i;
+    half v = (half)0;
+    if (xok && c < C) v = in[(size_t)c * HW + (size_t)y * W + x];
+    tile[i][lid] = v;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (!xok) return;
+  const size_t obase = (((size_t)cb * H + y) * W + x) * 16;
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    out[obase + i] = tile[i][lid];
+}

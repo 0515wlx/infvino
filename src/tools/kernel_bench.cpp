@@ -602,10 +602,55 @@ int benchReorder(infvino::ClRuntime & rt, const ConvShape & s, int iters)
   double med = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, nullptr); },
                          3, iters, &btmin, &btp90);
   const double bytes = 2.0 * (ne + no) * 2.0;
-  std::printf("  reorder Cin=%-4d %dx%d bytes=%.2fMB  %8.4f ms  %7.1f GB/s  [min %.4f p90 %.4f spread %+.0f%%]\n",
+  std::printf("  reorder      Cin=%-4d %dx%d bytes=%.2fMB  %8.4f ms  %7.1f GB/s  [min %.4f p90 %.4f spread %+.0f%%]\n",
               C, H, W, bytes / 1e6, med, bytes / (med * 1e-3) / 1e9, btmin, btp90,
               btp90 > 0 ? (btp90 / btmin - 1.0) * 100.0 : 0.0);
-  clReleaseMemObject(dI); clReleaseMemObject(dO); clReleaseKernel(k);
+  clReleaseKernel(k);
+
+  // R54: OV-style SLM transpose variant.
+  try {
+    cl_kernel ks = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16_slm", "");
+    cl_int e0 = clSetKernelArg(ks, 0, sizeof(dI), &dI);
+    cl_int e1 = clSetKernelArg(ks, 1, sizeof(dO), &dO);
+    cl_int e2 = clSetKernelArg(ks, 2, sizeof(Ca), &Ca);
+    cl_int e3 = clSetKernelArg(ks, 3, sizeof(Ha), &Ha);
+    cl_int e4 = clSetKernelArg(ks, 4, sizeof(Wa), &Wa);
+    if (e0|e1|e2|e3|e4)
+      std::fprintf(stderr, "  [reorder_slm] setArg errs %d %d %d %d %d\n", e0,e1,e2,e3,e4);
+    const size_t g2[3] = {(size_t)((W + 15) / 16) * 16, (size_t)H, (size_t)cb};
+    const size_t l2[3] = {16, 1, 1};
+    double mn = 0.0, p90 = 0.0;
+    double m2 = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), ks, 3, g2, l2); },
+                          3, iters, &mn, &p90);
+    std::printf("  reorder_slm  Cin=%-4d %dx%d bytes=%.2fMB  %8.4f ms  %7.1f GB/s  [min %.4f p90 %.4f spread %+.0f%%]\n",
+                C, H, W, bytes / 1e6, m2, bytes / (m2 * 1e-3) / 1e9, mn, p90,
+                p90 > 0 ? (p90 / mn - 1.0) * 100.0 : 0.0);
+    // correctness: old vs slm must be bit-identical (same fp16 values, only order).
+    {
+      cl_kernel ko = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", "");
+      clSetKernelArg(ko, 0, sizeof(dI), &dI);
+      clSetKernelArg(ko, 1, sizeof(dO), &dO);
+      clSetKernelArg(ko, 2, sizeof(Ca), &Ca);
+      clSetKernelArg(ko, 3, sizeof(Ha), &Ha);
+      clSetKernelArg(ko, 4, sizeof(Wa), &Wa);
+      std::vector<uint16_t> a(no), b(no, 0xd0d0), zeros(no, 0);
+      rt.write(dO, no * 2, zeros.data());
+      infvino::ClRuntime::enqueueND(rt.queue(), ko, 3, gws, nullptr);
+      rt.read(dO, no * 2, a.data());
+      rt.write(dO, no * 2, zeros.data());
+      infvino::ClRuntime::enqueueND(rt.queue(), ks, 3, g2, l2);
+      rt.read(dO, no * 2, b.data());
+      int bad = 0;
+      for (size_t i = 0; i < no; ++i) if (a[i] != b[i]) ++bad;
+      std::printf("  reorder_slm  Cin=%-4d %dx%d verify: %s (%d/%zu mismatches)\n",
+                  C, H, W, bad == 0 ? "PASS" : "FAIL", bad, no);
+      clReleaseKernel(ko);
+    }
+    clReleaseKernel(ks);
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "  [reorder_slm] build/run failed: %s\n", e.what());
+  }
+  clReleaseMemObject(dI); clReleaseMemObject(dO);
   return 0;
 }
 
