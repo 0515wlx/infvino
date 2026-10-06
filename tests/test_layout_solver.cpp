@@ -113,6 +113,19 @@ static void run_tests()
     CHECK(true, "out-of-range calls are safe");
   }
 
+  // --- 4b. R56 回退局部化：relaxed 表永不失败，且解仍有限/确定 ---
+  {
+    BinaryEnergy ok(2);
+    ok.addPairwiseTableRelaxed(0, 1, 0.0, 0.0, 0.0, 10.0);  // 非 submodular -> clamp
+    const BinarySolution s = solveBinaryMinCut(ok);
+    CHECK(s.optimal, "relaxed non-submodular table still solves to optimum");
+    CHECK(std::isfinite(s.energy), "relaxed energy is finite");
+    // 越界/自环安全忽略（不崩、不改语义）。
+    ok.addPairwiseTableRelaxed(0, 0, 0, 0, 0, 0);
+    ok.addPairwiseTableRelaxed(-1, 5, 0, 0, 0, 0);
+    CHECK(true, "relaxed out-of-range calls are safe");
+  }
+
   // --- 5. 随机 submodular 图 vs 暴力枚举 ---
   {
     std::mt19937                           rng(0xC0FFEEu);

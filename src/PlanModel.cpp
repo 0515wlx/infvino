@@ -1899,6 +1899,26 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
   //   f(1,0) = eB              FSV16 入 / NCHW 出：blk
   //   f(1,1) = eB              FSV16 入 / FSV16 出：blk
   //   K = (f00+f11-f01-f10)/2 = (min(eN,eB+r) - eB - r)/2 ≤ 0 → submodular。
+  // R56 目标（reorder 级）：reorder 代价优先用**结构性**估算（launch floor + 元素量 × 常数），
+  // 不再因为缺 `#reorder` 条目就把 reorder 当免费——那会系统性偏向「过度持久化」（R49 缺口 A）。
+  // 这与 OV `reorder_inputs` 的两级目标一致：一级 = reorder 条数（固定 launch floor），
+  // 二级 = 搬运元素量。有实测 `#reorder` 时以实测为准；可用 INFVINO_LAYOUT_REORDER_W 缩放。
+  const double kReorderFixedMs = 0.0035;     // ≈ 一次 dispatch 的 launch floor
+  const double kReorderMsPerElem = 6.7e-8;   // ≈ 60 GB/s，fp16 读+写 4 B/elem
+  const double reorderW =
+      std::getenv("INFVINO_LAYOUT_REORDER_W") ? std::atof(std::getenv("INFVINO_LAYOUT_REORDER_W")) : 1.0;
+  auto reorderCost = [&](size_t ni) -> double {
+    double r = alt[ni].reorder.ms;
+    // 结构性兜底（默认开）；INFVINO_NO_REORDER_STRUCT=1 关闭以做 A/B（= R56 前的行为）。
+    if (r <= 0.0 && !std::getenv("INFVINO_NO_REORDER_STRUCT"))
+    {
+      const std::string & tname = nodes_[ni].ins[static_cast<size_t>(actSlot(ni))];
+      auto it = T_.find(tname);
+      const double numel = static_cast<double>(it != T_.end() ? it->second.numel() : 0);
+      r = kReorderFixedMs + kReorderMsPerElem * numel;
+    }
+    return r * reorderW;
+  };
   for (size_t ni : nodes)
   {
     const Node & n = nodes_[ni];
@@ -1907,27 +1927,39 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     bool ok = false;
     const OpSignature s = nodeSignature(n, &ok);
     const double eB = inCurveMs(ni, alt[ni].blk, s), eN = inCurveMs(ni, alt[ni].non, s),
-                 r = alt[ni].reorder.ms;
+                 r = reorderCost(ni);
     // R50: 输出 fsv16 时用契约成本（同一 blk kernel + OUT_FSV16=1），否则用 bfyx 成本。
     const double eBf = alt[ni].blkFsv16.kernel.empty() ? eB : inCurveMs(ni, alt[ni].blkFsv16, s);
     const double f00 = std::min(eN, eB + r), f01 = eBf + r, f10 = eB, f11 = eBf;
-    if (!en.addPairwiseTable(a, b, f00, f01, f10, f11))
-      return false;  // 非 submodular → 回退
+    // R56 回退局部化：用**永不失败**的表分解（非 submodular 时 clamp 耦合项），
+    // 不让一个非 submodular 表作废整份布局提案。
+    en.addPairwiseTableRelaxed(a, b, f00, f01, f10, f11);
   }
 
-  const BinarySolution sol = solveBinaryMinCut(en);
-  if (!sol.optimal) return false;
+  BinarySolution sol = solveBinaryMinCut(en);
 
   // ---- 落地：张量 fsv16 + 每节点 kernel（与代价表的 argmin 一致）。----
-  // R52 safety：任何被 mincut 标为 fsv16 的变量都必须有放得下补齐布局的缓冲；否则
-  // 说明分配补齐集合与布局契约漂移，回退到 baseline（planBlockedLayout 有同款守卫）。
+  // R56 回退局部化：被标 fsv16 但缓冲放不下 → 只把**该变量**钉死 NCHW 并重解，
+  // 而不是像 R52 那样整份 REJECT（一个越界点拖垮全局布局）。
+  for (int it = 0; it < 4; ++it)
+  {
+    bool violated = false;
+    for (size_t v = 0; v < varName.size(); ++v)
+      if (sol.labels[v] == 1 && !mayMarkFsv16(varName[v]))
+      {
+        en.fix(static_cast<int>(v), 0);
+        violated = true;
+      }
+    if (!violated) break;
+    sol = solveBinaryMinCut(en);
+  }
   for (size_t v = 0; v < varName.size(); ++v)
     if (sol.labels[v] == 1 && !mayMarkFsv16(varName[v]))
     {
       std::fprintf(stderr,
-                   "[layout] mincut REJECT: %s labeled fsv16 but buffer cannot hold padded layout\n",
+                   "[layout] mincut LOCALIZE: %s labeled fsv16 but buffer too small -> NCHW\n",
                    varName[v].c_str());
-      return false;
+      sol.labels[v] = 0;   // 兜底（loop 理论上已清干净）
     }
   for (size_t v = 0; v < varName.size(); ++v)
   {
@@ -1944,7 +1976,7 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     bool ok = false;
     const OpSignature s = nodeSignature(n, &ok);
     const double eB = inCurveMs(ni, alt[ni].blk, s), eN = inCurveMs(ni, alt[ni].non, s),
-                 r = alt[ni].reorder.ms;
+                 r = reorderCost(ni);
     const bool useBlk = la || lb || (eB + r <= eN);
     node_choice_[ni] = useBlk ? alt[ni].blk : alt[ni].non;
   }

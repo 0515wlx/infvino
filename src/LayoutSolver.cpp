@@ -123,6 +123,17 @@ bool BinaryEnergy::addPairwiseTable(int i, int j, double f00, double f01, double
   return true;
 }
 
+void BinaryEnergy::addPairwiseTableRelaxed(int i, int j, double f00, double f01, double f10, double f11)
+{
+  if (i < 0 || j < 0 || i == j || i >= n || j >= n) return;
+  // 非 submodular → 把耦合项 clamp 到 0（合法松弛，不解整份作废）。
+  const double K = std::min((f00 + f11 - f01 - f10) / 2.0, 0.0);
+  constant += f00;
+  addUnary(i, 0.0, f10 - f00 + K);
+  addUnary(j, 0.0, f01 - f00 + K);
+  if (-K > kEps) addPairwise(i, j, -K);
+}
+
 void BinaryEnergy::fix(int i, int label)
 {
   if (i < 0 || i >= n) return;

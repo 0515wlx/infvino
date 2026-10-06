@@ -66,6 +66,14 @@ struct BinaryEnergy
    * submodular（K ≤ 0）时成立；否则返回 false（调用方应回退，不要静默改语义）。
    */
   bool addPairwiseTable(int i, int j, double f00, double f01, double f10, double f11);
+  /**
+   * @brief `addPairwiseTable` 的**永不失败**版本（R56 回退局部化）。
+   *
+   * 非 submodular（K>0）时把耦合项 clamp 到 0（丢掉落 repulsive 项），得到一个合法的
+   * **松弛**能量：解仍是确定的最优解，但不再让「一个非 submodular 表」作废整份布局提案。
+   * 仅用于「求解器不应整体回退」的场景；需要严格语义时仍用 `addPairwiseTable`。
+   */
+  void addPairwiseTableRelaxed(int i, int j, double f00, double f01, double f10, double f11);
   /** @brief 钉死变量 i 的标签（0/1）。*/
   void fix(int i, int label);
   /** @brief 是否存在「两个标签都被钉死/都不可行」的矛盾变量。*/
