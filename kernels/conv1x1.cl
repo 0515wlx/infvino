@@ -139,10 +139,19 @@ __kernel void conv1x1_f16(
 //   网格 dim0 = Cout * 16（lws=16）→ work-group 数 = Cout（=1000 时 ~1000 个
 //   sub-group，足以喂满 80 EU 的 7 threads/EU）。
 //
-// 编译期参数：ACT（同 conv1x1_f16）、SG（默认 16）。
+// 编译期参数：ACT（同 conv1x1_f16）、SG（默认 16）、GEMV_TM（每子组输出通道数）。
+//
+// R48 §4bis「conv1x1 N=1 无多输出」：原实现一个子组只算一个输出通道，X 向量被每个
+// 输出通道的子组重复读 Cout 次（X 读流量 = Cout*Cin）。GEMV_TM=T 时一个子组同时算 T 个
+// 输出通道：X[k] 只读一次、供 T 个权重行复用（X 读流量 /T），并把 T 条独立归约链交错以
+// 提升 ILP。T=1 与旧行为**逐位一致**（每个输出通道的累加顺序、reduction 不变）。
+// 网格：dim0 = ceil(Cout/T)*GEMV_SG；kernel 由 group_id*T 得起始通道。
 // ---------------------------------------------------------------------------
 #ifndef GEMV_SG
 #define GEMV_SG 16
+#endif
+#ifndef GEMV_TM
+#define GEMV_TM 1
 #endif
 
 __attribute__((intel_reqd_sub_group_size(GEMV_SG)))
@@ -154,23 +163,36 @@ __kernel void conv1x1_gemv_f16(
   __global const half *restrict Res,   // [Cout] or null (RES=1)
   __global half *restrict Y,           // [Cout]
   const int Cin, const int Cout) {
-  const int m = get_group_id(0);
   const int lane = get_local_id(0);
-  if (m >= Cout) return;
+  const int m0 = get_group_id(0) * GEMV_TM;
+  if (m0 >= Cout) return;
 
-  float acc = 0.0f;
-  __global const half *wrow = W + (size_t)m * Cin;
-  for (int k = lane; k < Cin; k += GEMV_SG)
-    acc += (float)wrow[k] * (float)X[k];
+  float acc[GEMV_TM];
+#pragma unroll
+  for (int t = 0; t < GEMV_TM; ++t) acc[t] = 0.0f;
 
-  float s = sub_group_reduce_add(acc);
-  if (lane == 0) {
-    half v = (half)s;
-    if (Bias != 0) v = v + Bias[m];
-    v = c1x1_activate(v);
+  for (int k = lane; k < Cin; k += GEMV_SG) {
+    const float x = (float)X[k];
+#pragma unroll
+    for (int t = 0; t < GEMV_TM; ++t) {
+      const int m = m0 + t;
+      if (m < Cout) acc[t] += (float)W[(size_t)m * Cin + k] * x;
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < GEMV_TM; ++t) {
+    const int m = m0 + t;
+    if (m >= Cout) continue;
+    float s = sub_group_reduce_add(acc[t]);
+    if (lane == 0) {
+      half v = (half)s;
+      if (Bias != 0) v = v + Bias[m];
+      v = c1x1_activate(v);
 #if RES
-    v = v + Res[m];
+      v = v + Res[m];
 #endif
-    Y[m] = v;
+      Y[m] = v;
+    }
   }
 }

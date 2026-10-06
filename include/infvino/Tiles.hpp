@@ -195,12 +195,13 @@ struct Conv1x1Cfg
   int RES = 0;   // 1 = epilogue 加残差
   int SG = 16;   // 强制子组宽度（0=IGC 决定）
   int UNROLL = 4;  // Cin 循环展开因子（提升 load/FMA 重叠）
+  int GEMV_TM = 1; // conv1x1_gemv_f16: 每子组的输出通道数（R48 N=1 多输出；1=旧行为）
 
   std::string options() const
   {
     std::ostringstream o;
     o << "-DTM=" << TM << " -DTN=" << TN << " -DACT=" << ACT << " -DRES=" << RES
-      << " -DSG=" << SG << " -DUNROLL=" << UNROLL
+      << " -DSG=" << SG << " -DUNROLL=" << UNROLL << " -DGEMV_TM=" << GEMV_TM
       << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
@@ -208,7 +209,7 @@ struct Conv1x1Cfg
   {
     std::ostringstream o;
     o << "TM" << TM << " TN" << TN << " act" << ACT << (RES ? " res" : "") << " sg" << SG
-      << " u" << UNROLL;
+      << " u" << UNROLL << " gtm" << GEMV_TM;
     return o.str();
   }
 };
@@ -227,6 +228,7 @@ inline Conv1x1Cfg parseConv1x1(const std::string & s)
   if (v.size() > 3) c.RES = v[3];
   if (v.size() > 4) c.SG = v[4];
   if (v.size() > 5) c.UNROLL = v[5];
+  if (v.size() > 6) c.GEMV_TM = v[6];
   return c;
 }
 
@@ -297,20 +299,22 @@ struct DepthwiseBlkCfg
   int OUT_FSV16 = 0;
   int SG = 16;
   int YB = 1;        // R50: 每 WI 的输出行数（输入行按滑动窗口复用）；1 = 原行为
+  int VEC_STORE = 0; // R50/D6: fsv16 输出用子组 block_write（1=开）；默认关（实测中性）
 
   std::string options() const
   {
     std::ostringstream o;
     o << "-DX_BLOCK=" << XB << " -DDWK=" << K << " -DSTRIDE=" << S << " -DPAD=" << P
       << " -DACT=" << ACT << " -DOUT_FSV16=" << OUT_FSV16 << " -DSG=" << SG
-      << " -DY_BLOCK=" << YB << " -cl-mad-enable -cl-fast-relaxed-math";
+      << " -DY_BLOCK=" << YB << " -DVEC_STORE=" << VEC_STORE
+      << " -cl-mad-enable -cl-fast-relaxed-math";
     return o.str();
   }
   std::string label() const
   {
     std::ostringstream o;
     o << "XB" << XB << " YB" << YB << " K" << K << " s" << S << " p" << P << " act" << ACT
-      << (OUT_FSV16 ? " fsv16" : " bfyx");
+      << (OUT_FSV16 ? " fsv16" : " bfyx") << (VEC_STORE ? " vec" : "");
     return o.str();
   }
 };
@@ -329,6 +333,7 @@ inline DepthwiseBlkCfg parseDepthwiseBlk(const std::string & s)
   if (v.size() > 4) c.ACT = v[4];
   if (v.size() > 5) c.OUT_FSV16 = v[5];
   if (v.size() > 6) c.YB = v[6];
+  if (v.size() > 7) c.VEC_STORE = v[7];
   return c;
 }
 

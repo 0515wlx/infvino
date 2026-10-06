@@ -538,6 +538,12 @@ void PlanModel::parse()
   for (const auto & o : outputs_)
     if (!T_.count(o)) throw std::runtime_error("PlanModel: output tensor not declared: " + o);
 
+  // R56 D5: SPPF block launch fusion（opt-in，`INFVINO_FUSE_SPPF=1`）。**负结果**：把
+  // `concat4(x, mp(x), mp²(x), mp³(x))` 折成一个 kernel 后，3.7× 冗余 fmax + 13×13 窗口
+  // 重读 > 省下的 3 次 launch，且挤掉了原本 CAT4 的免费 concat 融合（y8 busy +1.2%）。
+  // 保留机制供审计，默认关。必须在 fuseConcatConv1x1 之前（否则 SPPF concat 已被 CAT4 吃掉）。
+  if (std::getenv("INFVINO_FUSE_SPPF")) fuseSppfConcat();
+
   // R30c：把「4 路 concat -> 1x1 conv」融合（Route A）：conv1x1 走 gemm_f16 的
   // CAT4 B-staging（B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量），
   // 省掉 concat 的物化（写+再读），同时保留 gemm_f16 的 tile/流水。
@@ -793,6 +799,78 @@ void PlanModel::fuseChannelScaleMul()
     if (!remove[i]) kept.push_back(std::move(nodes_[i]));
   nodes_ = std::move(kept);
   // Mul 输出张量已死：从池候选与 T_ 中移除（避免按「活到最后」多占一块缓冲）。
+  for (const auto & t : dead)
+  {
+    T_.erase(t);
+    act_names_.erase(std::remove(act_names_.begin(), act_names_.end(), t), act_names_.end());
+  }
+}
+
+void PlanModel::fuseSppfConcat()
+{
+  std::map<std::string, size_t> producer;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") producer[o] = i;
+  std::map<std::string, int> useCount;
+  for (const auto & n : nodes_)
+    for (const auto & in : n.ins)
+      if (in != "-") ++useCount[in];
+
+  std::vector<char> remove(nodes_.size(), 0);
+  std::vector<std::string> dead;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    Node & n = nodes_[i];
+    if (n.op != "concat4" || n.ins.size() < 4) continue;
+    if (attrInt(n, "outer", 1) != 1) continue;
+    const int ca = attrInt(n, "ca", 0), cb = attrInt(n, "cb", 0), cc = attrInt(n, "cc", 0),
+              cd = attrInt(n, "cd", 0);
+    if (!(ca > 0 && ca == cb && cb == cc && cc == cd)) continue;
+    const std::string a = n.ins[0], b = n.ins[1], c = n.ins[2], d = n.ins[3];
+    if (a == "-" || b == "-" || c == "-" || d == "-") continue;
+    // s 是 src 经 MaxPool5s1p2 的输出；它的唯一其它消费者是链上的下一个 maxpool
+    // （因此 useCount 期望 2），末端 maxpool 输出只喂 concat（期望 1）。
+    auto mpOf = [&](const std::string & t, const std::string & src, int wantUse) -> size_t {
+      auto p = producer.find(t);
+      if (p == producer.end()) return static_cast<size_t>(-1);
+      const Node & m = nodes_[p->second];
+      if (m.op != "maxpool") return static_cast<size_t>(-1);
+      if (attrInt(m, "K", 5) != 5 || attrInt(m, "S", 1) != 1 || attrInt(m, "P", 2) != 2)
+        return static_cast<size_t>(-1);
+      if (m.ins.empty() || m.ins[0] != src) return static_cast<size_t>(-1);
+      if (useCount[t] != wantUse) return static_cast<size_t>(-1);
+      return p->second;
+    };
+    const size_t ib = mpOf(b, a, 2), ic = mpOf(c, b, 2), id = mpOf(d, c, 1);
+    if (ib == static_cast<size_t>(-1) || ic == static_cast<size_t>(-1) ||
+        id == static_cast<size_t>(-1) || ib == ic || ic == id || ib == id)
+      continue;
+    auto xit = T_.find(a);
+    if (xit == T_.end() || xit->second.dims.size() < 3) continue;
+    const auto & xd = xit->second.dims;
+    const int H = static_cast<int>(xd[xd.size() - 2]), W = static_cast<int>(xd[xd.size() - 1]),
+              C = static_cast<int>(xd[xd.size() - 3]);
+    if (H <= 0 || W <= 0 || C <= 0) continue;
+    n.op = "sppf_concat4";
+    n.ins.assign(1, a);
+    n.attr["sp_C"] = std::to_string(C);
+    n.attr["sp_H"] = std::to_string(H);
+    n.attr["sp_W"] = std::to_string(W);
+    n.attr["sp_K"] = "5";
+    n.attr["sp_P"] = "2";
+    remove[ib] = remove[ic] = remove[id] = 1;
+    dead.push_back(b);
+    dead.push_back(c);
+    dead.push_back(d);
+    ++fusions_sppf_;
+  }
+  if (fusions_sppf_ == 0) return;
+  std::vector<Node> kept;
+  kept.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    if (!remove[i]) kept.push_back(std::move(nodes_[i]));
+  nodes_ = std::move(kept);
   for (const auto & t : dead)
   {
     T_.erase(t);
@@ -2978,6 +3056,14 @@ void PlanModel::run()
         // R45 P0#6: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
         if (const TuningEntry * e = choiceEntry(ni, sig)) gopts = e->options;
         if (dres) setResOpt(gopts, true);  // R33 融合残差
+        // R48 §4bis: conv1x1_gemv 的 GEMV_TM（每子组输出通道数）由选项决定网格。
+        // 旧缓存无此宏 → 默认 1（逐位兼容）。
+        auto optInt = [](const std::string & s, const char * key, int def) -> int {
+          const size_t p = s.find(key);
+          if (p == std::string::npos) return def;
+          return std::max(1, std::atoi(s.c_str() + p + std::strlen(key)));
+        };
+        const int gemvTm = optInt(gopts, "-DGEMV_TM=", 1);
         cl_kernel kg = getKernel("conv1x1", "conv1x1_gemv_f16", gopts);
         setArg(kg, 0, sizeof(dw), &dw);
         setArg(kg, 1, sizeof(dx), &dx);
@@ -2987,7 +3073,7 @@ void PlanModel::run()
         setArg(kg, 5, sizeof(Cin), &Cin);
         setArg(kg, 6, sizeof(Cout), &Cout);
         const size_t lws[1] = {16};
-        const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+        const size_t gws[1] = {static_cast<size_t>((Cout + gemvTm - 1) / gemvTm) * 16};
         timed("conv1x1g@" + std::to_string(Cout) + "x" + std::to_string(Cin), kg, 1, gws, lws);
       } else {
         Tiles t;
@@ -3589,6 +3675,24 @@ void PlanModel::run()
       bool        useLws;
       smallLaunch(n, k, kern, opts, dim, gws, lws, useLws);
       timed("slice_axis", k, dim, gws, useLws ? lws : nullptr);
+    }
+    else if (n.op == "sppf_concat4")
+    {
+      // R56 D5: 融合的 SPPF（maxpool 链 + concat 一次算完）。内核只吃源张量 a。
+      const int C = attrInt(n, "sp_C", 0), H = attrInt(n, "sp_H", 0), W = attrInt(n, "sp_W", 0);
+      const int K = attrInt(n, "sp_K", 5), P = attrInt(n, "sp_P", 2);
+      cl_mem dx = ref(n.ins[0]).mem, dy = ref(n.outs[0]).mem;
+      cl_kernel k = getKernel("ops", "sppf_concat4", "");
+      setArg(k, 0, sizeof(dx), &dx);
+      setArg(k, 1, sizeof(dy), &dy);
+      setArg(k, 2, sizeof(C), &C);
+      setArg(k, 3, sizeof(H), &H);
+      setArg(k, 4, sizeof(W), &W);
+      setArg(k, 5, sizeof(K), &K);
+      setArg(k, 6, sizeof(P), &P);
+      const size_t gws[1] = {static_cast<size_t>(4) * static_cast<size_t>(C) *
+                             static_cast<size_t>(H) * static_cast<size_t>(W)};
+      timed("sppf", k, 1, gws, nullptr);
     }
     else if (n.op == "concat4")
     {
@@ -4409,8 +4513,13 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
           setArg(kg, 4, sizeof(dy), &dy);
           setArg(kg, 5, sizeof(Cin), &Cin);
           setArg(kg, 6, sizeof(Cout), &Cout);
+          // R48 §4bis: GEMV_TM 决定网格（ceil(Cout/TM) 个子组）。
+          const auto gp = c.options.find("-DGEMV_TM=");
+          const int tm = gp == std::string::npos
+                           ? 1
+                           : std::max(1, std::atoi(c.options.c_str() + gp + std::strlen("-DGEMV_TM=")));
           const size_t lws[1] = {16};
-          const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+          const size_t gws[1] = {static_cast<size_t>((Cout + tm - 1) / tm) * 16};
           return [this, kg, gws, lws]() {
             return ClRuntime::enqueueND(rt_.queue(), kg, 1, gws, lws);
           };

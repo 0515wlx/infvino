@@ -769,7 +769,7 @@ int benchConv1x1Gemv(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, con
   clSetKernelArg(k, 6, sizeof(CoutA), &CoutA);
 
   const size_t lws[1] = {16};
-  const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+  const size_t gws[1] = {static_cast<size_t>((Cout + c.GEMV_TM - 1) / c.GEMV_TM) * 16};
   const double med = rt.timeMs(
     [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws); }, 3, iters);
   const double flops = 2.0 * Cout * Cin;

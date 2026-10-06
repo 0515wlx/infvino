@@ -348,6 +348,10 @@ private:
    *  that consumes it as its activation, so the Mul pass + its tensor disappear; the conv
    *  reads the unscaled value + a per-input-channel `scale` (kernel `-DMUL_SCALE=1`). */
   void    fuseChannelScaleMul();
+  /** @brief R56 D5: fuse the YOLO SPPF block (`concat4(x, mp(x), mp²(x), mp³(x))` with a
+   *  chained MaxPool5s1p2) into a single `sppf_concat4` kernel (3 launches + 3 buffers saved;
+   *  bit-exact, max is associative). */
+  void    fuseSppfConcat();
   void    buildKernels();
   void    releaseKernels();
   void    dispatch(const Node & n);
@@ -530,6 +534,7 @@ private:
   int                                           fusions_res_{0};    // R33 残差融合次数
   int                                           fusions_concat_{0}; // R30c concat->conv1x1 次数
   int                                           fusions_scale_{0};  // R51 D5 Mul->conv1x1 prologue 次数
+  int                                           fusions_sppf_{0};   // R56 D5 SPPF maxpool->concat 次数
   double                                        last_run_ms_{0.0};
   // P2: host-side segmentation (only filled when profiling_): cumulative time in
   // clEnqueueNDRangeKernel and in clWaitForEvents.

@@ -485,6 +485,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.op = "conv1x1";
       f.source = "gemm_sk";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
+      f.layout.inIndex = 1;   // 槽 0 = 权重，激活在槽 1（与 gemm_f16/conv1x1_blk 同约定）
       f.bottleneck = Bottleneck::Fma;
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1" && s.N > 1; };
       f.candidates = [](const OpSignature & s) {
@@ -544,11 +545,20 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.bottleneck = Bottleneck::Latency;
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1" && s.N == 1; };
       f.candidates = [](const OpSignature & s) {
-        Conv1x1Cfg cfg;
-        cfg.ACT = s.act;
-        cfg.RES = (s.groups & 2) ? 1 : 0;
-        cfg.SG = 16;
-        return std::vector<Candidate>{mk("conv1x1_gemv_f16", "conv1x1", cfg.options(), cfg.label())};
+        std::vector<Candidate> out;
+        // R48 §4bis: N=1 族此前只有 1 个候选（无多输出/无调优空间）。GEMV_TM=每子组
+        // 输出通道数：X 读一次供 T 个权重行复用（X 读流量 /T）+ T 条独立归约链提升 ILP。
+        // T=1 与旧行为逐位一致；更大的 T 仅在 Cout>=T 时才有意义。
+        for (int tm : {1, 2, 4}) {
+          if (s.Cout > 0 && tm > s.Cout) continue;
+          Conv1x1Cfg cfg;
+          cfg.ACT = s.act;
+          cfg.RES = (s.groups & 2) ? 1 : 0;
+          cfg.SG = 16;
+          cfg.GEMV_TM = tm;
+          out.push_back(mk("conv1x1_gemv_f16", "conv1x1", cfg.options(), cfg.label()));
+        }
+        return out;
       };
       f.ceiling = [](const OpSignature & s, const ClDeviceInfo & dev) {
         const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;

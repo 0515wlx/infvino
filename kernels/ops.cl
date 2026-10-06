@@ -104,6 +104,38 @@ __kernel void concat4(__global const half *restrict a, const int ca,
   y[(o * sum + ax) * inner + r] = v;
 }
 
+// ---- SPPF: y = concat4(x, maxpool(x), maxpool²(x), maxpool³(x)) fused into one pass ----
+// R56 D5: launch fusion. YOLO SPPF = conv1x1 -> {MaxPool5s1p2 chained 3x} -> concat4. The 3
+// maxpools + the concat become ONE kernel (saves 3 launches + 3 [C,H,W] materializations).
+// max is associative & order-independent, and the composition of chained S=1/P maxpools is
+// exactly a single max over the Minkowski-sum box [-(src*P), src*P] ignoring OOB — so this is
+// **bit-exact** vs the unfused path. K/P are the maxpool kernel/stride-half-width (5/2).
+__kernel void sppf_concat4(__global const half *restrict x, __global half *restrict y,
+                           const int C, const int H, const int W, const int K, const int P) {
+  const int inner = H * W;
+  const int i = get_global_id(0);
+  const int total = 4 * C * inner;
+  if (i >= total) return;
+  const int c4  = i / inner;
+  const int r   = i % inner;
+  const int src = c4 / C;          // 0 = x, 1 = mp, 2 = mp^2, 3 = mp^3
+  const int c   = c4 % C;
+  const int oh  = r / W, ow = r % W;
+  if (src == 0) { y[i] = x[(c * H + oh) * W + ow]; return; }
+  const int span = src * P;        // effective half-window (K=2P+1 -> 2*src*P+1)
+  float m = -3.4e38f;
+  for (int dy = -span; dy <= span; ++dy) {
+    const int yy = oh + dy;
+    if (yy < 0 || yy >= H) continue;
+    for (int dx = -span; dx <= span; ++dx) {
+      const int xx = ow + dx;
+      if (xx < 0 || xx >= W) continue;
+      m = fmax(m, (float)x[(c * H + yy) * W + xx]);
+    }
+  }
+  y[i] = (half)m;
+}
+
 // ---- max pool (K,K) stride S pad P ----
 __kernel void maxpool(__global const half *restrict x, __global half *restrict y,
                       const int C, const int H, const int W, const int Hout,

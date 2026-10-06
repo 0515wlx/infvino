@@ -60,19 +60,31 @@
 #ifndef Y_BLOCK         // R50: output rows per work-item (1 = original)
 #define Y_BLOCK 1
 #endif
+#ifndef VEC_STORE       // R50/D6: 向量化 fsv16 store（block_write）；实测与标量在 mb 的
+#define VEC_STORE 0     //   小 depthwise（贴 launch 地板）持平/略负 → 默认关，opt-in 保留
+#endif
 
 #if X_BLOCK == 8
 #define VEC_T half8
+#define RWV_T ushort8
 #define AS_V(x) as_half8(x)
+#define AS_RW(x) as_ushort8(x)
 #define BLOCK_READ(p) intel_sub_group_block_read_us8(p)
+#define BLOCK_WRITE(p, v) intel_sub_group_block_write_us8(p, v)
 #elif X_BLOCK == 4
 #define VEC_T half4
+#define RWV_T ushort4
 #define AS_V(x) as_half4(x)
+#define AS_RW(x) as_ushort4(x)
 #define BLOCK_READ(p) intel_sub_group_block_read_us4(p)
+#define BLOCK_WRITE(p, v) intel_sub_group_block_write_us4(p, v)
 #elif X_BLOCK == 2
 #define VEC_T half2
+#define RWV_T ushort2
 #define AS_V(x) as_half2(x)
+#define AS_RW(x) as_ushort2(x)
 #define BLOCK_READ(p) intel_sub_group_block_read_us2(p)
+#define BLOCK_WRITE(p, v) intel_sub_group_block_write_us2(p, v)
 #else
 #error "depthwise_blk: X_BLOCK must be 2, 4 or 8"
 #endif
@@ -183,10 +195,24 @@ __kernel void depthwise_blk(
   }
 
   const half b = (bias != 0 && cok) ? bias[c] : (half)0;
+  // R50/D6: full 16-lane channel block + full column block → vectorized fsv16 store
+  // (intel_sub_group_block_write_usN; lane l writes component i to base + i*SG + l).
+  const bool cfull = ((f_block + 1) * SG <= C);
 #pragma unroll
   for (int t = 0; t < Y_BLOCK; ++t) {
     const int yy = y0 + t;
     if (yy >= Ho) continue;
+#if VEC_STORE && OUT_FSV16
+    if (cfull && x0 + X_BLOCK <= Wo) {
+      VEC_T res;
+#pragma unroll
+      for (int j = 0; j < X_BLOCK; ++j)
+        res[j] = dwblk_activate((half)(acc[t * X_BLOCK + j] + b));
+      const size_t vbase = (((size_t)f_block * Ho + yy) * Wo + x0) * SG;
+      BLOCK_WRITE((__global ushort *)output + vbase, AS_RW(res));
+      continue;
+    }
+#endif
 #pragma unroll
     for (int j = 0; j < X_BLOCK; ++j) {
       const int xx = x0 + j;

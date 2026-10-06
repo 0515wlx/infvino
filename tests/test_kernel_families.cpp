@@ -153,6 +153,20 @@ static void run_tests()
     CHECK(convblk && convblk->layout.inIndex == 0, "conv3x3_blk activation in slot 0");
     CHECK(gapfsv && gapfsv->layout.inIndex == 0, "gap_fsv16 activation in slot 0");
     CHECK(gapfsv && gapfsv->layout.in == Layout::FSV16, "gap_fsv16 input layout is FSV16");
+
+    // 通用契约不变量（防止新增族漏声明 inIndex）：凡服务「槽 0 = 权重」的 op（gemm /
+    // conv1x1 / conv1x1_cat4），激活都在槽 1；其余 op 激活在槽 0。曾经 gemm_sk_f16
+    // 漏声明 → default 0，与同族其它成员不一致（潜在布局/分配漂移）。
+    const KernelFamily * sk = familyByName("gemm_sk_f16");
+    CHECK(sk && sk->layout.inIndex == 1, "gemm_sk_f16 activation in slot 1 (contract fix)");
+    for (const auto & f : kernelFamilies())
+    {
+      const bool weightFirst = (f.op == "gemm" || f.op == "conv1x1" || f.op == "conv1x1_cat4");
+      const int want = weightFirst ? 1 : 0;
+      const std::string m =
+          "family '" + f.name + "' (" + f.op + ") declares activation slot " + std::to_string(want);
+      CHECK_EQ(f.layout.inIndex, want, m.c_str());
+    }
   }
 
   // --- canOutFsv16 由族契约传播到候选 ---

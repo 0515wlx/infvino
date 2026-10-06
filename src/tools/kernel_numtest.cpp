@@ -179,8 +179,11 @@ int main(int argc, char ** argv)
       if (Cin <= 0 || Cout <= 0) throw std::runtime_error("need --cin --cout");
       auto hW = readBin(in_w, static_cast<size_t>(Cout) * Cin);
       auto hX = readBin(in_x, static_cast<size_t>(Cin));
-      cl_kernel k = rt.buildKernel("conv1x1", "conv1x1_gemv_f16",
-                                   "-DACT=0 -DRES=0 -DSG=16 -cl-mad-enable -cl-fast-relaxed-math");
+      // R48 §4bis: 允许 --opts 覆盖（用于验证 GEMV_TM 多输出候选）。
+      const std::string gopts =
+          opts.empty() ? std::string("-DACT=0 -DRES=0 -DSG=16 -cl-mad-enable -cl-fast-relaxed-math")
+                       : opts;
+      cl_kernel k = rt.buildKernel("conv1x1", "conv1x1_gemv_f16", gopts);
       cl_mem dW = rt.alloc(static_cast<size_t>(Cout) * Cin * 2, CL_MEM_READ_ONLY);
       cl_mem dX = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_READ_ONLY);
       cl_mem dC = rt.alloc(static_cast<size_t>(Cout) * 2, CL_MEM_WRITE_ONLY);
@@ -194,8 +197,10 @@ int main(int argc, char ** argv)
       clSetKernelArg(k, 4, sizeof(dC), &dC);
       clSetKernelArg(k, 5, sizeof(Cin), &Cin);
       clSetKernelArg(k, 6, sizeof(Cout), &Cout);
+      const auto gt = gopts.find("-DGEMV_TM=");
+      const int tm = gt == std::string::npos ? 1 : std::max(1, std::atoi(gopts.c_str() + gt + 10));
       const size_t lws[1] = {16};
-      const size_t gws[1] = {static_cast<size_t>(Cout) * 16};
+      const size_t gws[1] = {static_cast<size_t>((Cout + tm - 1) / tm) * 16};
       for (int i = 0; i < iters; ++i)
         infvino::ClRuntime::enqueueND(rt.queue(), k, 1, gws, lws);
       rt.finish();
@@ -547,10 +552,14 @@ int main(int argc, char ** argv)
       if (!hB.empty()) { dB = rt.alloc(static_cast<size_t>(Cin) * 2, CL_MEM_READ_ONLY);
                          rt.write(dB, static_cast<size_t>(Cin) * 2, hB.data()); }
       cl_mem dY = rt.alloc(static_cast<size_t>(Cpad) * Ho * Wo * 2, CL_MEM_WRITE_ONLY);
-      char ob[192];
-      std::snprintf(ob, sizeof(ob),
-                    "-DX_BLOCK=4 -DY_BLOCK=1 -DDWK=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
-                    "-DOUT_FSV16=1 -cl-mad-enable -cl-fast-relaxed-math", dwK, S, P, act);
+      char ob[320];
+      if (!opts.empty()) {
+        std::snprintf(ob, sizeof(ob), "%s", opts.c_str());
+      } else {
+        std::snprintf(ob, sizeof(ob),
+                      "-DX_BLOCK=4 -DY_BLOCK=1 -DDWK=%d -DSTRIDE=%d -DPAD=%d -DACT=%d -DSG=16 "
+                      "-DOUT_FSV16=1 -cl-mad-enable -cl-fast-relaxed-math", dwK, S, P, act);
+      }
       cl_kernel k = rt.buildKernel("depthwise_blk", "depthwise_blk", ob);
       clSetKernelArg(k, 0, sizeof(dF), &dF);
       clSetKernelArg(k, 1, sizeof(dWo), &dWo);
