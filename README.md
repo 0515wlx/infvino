@@ -110,7 +110,28 @@ for (const auto & d : result.detections)
 
 ## 测试
 
-所有测试都需要可用的 Intel iGPU（`/dev/dri`）与容器镜像（脚本用 docker 跑容器）：
+### 离线单元测试（**不需要 iGPU / `/dev/dri`**）
+
+可直接在构建同容器（或已装依赖的宿主）内运行，不需要 iGPU。改动 host 侧纯逻辑时的快速门——
+覆盖调优缓存、布局最小割、物理标尺、算子族注册表这些「选型/记账/契约」层
+（R42–R52 里反复出 bug、而 GPU 数值测试抓不到的地方）：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target check        # 构建并跑全部离线测试（CTest）
+# 或直接：ctest --test-dir build --output-on-failure
+```
+
+`tests/` 下的套件：`test_layout_solver`（随机 submodular 图 vs 暴力枚举的精确性）、
+`test_tuning_cache`（ABI / 设备键 / 数值契约的 round-trip 与失效）、
+`test_rulers`（`expectedOps` / 带宽曲线 / `occupancyPressure` / R55 `l3MlpFactor` 等）、
+`test_kernel_families`（注册表不变量、`inIndex` 布局契约、`actMask` 过滤）、
+`test_l3_model`（R55 全局 LRU 溢出模拟 + 有限差分逐节点价），
+以及既有的 `tuning_test`。
+
+### GPU 数值 / 整网回归
+
+以下数值与整网检验需要可用的 Intel iGPU（`/dev/dri`）与容器镜像（脚本用 docker 跑容器）：
 
 ```bash
 # 算子级数值检验（vs numpy FP32）

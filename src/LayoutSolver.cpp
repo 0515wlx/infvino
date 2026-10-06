@@ -159,6 +159,15 @@ BinarySolution solveBinaryMinCut(const BinaryEnergy & e)
     if (e.fixed[static_cast<size_t>(i)][0] >= 0)
     {
       const int l = e.fixed[static_cast<size_t>(i)][0];
+      // 钉死标签的 unary 代价是相对自由变量的**常数偏移**：必须计入 constant，否则
+      // 报告的 energy 会丢掉被钉死变量在强制标签上的代价（argmin 不受影响）。
+      const double forced = (l == 0) ? d0 : d1;
+      if (forced >= kBig)
+      {
+        sol.energy = BinaryEnergy::kInf;  // 强制标签本身不可行
+        return sol;
+      }
+      constant += forced;
       if (l == 0) { d0 = 0.0; d1 = kBig; }
       else        { d0 = kBig; d1 = 0.0; }
     }

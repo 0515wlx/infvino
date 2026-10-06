@@ -20,6 +20,7 @@
 #include "infvino/Autotuner.hpp"
 #include "infvino/KernelFamily.hpp"
 #include "infvino/LayoutSolver.hpp"
+#include "infvino/L3Model.hpp"
 
 namespace infvino
 {
@@ -1313,6 +1314,77 @@ const TuningEntry * PlanModel::choiceEntry(size_t ni, const OpSignature & sig) c
   return tuning_.lookup(sig);
 }
 
+std::vector<L3Access> PlanModel::buildL3Access() const
+{
+  // 小算子：流式（读输入 + 写输出，保留工作集小）→ 其流式足迹即有效占用压力。
+  auto isSmall = [](const std::string & op) {
+    return op == "ew_binary" || op == "ew_binary_bcast" || op == "ew_unary" || op == "copy_c" ||
+           op == "slice_axis" || op == "concat4" || op == "maxpool" || op == "resize_nn" ||
+           op == "permute_0213" || op == "bmm" || op == "softmax_axis" || op == "gap";
+  };
+  std::vector<L3Access> out;
+  out.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nodes_[i], &ok);
+    const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
+    L3Access a;
+    a.op = nodes_[i].op;
+    // 读：所有出现在 T_（激活）里的输入；权重/常量不在 T_，不计（与旧 spill 模拟一致）。
+    for (const auto & in : nodes_[i].ins)
+    {
+      if (in == "-") continue;
+      auto it = T_.find(in);
+      if (it == T_.end()) continue;
+      a.reads.push_back({in, static_cast<double>(it->second.numel()) * 2.0});
+    }
+    // 写：只计 outs[0]（与旧 spill 模拟一致）。
+    if (!nodes_[i].outs.empty())
+    {
+      auto it = T_.find(nodes_[i].outs[0]);
+      if (it != T_.end())
+        a.writes.push_back({nodes_[i].outs[0], static_cast<double>(it->second.numel()) * 2.0});
+    }
+    double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
+    if (isSmall(nodes_[i].op))
+    {
+      double fb = 0.0;
+      for (const auto & r : a.reads) fb += r.second;
+      for (const auto & w : a.writes) fb += w.second;
+      press = std::max(press, fb);
+    }
+    a.occ_bytes = press;
+    out.push_back(std::move(a));
+  }
+  return out;
+}
+
+double PlanModel::layoutModelScore() const
+{
+  double score = 0.0;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+  {
+    bool ok = false;
+    const OpSignature s = nodeSignature(nodes_[i], &ok);
+    const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
+    if (e && !e->kernel.empty()) score += e->ms;
+    if (!e || e->kernel.find("_blk") == std::string::npos) continue;
+    // 未持久化 fsv16 的 blk 输入要付一趟 reorder。
+    const Node & n = nodes_[i];
+    const size_t inIdx = (n.op == "conv1x1" || n.op == "conv1x1_cat4") ? 1 : 0;
+    if (n.ins.size() <= inIdx) continue;
+    auto it = T_.find(n.ins[inIdx]);
+    if (it == T_.end() || it->second.fsv16) continue;
+    if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
+      score += r->ms;
+  }
+  L3ModelConfig cfg;
+  cfg.compute_prices = false;
+  score += evaluateL3(buildL3Access(), cfg).spill_ms;
+  return score;
+}
+
 void PlanModel::resolveLayoutChoices()
 {
   node_choice_.assign(nodes_.size(), {});
@@ -1429,9 +1501,22 @@ void PlanModel::resolveLayoutChoices()
       invalidateCapture();  // 布局改变 ⇒ 已录制的 dispatch 失效（否则回退后仍重放旧录制）
     };
     const LayoutState base = snap();
+    // R55: L3 定价提案的**离线评分拒绝门**（只防回归）：mincut 提案的整网离线评分
+    // （Σ kernel ms + reorder + spill）若比 baseline 更差 >0.5%，拒绝并回退。随
+    // `INFVINO_LAYOUT_L3` 默认开启；`INFVINO_NO_LAYOUT_L3_GATE=1` 关闭（消融）。
+    const bool l3Gate = std::getenv("INFVINO_LAYOUT_L3") != nullptr &&
+                        std::getenv("INFVINO_NO_LAYOUT_L3_GATE") == nullptr;
+    const double baseScore = l3Gate ? layoutModelScore() : 0.0;
     if (!resolveLayoutMinCut(alt))
     {
       restore(base);  // 不适配 → 保留 baseline
+    }
+    else if (l3Gate && layoutModelScore() > baseScore * 1.005)
+    {
+      if (std::getenv("INFVINO_LAYOUT_REPORT"))
+        std::fprintf(stderr, "[layout] R55 L3 gate REJECT: score %.4f -> %.4f ms\n",
+                     baseScore, layoutModelScore());
+      restore(base);  // 预测更差 → 回退
     }
     else if (std::getenv("INFVINO_LAYOUT_MINCUT_GATE") && profiling_ &&
              !input_name_.empty() && inputNumel() > 0)
@@ -1677,17 +1762,59 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     if (pin) en.fix(static_cast<int>(v), 0);
   }
 
-  // ---- 节点代价表 f(x_in, x_out)（含 reorder + 可选 R47 L3/占用会计，submodular）。----
-  // R49 缺口 1：把 R47 的**占用压力会计**接进节点代价（线性、可加）。隔离 ms 之外再计一项
-  // `occupancyPressure × kL3SpillPerByteMs`。
-  //
-  // ⚠️ 负结果（见 docs/round49 §10）：逐节点 L3 项**破坏了可加性/量级校准**——占用压力是
-  // 「总并发足迹」而非「miss 字节」，直接当节点成本会压过隔离 ms、把选择推向过度持久化
-  // （mb 提案 1.57→2.46 ms）。R47 的正确形态是**整网 LRU 模拟**（顺序相关），不能塞进成对
-  // min-cut 的节点项。因此本项**默认关**，仅作消融/实验旋钮（`INFVINO_LAYOUT_L3=1`）。
+  // ---- 节点代价表 f(x_in, x_out)（含 reorder + R55 方案 A 的 L3 逐出**定价**，submodular）。----
+  // R55 方案 A：全局逐出不可加，用**价 ρ（ms/占用字节）**线性化进可加主问题。两种标定：
+  //   collective（默认）ρ = S_occ / ΣR —— 把「全体占用归零」能省的溢出 S_occ 按占用份额摊平，
+  //                       校准到总可省量，比逐节点更保守（不把集体削减记到单节点头上）。
+  //   pernode      ρ_i = 逐节点有限差分（局部，易高估单节点可实现的削减）。
+  // `INFVINO_L3_PRICE=pernode` 切换；`INFVINO_L3_PRICE_SCALE=<x>` 缩放（标定/消融）。
+  // 默认关（`INFVINO_LAYOUT_L3=1`）；价由**当前选择**的全局模拟（buildL3Access）重标定。
   const bool useL3 = std::getenv("INFVINO_LAYOUT_L3") != nullptr;
-  auto inCurveMs = [&](const TuningEntry & e, const OpSignature & s) -> double {
-    return e.ms + (useL3 ? occupancyPressure(e, s) * kL3SpillPerByteMs : 0.0);
+  std::vector<double> rho(nodes_.size(), 0.0);   // ms / occupancy-byte
+  if (useL3)
+  {
+    const std::vector<L3Access> acc = buildL3Access();
+    L3ModelConfig l3p;                 // anchor=1MB（与 predictNet 同源）；R55 ~2MB 待 A/B
+    l3p.compute_prices = true;
+    const L3Result l3r = evaluateL3(acc, l3p);
+    std::vector<L3Access> zacc = acc;
+    for (auto & a : zacc) a.occ_bytes = 0.0;
+    L3ModelConfig zcfg = l3p;
+    zcfg.compute_prices = false;
+    const double spill_no_occ = evaluateL3(zacc, zcfg).spill_ms;
+    const double S_occ = std::max(0.0, l3r.spill_ms - spill_no_occ);  // 占用可归属的总溢出
+    double sumR = 0.0;
+    for (const auto & a : acc) sumR += a.occ_bytes;
+    const char * priceMode = std::getenv("INFVINO_L3_PRICE");
+    const bool collective = !(priceMode && std::string(priceMode) == "pernode");
+    if (collective)
+    {
+      const double rhoU = sumR > 0.0 ? S_occ / sumR : 0.0;
+      for (size_t i = 0; i < acc.size(); ++i) rho[i] = (acc[i].occ_bytes > 0.0) ? rhoU : 0.0;
+    }
+    else
+    {
+      for (size_t i = 0; i < acc.size(); ++i)
+        if (acc[i].occ_bytes > 0.0) rho[i] = l3r.node_price_ms[i] / acc[i].occ_bytes;
+    }
+    const double priceScale =
+        std::getenv("INFVINO_L3_PRICE_SCALE") ? std::atof(std::getenv("INFVINO_L3_PRICE_SCALE")) : 1.0;
+    for (double & v : rho) v *= priceScale;
+    if (std::getenv("INFVINO_LAYOUT_REPORT"))
+    {
+      int nonzero = 0;
+      double sum_price = 0.0;
+      for (double p : l3r.node_price_ms) { if (p > 0.0) ++nonzero; sum_price += p; }
+      std::fprintf(stderr,
+                   "[layout] R55 price(%s): spill=%.4f ms, S_occ=%.4f ms, sumR=%.2f MB, "
+                   "nonzero_pernode=%d/%zu, sum_pernode=%.4f ms, rho_max=%.3e ms/B, scale=%.2f\n",
+                   collective ? "collective" : "pernode", l3r.spill_ms, S_occ, sumR / 1e6,
+                   nonzero, l3r.node_price_ms.size(), sum_price,
+                   rho.empty() ? 0.0 : *std::max_element(rho.begin(), rho.end()), priceScale);
+    }
+  }
+  auto inCurveMs = [&](size_t ni_i, const TuningEntry & e, const OpSignature & s) -> double {
+    return e.ms + (useL3 ? rho[ni_i] * occupancyPressure(e, s) : 0.0);
   };
   //   f(0,0) = min(eN, eB+r)   NCHW 入/出：non，或 blk 付输入 reorder 写 NCHW
   //   f(0,1) = eB + r          NCHW 入 / FSV16 出：必须 blk，付输入 reorder
@@ -1701,10 +1828,10 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     const int b = varId(n.outs[0]);
     bool ok = false;
     const OpSignature s = nodeSignature(n, &ok);
-    const double eB = inCurveMs(alt[ni].blk, s), eN = inCurveMs(alt[ni].non, s),
+    const double eB = inCurveMs(ni, alt[ni].blk, s), eN = inCurveMs(ni, alt[ni].non, s),
                  r = alt[ni].reorder.ms;
     // R50: 输出 fsv16 时用契约成本（同一 blk kernel + OUT_FSV16=1），否则用 bfyx 成本。
-    const double eBf = alt[ni].blkFsv16.kernel.empty() ? eB : inCurveMs(alt[ni].blkFsv16, s);
+    const double eBf = alt[ni].blkFsv16.kernel.empty() ? eB : inCurveMs(ni, alt[ni].blkFsv16, s);
     const double f00 = std::min(eN, eB + r), f01 = eBf + r, f10 = eB, f11 = eBf;
     if (!en.addPairwiseTable(a, b, f00, f01, f10, f11))
       return false;  // 非 submodular → 回退
@@ -1738,7 +1865,7 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
     const bool lb = (sol.labels[static_cast<size_t>(b)] == 1);
     bool ok = false;
     const OpSignature s = nodeSignature(n, &ok);
-    const double eB = inCurveMs(alt[ni].blk, s), eN = inCurveMs(alt[ni].non, s),
+    const double eB = inCurveMs(ni, alt[ni].blk, s), eN = inCurveMs(ni, alt[ni].non, s),
                  r = alt[ni].reorder.ms;
     const bool useBlk = la || lb || (eB + r <= eN);
     node_choice_[ni] = useBlk ? alt[ni].blk : alt[ni].non;
@@ -4931,30 +5058,13 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     *sb = statsOf(bs);
   };
 
-  // R47 step3: **全局 L3 模拟（LRU）** —— 占用会引入强耦合（A 的瞬时工作集逐出 B 的输入），
-  // 因此**不能**用逐算子独立项（会二次计费、且破坏可加性），而必须**按节点顺序跑一遍全局缓存
-  // 模拟**：维护容量 = L3 的常驻张量集合（LRU），每个节点先按其**瞬时占用**（并发 WG × 每 WG
-  // tile 字节）冲刷 LRU，再读输入（未命中 → 记一次 DRAM 往返）/写输出。耦合由模拟本身处理。
-  // 折算：miss_bytes × (1/BW_DRAM − 1/BW_L3)。这是对 OA 计数器不可用的替代估计。
-  constexpr double kL3 = 3.75e6;
-  // R49: miss 折算系数已抽到 Tuning.cpp 的 `kL3SpillPerByteMs`（单一真相源，mincut 共用）。
-  auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
-    const std::string k(key);
-    auto p = opts.find(k);
-    if (p == std::string::npos) return def;
-    return std::atoi(opts.c_str() + p + k.size());
-  };
-  // R47 标定：饱和阈值是 **8192 个线程**（= 102.4 线程/EU），与 WG 大小、寄存器用量均无关
-  // （见 docs/round47-l3-model.md §9.2；此前写死「128 WG」只对 WG=64 成立）。按线程算并发。
-  // R49：占用压力已抽成单一真相源 `infvino::occupancyPressure`（Tuning.cpp），
-  // mincut 的节点代价与这里的 L3 模拟共用，避免两处口径漂移。
-  // R47 step4: 占用感知的**有效 L3 容量**（footprint 实测，§9.1）：驻留足迹 ≈1MB 即达
-  // ~21GB/s 平台，之后断崖（组相联/流式占位放大有效占用）。把 LRU 容量按节点占用缩放：
-  // 占用越大，留给「其他张量复用」的有效容量越小。以 footprint 平台 1MB 为容量锚点。
-  constexpr double kL3Resident1Mb = 1.0e6;
-  auto effCapacity = [&](double press) -> double {
-    return std::max(kL3Resident1Mb, kL3 - 0.5 * press);
-  };
+  // R55: **全局 L3 溢出交给可离线单测的 `L3Model`**（`include/infvino/L3Model.hpp`）。
+  // 它按拓扑序跑一遍 LRU 模拟（每个节点先按其占用压力压缩有效容量、逐出 LRU 头，再读输入
+  // 记 miss、写输出），跨算子耦合由模拟一致处理。`buildL3Access()` 是构造该视图的单一入口
+  // （占用 = `occupancyPressure`，小算子 = 其流式足迹）。配置与 R47 行为一致（anchor=1MB）；
+  // R55 标定的 ~2MB 锚点需整网 A/B 后再切换（见 L3Model.hpp / round55 文档）。
+  L3ModelConfig l3cfg;
+  l3cfg.compute_prices = false;   // predictNet 只要总溢出；逐节点价留给 mincut 定价路径
   // R47 补充：**小算子（GEMV/ew/gap/pool/...）的整网外溢**。小算子是流式（读输入+写输出，
   // 保留工作集小），其代价 = launch 地板 + 流式 bytes/BW；且在流式期间会**冲刷 L3**（逐出
   // 常驻张量）。此前的 `predictNet` 只累加了 conv/gemm 的占用，漏掉小算子 —— 这正是 §4.7 里
@@ -4984,73 +5094,7 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     const double bw = copyBwGbps(bytes) * 1e9;
     return kSmallLaunchUs * 1e-3 + bytes / bw * 1e3;   // ms
   };
-  auto spillBytes = [&]() -> double {
-    std::vector<std::pair<std::string, double>> res;   // MRU 在尾部
-    double resBytes = 0.0, miss = 0.0, currentCap = kL3;
-    auto touch = [&](const std::string & name, double bytes, bool write) {
-      for (size_t k = 0; k < res.size(); ++k)
-        if (res[k].first == name)
-        {
-          auto pv = res[k];
-          res.erase(res.begin() + static_cast<long>(k));
-          res.push_back(pv);
-          return;
-        }
-      if (!write) miss += bytes;
-      res.push_back({name, bytes});
-      resBytes += bytes;
-      while (resBytes > currentCap && !res.empty())
-      {
-        resBytes -= res.front().second;
-        res.erase(res.begin());
-      }
-    };
-    for (size_t i = 0; i < nodes_.size(); ++i)
-    {
-      bool ok = false;
-      const OpSignature s = nodeSignature(nodes_[i], &ok);
-      const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
-      // 占用压力：按占用算有效容量并冲刷 LRU（跨算子耦合在此体现）。
-      double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
-      // R47 补充：小算子流式读+写会冲刷 L3（其流式足迹即有效压力）。
-      if (isSmallOp(nodes_[i].op))
-      {
-        double fb = 0.0;
-        for (const auto & in : nodes_[i].ins)
-        {
-          if (in == "-") continue;
-          auto it = T_.find(in);
-          if (it != T_.end()) fb += static_cast<double>(it->second.numel()) * 2.0;
-        }
-        if (!nodes_[i].outs.empty())
-        {
-          auto it = T_.find(nodes_[i].outs[0]);
-          if (it != T_.end()) fb += static_cast<double>(it->second.numel()) * 2.0;
-        }
-        press = std::max(press, fb);
-      }
-      currentCap = effCapacity(press);
-      while (resBytes > currentCap && !res.empty())
-      {
-        resBytes -= res.front().second;
-        res.erase(res.begin());
-      }
-      const Node & n = nodes_[i];
-      for (const auto & in : n.ins)
-      {
-        if (in == "-") continue;
-        auto it = T_.find(in);
-        if (it == T_.end()) continue;   // 权重/非激活 → 不计
-        touch(in, static_cast<double>(it->second.numel()) * 2.0, false);
-      }
-      if (!n.outs.empty())
-      {
-        auto it = T_.find(n.outs[0]);
-        if (it != T_.end()) touch(n.outs[0], static_cast<double>(it->second.numel()) * 2.0, true);
-      }
-    }
-    return miss;
-  };
+  auto spillBytes = [&]() -> double { return evaluateL3(buildL3Access(), l3cfg).spill_bytes; };
   auto spillMs = [&]() -> double { return spillBytes() * kL3SpillPerByteMs; };
 
   // R47 §3-P0: **可加目标**（GPU-free 代理整网）—— Σ 逐节点 kernel ms + 未持久化 blk 输入的

@@ -46,6 +46,7 @@ add_library(infvino SHARED
   src/Autotuner.cpp
   src/KernelFamilies.cpp
   src/LayoutSolver.cpp
+  src/L3Model.cpp
   src/PlanModel.cpp
   src/ClBackend.cpp
   src/InferenceEngine.cpp
@@ -90,6 +91,31 @@ add_executable(tuning_test src/tools/tuning_test.cpp)
 target_link_libraries(tuning_test PRIVATE infvino)
 enable_testing()
 add_test(NAME tuning_test COMMAND tuning_test)
+
+# ---------------------------------------------------------------------------
+# 离线单元测试（**不需要 GPU / 容器**）：只测 host 侧纯逻辑，是改动的快速门。
+# 覆盖布局最小割 / 调优缓存 / 物理标尺 / 算子族注册表——即 R42–R52 里反复出
+# bug（静默选型、记账、布局契约）的那一层。整网数值回归仍由 scripts/*_check.py 承担。
+#
+#   cmake --build build --target check      # 构建并跑全部离线测试
+#   ctest --test-dir build --output-on-failure
+# ---------------------------------------------------------------------------
+set(INFVINO_UNIT_TESTS
+  test_layout_solver
+  test_tuning_cache
+  test_rulers
+  test_kernel_families
+  test_l3_model
+)
+foreach(t ${INFVINO_UNIT_TESTS})
+  add_executable(${t} tests/${t}.cpp)
+  target_link_libraries(${t} PRIVATE infvino)
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
+add_custom_target(check
+  COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+  DEPENDS ${INFVINO_UNIT_TESTS} tuning_test
+  USES_TERMINAL)
 
 # R43: GPU hardware counters via the Intel Metrics Discovery API (optional).
 # Provides independent evidence for "which wall" (EU time, L3/DRAM bytes, stalls),

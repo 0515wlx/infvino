@@ -289,6 +289,53 @@ __kernel void footprint_scan(__global const uint *restrict in, __global uint *si
 
 
 // ---------------------------------------------------------------------------
+// R55 L3 coupling calibration: **解耦驻留足迹与并发度**。
+//   每个 work-item 反复触碰一块**私有、互不重叠**的窗口（`fp` 条 cache line，
+//   每条 64 B），重复 `passes` 遍。取一个驻留波次时：
+//       驻留足迹  R = gws · fp · 64 B
+//       并发度    C = gws 线程
+//       触碰次数  T = gws · fp · passes
+//   在**固定 R** 下扫 (gws, fp) 即可把「容量/ miss」（由 R 决定）与
+//   「并行度 / MLP」（由 C 决定）分开。passes=1 是纯流式（无复用，R 不影响命中）；
+//   passes 大时 R 决定逐遍命中还是逐遍 Miss。
+//   布局：第 gid 个 WI 的窗口 = [gid·fp·16, gid·fp·16 + (fp-1)·16]（uint 下标，
+//   stride 16 uint = 64 B），故与相邻 WI 的窗口不相交。
+// ---------------------------------------------------------------------------
+__kernel void l3_probe(__global const uint *restrict in, __global uint *sink,
+                       const uint fp, const uint passes) {
+  const uint gid = get_global_id(0);
+  __global const uint *base = in + (size_t)gid * (size_t)fp * 16u;
+  uint a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+  for (uint p = 0; p < passes; ++p) {
+    uint k = 0;
+    for (; k + 3u < fp; k += 4u) {
+      a0 += base[(size_t)(k + 0u) * 16u];
+      a1 += base[(size_t)(k + 1u) * 16u];
+      a2 += base[(size_t)(k + 2u) * 16u];
+      a3 += base[(size_t)(k + 3u) * 16u];
+    }
+    for (; k < fp; ++k) a0 += base[(size_t)k * 16u];
+  }
+  if ((a0 + a1 + a2 + a3) == 0xdeadbeefu) sink[0] = a0;
+}
+
+// ---------------------------------------------------------------------------
+// R55 双租户污染探针：协作重读一个**共享热点**（`hot_lines` 条 line，重复 `hiters`
+// 遍）。它紧跟在一次 aggressor 流（另一个 kernel，单独入队）之后运行；这一遍是
+// 命中 L3 还是打到 DRAM，就揭示 aggressor 的在飞足迹有没有把热点逐出。
+// 「B 的输入（热点）是否被 A 的占用（aggressor）冲掉」——即跨算子 L3 污染的直接测量。
+// ---------------------------------------------------------------------------
+__kernel void l3_hot_read(__global const uint *restrict hot, __global uint *sink,
+                          const uint hot_lines, const uint hiters) {
+  const uint gid = get_global_id(0);
+  const uint gsz = get_global_size(0);
+  uint acc = 0;
+  for (uint p = 0; p < hiters; ++p)
+    for (uint k = gid; k < hot_lines; k += gsz) acc += hot[(size_t)k * 16u];
+  if (acc == 0xdeadbeefu) sink[0] = acc;
+}
+
+// ---------------------------------------------------------------------------
 // H. Work-group barrier cost (Round 12). Each iteration does a real SLM store
 //    + barrier + SLM load (the same shape as the GEMM k-loop's synchronisation),
 //    so this measures the barrier+SLM-round-trip latency per iteration.

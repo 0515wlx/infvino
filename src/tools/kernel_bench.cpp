@@ -1429,6 +1429,136 @@ int benchFootprintBw(infvino::ClRuntime & rt, int ws, int passes)
   return 0;
 }
 
+// R55 L3 coupling calibration: 2D sweep (concurrency C=gws × per-WI window fp).
+// Reports effective line throughput (touches×64B/time) at each (C, fp) so that
+//   * fixed C, varying fp  -> pure **residency/miss** effect (R = C·fp·64);
+//   * fixed R = C·fp, varying (C, fp) -> pure **concurrency/MLP** effect.
+// passes=1 => streaming (no reuse); passes>1 => the per-WI window is reused.
+int benchL3Couple(infvino::ClRuntime & rt, const std::vector<int> & wi_list,
+                  const std::vector<int> & fp_list, int passes, int fi)
+{
+  const int maxWi = 8192, maxFp = 256;
+  const size_t n = static_cast<size_t>(maxWi) * maxFp * 16;  // uint elements (line-strided)
+  cl_kernel k = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
+  cl_mem in = rt.alloc(n * 4, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(n, 1); rt.write(in, n * 4, z.data()); }
+  const size_t lws = 64;
+  std::printf("[l3couple] passes=%d  metric = effective line throughput (touch=64B)\n", passes);
+  std::printf("        C\\fp");
+  for (int fp : fp_list) std::printf("   fp=%-3d", fp);
+  std::printf("\n");
+  const uint pu = static_cast<uint>(passes);
+  for (int w : wi_list)
+  {
+    if (w <= 0 || w > maxWi) continue;
+    const size_t gws = static_cast<size_t>(w);
+    std::printf("  C=%-6d", w);
+    for (int fp : fp_list)
+    {
+      if (fp <= 0 || fp > maxFp) { std::printf("   %7s", "-"); continue; }
+      const uint fpu = static_cast<uint>(fp);
+      clSetKernelArg(k, 0, sizeof(in), &in);
+      clSetKernelArg(k, 1, sizeof(sink), &sink);
+      clSetKernelArg(k, 2, sizeof(fpu), &fpu);
+      clSetKernelArg(k, 3, sizeof(pu), &pu);
+      double med = 0.0;
+      try {
+        med = rt.timeMs(
+          [&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, fi);
+      } catch (const std::exception & e) { std::printf("   %7s", "ERR"); continue; }
+      const double touches = static_cast<double>(w) * fp * passes;
+      const double gbps = touches * 64.0 / (med * 1e-3) / 1e9;   // line-granular throughput
+      std::printf(" %6.1f", gbps);
+    }
+    std::printf("   (R = C·fp·64)\n");
+  }
+  clReleaseMemObject(in);
+  clReleaseMemObject(sink);
+  clReleaseKernel(k);
+  return 0;
+}
+
+// R55 two-tenant pollution probe: run an aggressor stream (private footprint
+// R_A = agg_wi·agg_fp·64 B) immediately before cooperatively re-reading a SHARED
+// hot set of `hot_lines` lines. timeMs() profiles the hot-read event only (the
+// aggressor is enqueued on the same in-order queue just before, untimed), so the
+// hot-read's effective throughput reveals whether the aggressor evicted the hot
+// set. Baseline = no aggressor (fully L3-resident).
+int benchL3Pollute(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hiters,
+                   const std::vector<int> & agg_wi, const std::vector<int> & agg_fp, int fi)
+{
+  const int maxWi = 8192, maxFp = 256;
+  const size_t hn = static_cast<size_t>(hot_lines) * 16 + 16;
+  const size_t an = static_cast<size_t>(maxWi) * maxFp * 16;
+  cl_mem hot = rt.alloc(hn * 4, CL_MEM_READ_ONLY);
+  cl_mem agg = rt.alloc(an * 4, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(hn, 1); rt.write(hot, hn * 4, z.data()); }
+  { std::vector<uint32_t> z(an, 1); rt.write(agg, an * 4, z.data()); }
+  cl_kernel khot = rt.buildKernel("micro", "l3_hot_read", "-cl-mad-enable");
+  cl_kernel kagg = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
+  const size_t lws = 64;
+  const uint hl = static_cast<uint>(hot_lines), hi = static_cast<uint>(hiters), one = 1u;
+  clSetKernelArg(khot, 0, sizeof(hot), &hot);
+  clSetKernelArg(khot, 1, sizeof(sink), &sink);
+  clSetKernelArg(khot, 2, sizeof(hl), &hl);
+  clSetKernelArg(khot, 3, sizeof(hi), &hi);
+  const size_t hotGws = static_cast<size_t>(hot_gws);
+  const double hotBytes = static_cast<double>(hot_lines) * hiters * 64.0;
+  auto measure = [&](int agws, int afp) -> double {
+    auto closure = [&]() -> cl_event {
+      cl_event aev = nullptr;
+      if (agws > 0)
+      {
+        const uint af = static_cast<uint>(afp);
+        clSetKernelArg(kagg, 0, sizeof(agg), &agg);
+        clSetKernelArg(kagg, 1, sizeof(sink), &sink);
+        clSetKernelArg(kagg, 2, sizeof(af), &af);
+        clSetKernelArg(kagg, 3, sizeof(one), &one);   // passes=1: pure stream
+        size_t ag = static_cast<size_t>(agws);
+        aev = infvino::ClRuntime::enqueueND(rt.queue(), kagg, 1, &ag, &lws);
+      }
+      cl_event hev = infvino::ClRuntime::enqueueND(rt.queue(), khot, 1, &hotGws, &lws);
+      if (aev) clReleaseEvent(aev);
+      return hev;
+    };
+    try { return rt.timeMs(closure, 2, fi); } catch (const std::exception &) { return 0.0; }
+  };
+  std::printf("[l3pollute] hot=%d lines (%.0f KB shared), hot_gws=%d, hiters=%d, "
+              "hot_bytes=%.0f KB\n", hot_lines, hot_lines * 64.0 / 1024.0, hot_gws, hiters,
+              hotBytes / 1024.0);
+  std::printf("  aggressor            R_A       hot_read_ms   hot_GB/s   vs ref\n");
+  // 参考点用**平台区中段**（R_A=1 MB，确定无污染）。两点伪影要避开：(a)「无 aggressor」
+  // 背靠背单独 kernel 的 event 采样；(b) 首次测量的冷启动。先丢弃一次，再取参考。
+  (void)measure(1024, 4);
+  const double base = measure(4096, 4);
+  const double baseGbs = base > 0 ? hotBytes / (base * 1e-3) / 1e9 : 0.0;
+  std::printf("  %-16s %8s   %10.4f   %8.1f   1.00\n", "ref(R_A=1MB)", "1.05 MB", base, baseGbs);
+  struct Row { double R; int wi, fp; double ms; };
+  std::vector<Row> rows;
+  for (int wi : agg_wi)
+    for (int fp : agg_fp)
+    {
+      if (wi <= 0 || wi > maxWi || fp <= 0 || fp > maxFp) continue;
+      const double ms = measure(wi, fp);
+      rows.push_back({static_cast<double>(wi) * fp * 64.0, wi, fp, ms});
+    }
+  std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) { return a.R < b.R; });
+  for (const auto & r : rows)
+  {
+    const double gbs = r.ms > 0 ? hotBytes / (r.ms * 1e-3) / 1e9 : 0.0;
+    std::printf("  wi=%-5d fp=%-3d  %8.2f MB   %10.4f   %8.1f   %.2f\n",
+                r.wi, r.fp, r.R / 1e6, r.ms, gbs, base > 0 ? r.ms / base : 0.0);
+  }
+  clReleaseMemObject(hot);
+  clReleaseMemObject(agg);
+  clReleaseMemObject(sink);
+  clReleaseKernel(khot);
+  clReleaseKernel(kagg);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -1448,6 +1578,9 @@ int main(int argc, char ** argv)
   int depth = 1;
   std::vector<size_t> sizes_kb;
   int slm_kb = 16, mode = 0, nwg = 64, wg = 256, sg = 0;
+  std::vector<int> wi_list, fp_list;
+  int passes = 32;
+  int hot_lines = 16384, hot_gws = 4096, hot_iters = 1;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -1498,6 +1631,18 @@ int main(int argc, char ** argv)
       conv.SG = sg;
     } else if (a == "--sizes") {
       for (int v : parseInts(next())) sizes_kb.push_back(static_cast<size_t>(v));
+    } else if (a == "--wi") {
+      wi_list = parseInts(next());
+    } else if (a == "--fp") {
+      fp_list = parseInts(next());
+    } else if (a == "--passes") {
+      passes = std::atoi(next().c_str());
+    } else if (a == "--hot-lines") {
+      hot_lines = std::atoi(next().c_str());
+    } else if (a == "--hot-gws") {
+      hot_gws = std::atoi(next().c_str());
+    } else if (a == "--hot-iters") {
+      hot_iters = std::atoi(next().c_str());
     } else if (a == "--slm-kb") {
       slm_kb = std::atoi(next().c_str());
     } else if (a == "--mode") {
@@ -1608,6 +1753,14 @@ int main(int argc, char ** argv)
     rc = benchBarrier(rt, wg, nwg, iters, mode);
   } else if (op == "footprint") {
     rc = benchFootprintBw(rt, depth, iters);
+  } else if (op == "l3couple") {
+    if (wi_list.empty()) wi_list = {256, 512, 1024, 2048, 4096, 8192};
+    if (fp_list.empty()) fp_list = {1, 2, 4, 8, 16, 32, 64};
+    rc = benchL3Couple(rt, wi_list, fp_list, passes, 2);
+  } else if (op == "l3pollute") {
+    if (wi_list.empty()) wi_list = {1024, 2048, 4096, 8192};
+    if (fp_list.empty()) fp_list = {1, 2, 4, 8, 16, 32};
+    rc = benchL3Pollute(rt, hot_lines, hot_gws, hot_iters, wi_list, fp_list, 5);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

@@ -445,7 +445,11 @@ double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
 /** @brief R47 标定：L3 miss 折算（1/BW_DRAM − 1/BW_L3），ms/byte。*/
 const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;
 
-double occupancyPressure(const TuningEntry & e, const OpSignature & s)
+namespace
+{
+// R55: 占用统计的**单一真相源**（occupancyPressure / occupancyThreads 共用）。
+// 出参 concurrent = min(总线程数, 8192)、perWg = 每 WG 触达字节；返回 false = 该 op 不计占用。
+bool occupancyStats(const TuningEntry & e, const OpSignature & s, double & concurrent, double & perWg)
 {
   auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
     const std::string k(key);
@@ -453,7 +457,8 @@ double occupancyPressure(const TuningEntry & e, const OpSignature & s)
     if (p == std::string::npos) return def;
     return std::atoi(opts.c_str() + p + k.size());
   };
-  double totalThreads = 1.0, perWg = 0.0;
+  double totalThreads = 1.0;
+  perWg = 0.0;
   int    wgSize = 64;
   if (s.op == "conv3x3")
   {
@@ -507,10 +512,60 @@ double occupancyPressure(const TuningEntry & e, const OpSignature & s)
     perWg = 2.0 * (static_cast<double>(bm) * bk + static_cast<double>(bn) * bk);
   }
   else
-    return 0.0;  // 小算子：占用并入其自身实测（launch/带宽受限）
+    return false;  // 小算子：占用并入其自身实测（launch/带宽受限）
   constexpr double kSatThreads = 8192.0;  // 实测：与 WG/寄存器无关的线程数上限
-  const double     concurrent = std::min(totalThreads, kSatThreads);
-  return concurrent * perWg;
+  concurrent = std::min(totalThreads, kSatThreads);
+  return true;
+}
+}  // namespace
+
+double occupancyPressure(const TuningEntry & e, const OpSignature & s)
+{
+  double c = 0.0, p = 0.0;
+  if (!occupancyStats(e, s, c, p)) return 0.0;
+  return c * p;
+}
+
+double occupancyThreads(const TuningEntry & e, const OpSignature & s)
+{
+  double c = 0.0, p = 0.0;
+  if (!occupancyStats(e, s, c, p)) return 0.0;
+  return c;
+}
+
+// R55 校准（`l3couple`）：并发/MLP 因子。有效行吞吐随线程数上升、约 ~1024 WI 饱和。
+double l3MlpFactor(double threads)
+{
+  if (threads <= 0.0) return 0.05;
+  constexpr double kMlpSatThreads = 1024.0;
+  return std::max(0.05, std::min(1.0, threads / kMlpSatThreads));
+}
+
+// R55 校准（`l3couple`）：L3 容量因子 g(R)。私有 tile 形态：平台 ~2 MB，半坡 ~6 MB，
+// DRAM 平台 ~0.04（见 docs/round55-l3-coupling-calibration.md §2.3）。
+double l3CapacityFactor(double residentBytes)
+{
+  struct P { double bytes, f; };
+  static const P kCurve[] = {
+    {0.0, 1.0},    {2.0e6, 1.0},  {3.0e6, 0.80}, {4.0e6, 0.70},  {6.0e6, 0.55},
+    {8.0e6, 0.48}, {12.0e6, 0.28}, {16.0e6, 0.15}, {24.0e6, 0.08}, {32.0e6, 0.05},
+    {64.0e6, 0.04}};
+  const int n = static_cast<int>(sizeof(kCurve) / sizeof(kCurve[0]));
+  if (residentBytes <= kCurve[1].bytes) return kCurve[1].f;
+  if (residentBytes >= kCurve[n - 1].bytes) return kCurve[n - 1].f;
+  for (int i = 1; i + 1 < n; ++i)
+    if (residentBytes <= kCurve[i + 1].bytes)
+    {
+      const double lx = std::log(residentBytes / kCurve[i].bytes) /
+                        std::log(kCurve[i + 1].bytes / kCurve[i].bytes);
+      return kCurve[i].f * std::pow(kCurve[i + 1].f / kCurve[i].f, lx);
+    }
+  return kCurve[n - 1].f;
+}
+
+double effectiveBwGbps(double bytes, double threads)
+{
+  return copyBwGbps(bytes) * l3MlpFactor(threads);
 }
 
 // R47: 导出的 launch 地板（供 PlanModel 的小算子外溢估计使用）。

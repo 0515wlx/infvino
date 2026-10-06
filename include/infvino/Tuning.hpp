@@ -157,7 +157,22 @@ extern const double kSmallLaunchUs;
  *  线性、可加、设备无关（只依赖候选 options 与 shape）。是 L3/占用会计的单一真相源：
  *  `globalRetune` 的 L3 模拟与 `resolveLayoutMinCut` 的节点代价共用。*/
 double occupancyPressure(const TuningEntry & e, const OpSignature & sig);
-/** @brief R47 标定：L3 miss 折算 (1/BW_DRAM − 1/BW_L3)，单位 ms/byte。*/
+/** @brief R55: 某候选的**并发线程数** C = min(总线程数, 8192)（与 occupancyPressure 同源；
+ *  供二维内存 roofline 的并发/MLP 因子使用）。小算子/未知 op 返回 0。*/
+double occupancyThreads(const TuningEntry & e, const OpSignature & sig);
+/** @brief R55 (`l3couple` 标定)：并发/MLP 因子（(0,1]，1=饱和）。有效行吞吐随并发线程数
+ *  上升，约 **1024 线程**饱和；小网格欠占用 → 因子 <1（解释「小算子 prologue 受限」）。
+ *  这给 `copyBwGbps` 补上此前缺失的**并发维**。*/
+double l3MlpFactor(double threads);
+/** @brief R55 (`l3couple` 标定)：L3 容量因子 g(R)（(0,1]，1=全命中）。R = 在飞驻留足迹
+ *  字节（= occupancyPressure）。私有 tile 形态下平台延伸到 **~2 MB**，之后平滑下降，
+ *  DRAM 平台 ~0.04——而非标称 3.75 MB。*/
+double l3CapacityFactor(double residentBytes);
+/** @brief R55: 二维有效带宽 = copyBwGbps(bytes) × l3MlpFactor(threads)（逐节点、可加）。
+ *  `bytes` = 该节点的单遍工作集足迹（决定自有效容量断崖）；`threads` = 并发度（MLP）。
+ *  跨算子的容量污染不在此项，由 `L3Model` 的全局 LRU 模拟/定价处理。*/
+double effectiveBwGbps(double bytes, double threads);
+/** @brief R47/R55 标定：L3 miss 折算 (1/BW_DRAM − 1/BW_L3)，单位 ms/byte。*/
 extern const double kL3SpillPerByteMs;
 
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/

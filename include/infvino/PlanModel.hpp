@@ -27,6 +27,7 @@
 
 #include "infvino/ClRuntime.hpp"
 #include "infvino/Tuning.hpp"
+#include "infvino/L3Model.hpp"
 
 namespace infvino
 {
@@ -303,6 +304,12 @@ private:
   void    resolveLayoutChoices();
   /** @brief R38: per-node 覆盖（不动点结果），未命中则回退到签名缓存。 */
   const TuningEntry * choiceEntry(size_t ni, const OpSignature & sig) const;
+  /** @brief R55: 构造 L3 全局模拟视图（拓扑序；占用 = occupancyPressure，小算子 = 其流式足迹）。
+   *  供 `predictNet` 的全局溢出与 `resolveLayoutMinCut` 的逐节点定价共用（单一真相源）。*/
+  std::vector<L3Access> buildL3Access() const;
+  /** @brief R55: 布局选择的离线整网评分 = Σ 选中 kernel ms + Σ 未持久化 blk 输入的 reorder
+   *  + L3 spill_ms（小算子为布局不变量，略）。用于 L3 定价提案的**拒绝门**（只防回归）。*/
+  double layoutModelScore() const;
   /** @brief R38/R49: 一个节点在缓存里的两种布局备选 + 一趟 reorder 成本。*/
   struct LayoutAlt
   {
