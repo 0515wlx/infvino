@@ -183,6 +183,22 @@ static void run_tests()
           "effectiveBw rises with concurrency");
   }
 
+  // --- R59: L3 实测标定锚点（物理 L3 = 8 MiB，非旧 3.75 MB）---
+  {
+    CHECK_NEAR(l3PhysicalBytes(), 8.0e6, 1.0, "R59: physical L3 = 8 MiB (measured)");
+    CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R59: private-tile cap knee = 2 MB (R55)");
+    CHECK(l3DefaultCapBytes() > 3.75e6, "R59: default LRU capacity uses the real L3 (not legacy)");
+    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R59: default cap == physical L3");
+    CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R59: default anchor == private cap");
+    CHECK(l3SramBwGbps() > l3DramBwGbps(), "R59: SRAM BW > DRAM BW");
+    // legacy 开关（A/B）：置 1 时回退 R47 的 3.75MB / 1MB。
+    setenv("INFVINO_L3_LEGACY", "1", 1);
+    CHECK_NEAR(l3DefaultCapBytes(), 3.75e6, 1.0, "R59: legacy cap = 3.75 MB");
+    CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R59: legacy anchor = 1 MB");
+    unsetenv("INFVINO_L3_LEGACY");
+    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R59: back to calibrated after unset");
+  }
+
   // --- R55: occupancyThreads 与 occupancyPressure 同源 ---
   {
     TuningEntry e;

@@ -45,12 +45,10 @@ struct L3Access
 /** @brief L3 模型参数（默认 = R47/R55 标定值）。 */
 struct L3ModelConfig
 {
-  double l3_bytes = 3.75e6;                        ///< 标称 L3 容量（字节）
+  double l3_bytes = l3DefaultCapBytes();           ///< 跨算子 LRU 有效容量（R59 实测物理 L3；legacy 3.75e6）
   double spill_per_byte_ms = kL3SpillPerByteMs;    ///< miss 折算 (1/BW_DRAM − 1/BW_L3)
-  // R47 现有行为用 1 MB 锚点；R55 标定私有 tile 形态有效容量 ~2 MB（见
-  // docs/round55-l3-coupling-calibration.md §2.3）。默认保持 1 MB 以免改动未经 A/B 的
-  // `predictNet`；需要 R55 形态时显式置 2.0e6。
-  double eff_cap_anchor = 1.0e6;                   ///< 有效容量锚点（R47=1MB，R55≈2MB）
+  // R59: 有效容量锚点 = R55 私有 tile 膝点 ~2MB（legacy 1MB）。见 docs/round59。
+  double eff_cap_anchor = l3DefaultAnchorBytes();  ///< 有效容量锚点（R47=1MB，R55/R59≈2MB）
   double occ_cap_slope = 0.5;                      ///< effCap = max(anchor, L3 − slope·press)
   bool   compute_prices = true;                    ///< 是否用有限差分算逐节点价 ρ_i
 };

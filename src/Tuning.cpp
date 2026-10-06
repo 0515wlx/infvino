@@ -442,8 +442,27 @@ double paramAt(const std::vector<int> & v, size_t i, double dflt = 0.0)
 // R47: 导出 copy 带宽插值（外层可见）：转发到匿名命名空间里的同名实现。
 double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
 
-/** @brief R47 标定：L3 miss 折算（1/BW_DRAM − 1/BW_L3），ms/byte。*/
-const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 130e9) * 1e3;
+/** @brief R47 标定：L3 miss 折算（1/BW_DRAM − 1/BW_L3），ms/byte。
+ *  R59：BW 用实测平台/峰值（DRAM 20 GB/s、L3 copy 峰值 145 GB/s）。*/
+const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 145e9) * 1e3;
+
+// R59: 实测 L3 标定锚点（见 Tuning.hpp）。
+double l3PhysicalBytes() { return 8.0e6; }
+double l3PrivateCapBytes() { return 2.0e6; }
+double l3DefaultCapBytes()
+{
+  const char * legacy = std::getenv("INFVINO_L3_LEGACY");
+  return (legacy && std::string(legacy) != "0" && std::string(legacy) != "") ? 3.75e6
+                                                                             : l3PhysicalBytes();
+}
+double l3DefaultAnchorBytes()
+{
+  const char * legacy = std::getenv("INFVINO_L3_LEGACY");
+  return (legacy && std::string(legacy) != "0" && std::string(legacy) != "") ? 1.0e6
+                                                                             : l3PrivateCapBytes();
+}
+double l3DramBwGbps() { return 20.0; }
+double l3SramBwGbps() { return 145.0; }
 
 namespace
 {

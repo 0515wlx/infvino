@@ -310,6 +310,13 @@ private:
   /** @brief R55: 布局选择的离线整网评分 = Σ 选中 kernel ms + Σ 未持久化 blk 输入的 reorder
    *  + L3 spill_ms（小算子为布局不变量，略）。用于 L3 定价提案的**拒绝门**（只防回归）。*/
   double layoutModelScore() const;
+  /** @brief R59: 上面评分的**分项**（kernel / reorder / spill），用于标定与验证。*/
+  struct LayoutScore
+  {
+    double kernel = 0.0, reorder = 0.0, spill = 0.0;
+    double total() const { return kernel + reorder + spill; }
+  };
+  LayoutScore layoutModelBreakdown() const;
   /** @brief R38/R49: 一个节点在缓存里的两种布局备选 + 一趟 reorder 成本。*/
   struct LayoutAlt
   {

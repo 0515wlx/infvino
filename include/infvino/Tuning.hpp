@@ -175,6 +175,25 @@ double effectiveBwGbps(double bytes, double threads);
 /** @brief R47/R55 标定：L3 miss 折算 (1/BW_DRAM − 1/BW_L3)，单位 ms/byte。*/
 extern const double kL3SpillPerByteMs;
 
+/**
+ * @brief R59: L3 标定的**实测锚点**（i5-1135G7）。
+ *
+ * 此前模型用 `kL3Bytes = 3.75e6` 当 L3 容量——**实测物理 L3 = 8 MiB**
+ * （`lscpu` / `/sys/devices/system/cpu/cpu0/cache/index3/size = 8192K`），不到一半 →
+ * LRU 模拟系统性**过度逐出**（spill 高估）。R59 用实测锚点重标定：
+ *   * `l3PhysicalBytes()`  = 8.0e6  （物理 L3，跨算子 LRU 的有效容量上限）；
+ *   * `l3PrivateCapBytes()`= 2.0e6  （R55 §2.3：单 kernel 私有 tile 的有效容量膝点）；
+ *   * `l3DefaultCapBytes()`= 物理 L3（`INFVINO_L3_LEGACY=1` 回退 3.75e6 做 A/B）；
+ *   * `l3DefaultAnchorBytes()` = 2.0e6（legacy 1.0e6）；
+ *   * `l3DramBwGbps()`=20.0、`l3SramBwGbps()`=145.0（R55 copy 实测平台/峰值）。
+ */
+double l3PhysicalBytes();
+double l3PrivateCapBytes();
+double l3DefaultCapBytes();
+double l3DefaultAnchorBytes();
+double l3DramBwGbps();
+double l3SramBwGbps();
+
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/
 constexpr double kPeakOpsPerEuCycle = 32.0;
 /** @brief 纯寄存器 FP16 FMA 的结构上限（R13/R18）。*/

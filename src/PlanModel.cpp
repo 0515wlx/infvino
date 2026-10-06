@@ -1438,15 +1438,17 @@ std::vector<L3Access> PlanModel::buildL3Access() const
   return out;
 }
 
-double PlanModel::layoutModelScore() const
+double PlanModel::layoutModelScore() const { return layoutModelBreakdown().total(); }
+
+PlanModel::LayoutScore PlanModel::layoutModelBreakdown() const
 {
-  double score = 0.0;
+  LayoutScore sc;
   for (size_t i = 0; i < nodes_.size(); ++i)
   {
     bool ok = false;
     const OpSignature s = nodeSignature(nodes_[i], &ok);
     const TuningEntry * e = ok ? choiceEntry(i, s) : nullptr;
-    if (e && !e->kernel.empty()) score += e->ms;
+    if (e && !e->kernel.empty()) sc.kernel += e->ms;
     if (!e || e->kernel.find("_blk") == std::string::npos) continue;
     // 未持久化 fsv16 的 blk 输入要付一趟 reorder。
     const Node & n = nodes_[i];
@@ -1455,12 +1457,12 @@ double PlanModel::layoutModelScore() const
     auto it = T_.find(n.ins[inIdx]);
     if (it == T_.end() || it->second.fsv16) continue;
     if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
-      score += r->ms;
+      sc.reorder += r->ms;
   }
   L3ModelConfig cfg;
   cfg.compute_prices = false;
-  score += evaluateL3(buildL3Access(), cfg).spill_ms;
-  return score;
+  sc.spill = evaluateL3(buildL3Access(), cfg).spill_ms;
+  return sc;
 }
 
 void PlanModel::resolveLayoutChoices()
@@ -1706,6 +1708,14 @@ void PlanModel::resolveLayoutChoices()
         }
       }
     }
+  }
+  // R59: 分项打印（标定/验证用）。
+  if (std::getenv("INFVINO_LAYOUT_REPORT"))
+  {
+    const LayoutScore ls = layoutModelBreakdown();
+    std::fprintf(stderr,
+                 "[layout] model score: kernel=%.4f reorder=%.4f spill=%.4f total=%.4f ms\n",
+                 ls.kernel, ls.reorder, ls.spill, ls.total());
   }
   // R52: 池/布局一致性守卫。任何被标记 fsv16 的张量都必须有放得下补齐布局的缓冲，
   // 且其生产者确实直写 fsv16 —— 否则会在整网静默产生错误激活（R51 §5.1 的根因）。
