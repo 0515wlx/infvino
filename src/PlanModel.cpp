@@ -1584,61 +1584,126 @@ void PlanModel::resolveLayoutChoices()
     // `INFVINO_LAYOUT_L3` 默认开启；`INFVINO_NO_LAYOUT_L3_GATE=1` 关闭（消融）。
     const bool l3Gate = std::getenv("INFVINO_LAYOUT_L3") != nullptr &&
                         std::getenv("INFVINO_NO_LAYOUT_L3_GATE") == nullptr;
-    const double baseScore = l3Gate ? layoutModelScore() : 0.0;
-    if (!resolveLayoutMinCut(alt))
+    // R57: **分量级**验收门——把「整图判否 → 整份 restore」改成「逐连通分量套用提案，
+    // 只有离线评分不回归才接受该分量」。**默认开**（严格不劣于 baseline 评分；实测
+    // y8/y11 略优、mb 噪声内）；`INFVINO_NO_LAYOUT_COMPONENT_GATE=1` 关闭（回到「整份
+    // 接受」或旧的全图 L3 门）。
+    const bool compGate = std::getenv("INFVINO_NO_LAYOUT_COMPONENT_GATE") == nullptr;
+    const double baseScore = (compGate || l3Gate) ? layoutModelScore() : 0.0;
+    MinCutProposal prop;
+    if (!resolveLayoutMinCut(alt, compGate ? &prop : nullptr))
     {
       restore(base);  // 不适配 → 保留 baseline
     }
-    else if (l3Gate && layoutModelScore() > baseScore * 1.005)
+    else
     {
-      if (std::getenv("INFVINO_LAYOUT_REPORT"))
-        std::fprintf(stderr, "[layout] R55 L3 gate REJECT: score %.4f -> %.4f ms\n",
-                     baseScore, layoutModelScore());
-      restore(base);  // 预测更差 → 回退
-    }
-    else if (std::getenv("INFVINO_LAYOUT_MINCUT_GATE") && profiling_ &&
-             !input_name_.empty() && inputNumel() > 0)
-    {
-      std::vector<uint16_t> zeros(inputNumel(), 0);
-      setInput(zeros.data());
-      auto busyMedian = [&](int reps) -> double {
-        invalidateCapture();
-        std::vector<double> v;
-        try
+      if (compGate && !prop.comps.empty())
+      {
+        // 分量级贪心：从 baseline 起，逐分量套用 min-cut 提案（该分量的张量 fsv16 +
+        // 节点 kernel），离线评分不回归（≤ 当前 ×1.0001）才接受，否则只回退**该分量**。
+        const LayoutState cut = snap();
+        restore(base);
+        double cur = baseScore;
+        int accepted = 0, rejected = 0;
+        auto fsvOf = [&](const LayoutState & s, const std::string & name, bool def) -> bool {
+          auto it = s.fsv.find(name);
+          return it == s.fsv.end() ? def : (it->second != 0);
+        };
+        for (const auto & comp : prop.comps)
         {
-          for (int r = 0; r <= reps; ++r)
+          auto apply = [&](const LayoutState & src) {
+            for (int k : comp)
+            {
+              const size_t ni = prop.nodes[static_cast<size_t>(k)];
+              for (int v : {prop.nodeVarA[static_cast<size_t>(k)], prop.nodeVarB[static_cast<size_t>(k)]})
+              {
+                auto it = T_.find(prop.varName[static_cast<size_t>(v)]);
+                if (it != T_.end()) it->second.fsv16 = (prop.labels[static_cast<size_t>(v)] == 1);
+              }
+              node_choice_[ni] = src.choice[ni];
+            }
+          };
+          apply(cut);
+          const double s = layoutModelScore();
+          if (s <= cur * 1.0001) { cur = s; ++accepted; }
+          else
           {
-            clearProfile();
-            run();
-            if (r == 0) continue;  // capture/热身
-            const double b = profile().busy_ms;
-            if (b > 0.0) v.push_back(b);
+            // 只回退该分量：张量 fsv16 回 baseline，节点选择回 baseline。
+            for (int k : comp)
+            {
+              const size_t ni = prop.nodes[static_cast<size_t>(k)];
+              for (int v : {prop.nodeVarA[static_cast<size_t>(k)], prop.nodeVarB[static_cast<size_t>(k)]})
+              {
+                auto it = T_.find(prop.varName[static_cast<size_t>(v)]);
+                if (it != T_.end())
+                  it->second.fsv16 = fsvOf(base, prop.varName[static_cast<size_t>(v)], it->second.fsv16);
+              }
+              node_choice_[ni] = base.choice[ni];
+            }
+            ++rejected;
           }
         }
-        catch (const std::exception &) { return 1e300; }
-        if (v.empty()) return 1e300;
-        std::sort(v.begin(), v.end());
-        return v[v.size() / 2];
-      };
-      const LayoutState cut = snap();
-      std::vector<double> bmed, mmed;
-      for (int r = 0; r < 3; ++r)
-      {
-        restore(base);
-        bmed.push_back(busyMedian(3));
-        restore(cut);
-        mmed.push_back(busyMedian(3));
+        mincut_active_ = accepted > 0;
+        invalidateCapture();
+        if (std::getenv("INFVINO_LAYOUT_REPORT"))
+          std::fprintf(stderr,
+                       "[layout] R57 component gate: %zu comps, accept=%d reject=%d, "
+                       "score %.4f -> %.4f ms\n",
+                       prop.comps.size(), accepted, rejected, baseScore, cur);
       }
-      auto medOf = [](std::vector<double> & v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
-      const double bm = medOf(bmed), mm = medOf(mmed);
-      if (!(mm < bm * 0.99))
+      else if (l3Gate && layoutModelScore() > baseScore * 1.005)
       {
-        restore(base);
-        std::fprintf(stderr, "[layout] mincut gate REJECT: median %.4f -> %.4f ms\n", bm, mm);
+        if (std::getenv("INFVINO_LAYOUT_REPORT"))
+          std::fprintf(stderr, "[layout] R55 L3 gate REJECT: score %.4f -> %.4f ms\n",
+                       baseScore, layoutModelScore());
+        restore(base);  // 预测更差 → 回退
       }
-      else
+
+      // R49 步骤 2：opt-in 的**整网实测**验收门（在分量门之后跑，对最终状态再做外部核对）。
+      if (std::getenv("INFVINO_LAYOUT_MINCUT_GATE") && profiling_ &&
+          !input_name_.empty() && inputNumel() > 0)
       {
-        std::fprintf(stderr, "[layout] mincut gate ACCEPT: median %.4f -> %.4f ms\n", bm, mm);
+        std::vector<uint16_t> zeros(inputNumel(), 0);
+        setInput(zeros.data());
+        auto busyMedian = [&](int reps) -> double {
+          invalidateCapture();
+          std::vector<double> v;
+          try
+          {
+            for (int r = 0; r <= reps; ++r)
+            {
+              clearProfile();
+              run();
+              if (r == 0) continue;  // capture/热身
+              const double b = profile().busy_ms;
+              if (b > 0.0) v.push_back(b);
+            }
+          }
+          catch (const std::exception &) { return 1e300; }
+          if (v.empty()) return 1e300;
+          std::sort(v.begin(), v.end());
+          return v[v.size() / 2];
+        };
+        const LayoutState cut = snap();
+        std::vector<double> bmed, mmed;
+        for (int r = 0; r < 3; ++r)
+        {
+          restore(base);
+          bmed.push_back(busyMedian(3));
+          restore(cut);
+          mmed.push_back(busyMedian(3));
+        }
+        auto medOf = [](std::vector<double> & v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const double bm = medOf(bmed), mm = medOf(mmed);
+        if (!(mm < bm * 0.99))
+        {
+          restore(base);
+          std::fprintf(stderr, "[layout] mincut gate REJECT: median %.4f -> %.4f ms\n", bm, mm);
+        }
+        else
+        {
+          std::fprintf(stderr, "[layout] mincut gate ACCEPT: median %.4f -> %.4f ms\n", bm, mm);
+        }
       }
     }
   }
@@ -1716,7 +1781,7 @@ bool PlanModel::poolAliasProbe(const char * where, bool verbose) const
   return bad == 0;
 }
 
-bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
+bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutProposal * prop)
 {
   // ---- 注册表驱动：族 → 布局契约（inIndex/canOutFsv16/in）。----
   auto blkFamilyOf = [&](size_t ni) -> const KernelFamily * {
@@ -1961,6 +2026,47 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt)
                    varName[v].c_str());
       sol.labels[v] = 0;   // 兜底（loop 理论上已清干净）
     }
+
+  // R57: 填出提案结构（分量 = 按共享张量连通的节点组），供调用方做**分量级验收**。
+  if (prop)
+  {
+    prop->varName = varName;
+    prop->labels.assign(varName.size(), 0);
+    for (size_t v = 0; v < varName.size(); ++v) prop->labels[v] = sol.labels[v];
+    prop->nodes = nodes;
+    prop->nodeVarA.assign(nodes.size(), -1);
+    prop->nodeVarB.assign(nodes.size(), -1);
+    for (size_t k = 0; k < nodes.size(); ++k)
+    {
+      const Node & n = nodes_[nodes[k]];
+      prop->nodeVarA[k] = varId(n.ins[static_cast<size_t>(actSlot(nodes[k]))]);
+      prop->nodeVarB[k] = varId(n.outs[0]);
+    }
+    std::vector<int> uf(nodes.size());
+    for (size_t k = 0; k < nodes.size(); ++k) uf[k] = static_cast<int>(k);
+    std::function<int(int)> find = [&](int x) {
+      while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
+      return x;
+    };
+    auto uni = [&](int x, int y) { x = find(x); y = find(y); if (x != y) uf[x] = y; };
+    std::unordered_map<std::string, std::vector<int>> byTensor;
+    for (size_t k = 0; k < nodes.size(); ++k)
+    {
+      const Node & n = nodes_[nodes[k]];
+      byTensor[n.ins[static_cast<size_t>(actSlot(nodes[k]))]].push_back(static_cast<int>(k));
+      if (!n.outs.empty()) byTensor[n.outs[0]].push_back(static_cast<int>(k));
+    }
+    for (auto & kv : byTensor)
+      for (size_t j = 1; j < kv.second.size(); ++j) uni(kv.second[0], kv.second[j]);
+    std::unordered_map<int, int> compId;
+    for (size_t k = 0; k < nodes.size(); ++k)
+    {
+      const int r = find(static_cast<int>(k));
+      if (!compId.count(r)) { compId[r] = static_cast<int>(prop->comps.size()); prop->comps.push_back({}); }
+      prop->comps[static_cast<size_t>(compId[r])].push_back(static_cast<int>(k));
+    }
+  }
+
   for (size_t v = 0; v < varName.size(); ++v)
   {
     auto it = T_.find(varName[v]);

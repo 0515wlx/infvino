@@ -321,6 +321,21 @@ private:
     bool        has = false;
   };
   /**
+   * @brief R57: min-cut 提案的结构（供「按连通分量局部化验收门」使用）。
+   *
+   * `varName`/`labels` = 每个变量的张量名与提案标签；`comps` = 分量（每个是参与节点在
+   * `nodes` 里的下标列表，按共享张量连通）；`nodes` 是参与 min-cut 的节点，
+   * `nodeVarA/B` 是它们在变量表里的输入/输出变量号（用于把分量映射回节点选择）。
+   */
+  struct MinCutProposal
+  {
+    std::vector<std::string>      varName;
+    std::vector<int>              labels;
+    std::vector<std::vector<int>> comps;
+    std::vector<size_t>           nodes;
+    std::vector<int>              nodeVarA, nodeVarB;
+  };
+  /**
    * @brief R49 试点：把布局决策建模成二元标注的**精确最小割**（LayoutSolver）。
    *
    * 只对 `op == "conv1x1"` 且缓存含 `#blk/#non/#reorder` 的节点生效（一族试点，
@@ -330,8 +345,10 @@ private:
    *
    * 成功返回 true 并写好 `node_choice_` 与各张量 `fsv16`；任何不适配（非本族 alt、
    * 表非 submodular、变量为空）都返回 false，调用方回退到既有不动点/启发式。
+   * R57：非 submodular 用 relaxed 表（不再 return false）；越界变量局部钉死。
+   * `prop` 非空时填出提案结构（连通分量），供调用方做**分量级验收**。
    */
-  bool    resolveLayoutMinCut(const std::vector<LayoutAlt> & alt);
+  bool    resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutProposal * prop = nullptr);
   /** @brief R49: mincut 是否已接管布局（为真时 planBlockedLayout 直接返回，保留标注）。*/
   bool    mincut_active_ = false;
 
