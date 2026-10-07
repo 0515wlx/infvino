@@ -42,7 +42,7 @@
 | B7 | 候选生成按**占用 / 容量**过滤 | 🔴 | R66 §：在注册表侧排除注定内存墙的 tiling，未做。当前候选预算（R48 §3.1）只按数量截断。 | 与 A2/A3 一起做更自然 |
 | B8 | mincut **per-plan 最优 bake** 成工件 | 🟡 | R49 §9.5-4 / R50 §7：门需 profiling + 构造期多次整网执行；生产应离线跑一次后 bake，而非运行时自检。 | 与 C3（per-plan 工件覆盖）合并推进 |
 | B9 | 非 16 通道的 fsv16 持久化（激活按 `ceil(C/16)*16` 分配） | ✅ R51 | mb 默认 −2.7%；见 `round51-cat4-registry-and-non16-fsv16.md`。 | — |
-| B10 | **blocked 链布局**：不动点需「链感知定价」——选 blk 会令单消费者生产者直写 fsv16（reorder 实为 0） | 🟡 R71 | R71 定位：不动点按 `blk+reorder` 逐节点定价、且只按**当前**是否 fsv16，导致跨族链（concat→1×1、1×1→dw）断掉、卡 NCHW 局部最优。已落地单消费者版链感知定价（`PlanModel` R71 段）；**默认路径中性**，但使 unfused cat4 链 fsv16 张量 3→21。 | 多消费者/整分量赋值（B1）、融合 blocked-cat4（B11） |
+| B10 | **blocked 链布局**：不动点需「链感知定价」——选 blk 会令单消费者生产者直写 fsv16（reorder 实为 0） | 🟡 R71 | R71 定位：不动点按 `blk+reorder` 逐节点定价、且只按**当前**是否 fsv16，导致跨族链（concat→1×1、1×1→dw）断掉、卡 NCHW 局部最优。已落地单消费者版链感知定价（`PlanModel` R71 段）；**默认路径中性**，但使 unfused cat4 链 fsv16 张量 3→21。 | 多消费者/整分量赋值（B1）、融合 blocked-cat4（B11）；**完整方案见 `round71-next-global-layout-policy.md`（下次任务）** |
 | B11 | **融合 blocked-cat4**：cat4 保留融合但走 blocked 1×1 直读 4 路 fsv16（不物化 concat） | ⚪ R71 | **已实现 + 负结果**：逐层更快（`128→128@20×20` 2.0×），但整网 y8 +7% / y11 +6%——因 4 路源钉不进持久 fsv16，每帧多 32 趟 reorder（+1.1ms）。`INFVINO_CAT4_BLK=1` 可开（默认关，见 `round71-1x1-depthwise-layout.md` §2.4）。 | 先做 B10 的多消费者/整分量链（源能持久 fsv16）后再验证 |
 
 ---
