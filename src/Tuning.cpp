@@ -464,6 +464,20 @@ double l3DefaultAnchorBytes()
 double l3DramBwGbps() { return 20.0; }
 double l3SramBwGbps() { return 145.0; }
 
+// R60: reorder 的**可加**成本模型。常数由本机 `kernel_bench --op reorder` 标定
+// （Cin16 322² 等 shape 实测 ~58–60 GB/s 单趟；launch floor ≈ 3.5 µs）。见 docs/round60-*。
+const double kReorderLaunchMs = 0.0035;
+const double kReorderStreamBwGbps = 60.0;
+// R60: 顺序 dispatch 的逐次间隔（锁频实测 ~12.4 µs，见 docs/round60-*）。事件计时的单趟
+// `#reorder.ms` 不含它；整网把 N 趟相加会少算 N×间隙——这正是「reorder 不可加」的第一项。
+const double kReorderDispatchGapMs = 0.0124;
+double reorderCostMs(double read_bytes, double write_bytes, bool input_resident)
+{
+  const double total = std::max(0.0, read_bytes) + std::max(0.0, write_bytes);
+  const double bw = input_resident ? l3SramBwGbps() : kReorderStreamBwGbps;
+  return kReorderLaunchMs + (bw > 0.0 ? total / (bw * 1e6) : 0.0);
+}
+
 namespace
 {
 // R55: 占用统计的**单一真相源**（occupancyPressure / occupancyThreads 共用）。

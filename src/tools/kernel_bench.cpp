@@ -654,6 +654,77 @@ int benchReorder(infvino::ClRuntime & rt, const ConvShape & s, int iters)
   return 0;
 }
 
+// R60: reorder additivity probe. N reorders back-to-back.
+//   mode bit0: 1 = shared input buffer (L3-hot after 1st), 0 = N distinct inputs.
+//   mode bit1: 1 = shared output buffer,                    0 = N distinct outputs.
+//   (0,0) all cold; (1,1) all hot; the difference attributes the additivity gap to
+//   the input vs output working set (vs L3 capacity).
+int benchReorderSeq(infvino::ClRuntime & rt, const ConvShape & s, int nseq, int mode, int iters)
+{
+  const int C = s.Cin, H = s.H, W = s.W, cb = (C + 15) / 16;
+  cl_kernel k;
+  try { k = rt.buildKernel("conv_blk", "reorder_bfyx_to_fsv16", ""); }
+  catch (const std::exception & e) { std::fprintf(stderr, "[build-fail] %s\n", e.what()); return 1; }
+  const size_t ne = (size_t)C * H * W, oe = (size_t)cb * H * W * 16;
+  if (nseq < 1) nseq = 1;
+  const bool sharedIn = (mode & 1) != 0, sharedOut = (mode & 2) != 0;
+  const int nbuf = sharedIn ? 1 : nseq, nout = sharedOut ? 1 : nseq;
+  std::vector<cl_mem> dI(nbuf), dO(nout);
+  std::vector<uint16_t> h(ne, 0x3c00);
+  for (int i = 0; i < nbuf; ++i) { dI[i] = rt.alloc(ne * 2, CL_MEM_READ_ONLY); rt.write(dI[i], ne * 2, h.data()); }
+  for (int i = 0; i < nout; ++i) dO[i] = rt.alloc(oe * 2, CL_MEM_WRITE_ONLY);
+  int Ca = C, Ha = H, Wa = W;
+  const size_t gws[3] = {(size_t)W, (size_t)H, (size_t)C};
+  auto enqueueOne = [&](cl_mem in, cl_mem out) {
+    clSetKernelArg(k, 0, sizeof(in), &in);
+    clSetKernelArg(k, 1, sizeof(out), &out);
+    clSetKernelArg(k, 2, sizeof(Ca), &Ca);
+    clSetKernelArg(k, 3, sizeof(Ha), &Ha);
+    clSetKernelArg(k, 4, sizeof(Wa), &Wa);
+    return infvino::ClRuntime::enqueueND(rt.queue(), k, 3, gws, nullptr);
+  };
+  const double s1 = rt.timeMs([&] { return enqueueOne(dI[0], dO[0]); }, 3, iters);
+  // GPU-spanning time: first event's START -> last event's END (excludes host enqueue bubbles).
+  auto timeBatch = [&]() -> double {
+    auto once = [&](bool timed, double * out) {
+      cl_event first = nullptr, last = nullptr, prev = nullptr;
+      for (int i = 0; i < nseq; ++i)
+      {
+        cl_event e = enqueueOne(sharedIn ? dI[0] : dI[i], sharedOut ? dO[0] : dO[i]);
+        if (i == 0) first = e;
+        else if (prev && prev != first) clReleaseEvent(prev);
+        prev = e;
+        last = e;
+      }
+      clWaitForEvents(1, &last);
+      if (timed)
+      {
+        cl_ulong t0 = 0, t1 = 0;
+        clGetEventProfilingInfo(first, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr);
+        clGetEventProfilingInfo(last, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, nullptr);
+        *out = static_cast<double>(t1 - t0) * 1e-6;
+      }
+      if (last != first) clReleaseEvent(last);
+      clReleaseEvent(first);
+    };
+    for (int w = 0; w < 3; ++w) once(false, nullptr);
+    std::vector<double> ts;
+    for (int it = 0; it < iters; ++it) { double v = 0.0; once(true, &v); ts.push_back(v); }
+    std::sort(ts.begin(), ts.end());
+    return ts[ts.size() / 2];
+  };
+  const double stot = timeBatch();
+  const double bytes = 2.0 * (ne + oe) * 2.0;
+  std::printf("  reorder_seq  Cin=%-4d %dx%d n=%-3d in=%s out=%s  bytes/pass=%.2f MB\n", C, H, W, nseq,
+              sharedIn ? "shared" : "distinct", sharedOut ? "shared" : "distinct", bytes / 1e6);
+  std::printf("    single=%8.4f ms  total=%8.4f ms  per=%8.4f ms  additivity(N x single)=%.3f\n",
+              s1, stot, stot / nseq, s1 > 0 ? (stot / nseq) / s1 : 0.0);
+  for (cl_mem m : dI) clReleaseMemObject(m);
+  for (cl_mem m : dO) clReleaseMemObject(m);
+  clReleaseKernel(k);
+  return 0;
+}
+
 // Specialized 1x1 conv (pointwise) kernel: fused bias + activation.
 int benchConv1x1(infvino::ClRuntime & rt, const infvino::Conv1x1Cfg & c, const ConvShape & s, int iters, bool verify)
 {
@@ -1559,6 +1630,86 @@ int benchL3Pollute(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hite
   return 0;
 }
 
+// R60: retention sweep — self-calibration infrastructure for the L3 replacement model.
+// Machine-readable CSV: iters,R_A_MB,hot_ms,hot_gbps,retained (retained = ref_ms/hot_ms).
+// Sweeps the *reuse count* (hot_iters) too, so a fitter can tell whether heavily-reused
+// data resists streaming pollution (pLRU/NRU-like) or not (strict LRU).
+int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
+                  const std::vector<int> & iters_list, const std::vector<int> & agg_wi,
+                  const std::vector<int> & agg_fp, int fi)
+{
+  const int maxWi = 8192, maxFp = 256;
+  const size_t hn = static_cast<size_t>(hot_lines) * 16 + 16;
+  const size_t an = static_cast<size_t>(maxWi) * maxFp * 16;
+  cl_mem hot = rt.alloc(hn * 4, CL_MEM_READ_ONLY);
+  cl_mem agg = rt.alloc(an * 4, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(hn, 1); rt.write(hot, hn * 4, z.data()); }
+  { std::vector<uint32_t> z(an, 1); rt.write(agg, an * 4, z.data()); }
+  cl_kernel khot = rt.buildKernel("micro", "l3_hot_read", "-cl-mad-enable");
+  cl_kernel kagg = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
+  const size_t lws = 64;
+  const uint hl = static_cast<uint>(hot_lines), one = 1u;
+  clSetKernelArg(khot, 0, sizeof(hot), &hot);
+  clSetKernelArg(khot, 1, sizeof(sink), &sink);
+  clSetKernelArg(khot, 2, sizeof(hl), &hl);
+  const size_t hotGws = static_cast<size_t>(hot_gws);
+  std::printf("# l3retain hot=%d lines (%d KB) hot_gws=%d  (self-calibration; no vendor docs)\n",
+              hot_lines, hot_lines * 64 / 1024, hot_gws);
+  std::printf("iters,R_A_MB,hot_ms,hot_gbps,retained\n");
+  for (int hi : iters_list)
+  {
+    if (hi <= 0) continue;
+    const uint hiu = static_cast<uint>(hi);
+    clSetKernelArg(khot, 3, sizeof(hiu), &hiu);
+    const double hotBytes = static_cast<double>(hot_lines) * hi * 64.0;
+    auto measure = [&](int agws, int afp) -> double {
+      auto closure = [&]() -> cl_event {
+        cl_event aev = nullptr;
+        if (agws > 0)
+        {
+          const uint af = static_cast<uint>(afp);
+          clSetKernelArg(kagg, 0, sizeof(agg), &agg);
+          clSetKernelArg(kagg, 1, sizeof(sink), &sink);
+          clSetKernelArg(kagg, 2, sizeof(af), &af);
+          clSetKernelArg(kagg, 3, sizeof(one), &one);
+          size_t ag = static_cast<size_t>(agws);
+          aev = infvino::ClRuntime::enqueueND(rt.queue(), kagg, 1, &ag, &lws);
+        }
+        cl_event hev = infvino::ClRuntime::enqueueND(rt.queue(), khot, 1, &hotGws, &lws);
+        if (aev) clReleaseEvent(aev);
+        return hev;
+      };
+      try { return rt.timeMs(closure, 2, fi); } catch (const std::exception &) { return 0.0; }
+    };
+    (void)measure(1024, 4);                        // discard first (cold)
+    const double base = measure(4096, 4);          // ref: R_A = 1 MB (no pollution)
+    const double baseGbs = base > 0 ? hotBytes / (base * 1e-3) / 1e9 : 0.0;
+    std::printf("%d,1.05,%.6f,%.2f,1.000\n", hi, base, baseGbs);
+    struct Row { double R; int wi, fp; double ms; };
+    std::vector<Row> rows;
+    for (int wi : agg_wi)
+      for (int fp : agg_fp)
+      {
+        if (wi <= 0 || wi > maxWi || fp <= 0 || fp > maxFp) continue;
+        rows.push_back({static_cast<double>(wi) * fp * 64.0, wi, fp, measure(wi, fp)});
+      }
+    std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) { return a.R < b.R; });
+    for (const auto & r : rows)
+    {
+      const double gbs = r.ms > 0 ? hotBytes / (r.ms * 1e-3) / 1e9 : 0.0;
+      std::printf("%d,%.2f,%.6f,%.2f,%.3f\n", hi, r.R / 1e6, r.ms, gbs,
+                  base > 0 && r.ms > 0 ? base / r.ms : 0.0);
+    }
+  }
+  clReleaseMemObject(hot);
+  clReleaseMemObject(agg);
+  clReleaseMemObject(sink);
+  clReleaseKernel(khot);
+  clReleaseKernel(kagg);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -1581,6 +1732,8 @@ int main(int argc, char ** argv)
   std::vector<int> wi_list, fp_list;
   int passes = 32;
   int hot_lines = 16384, hot_gws = 4096, hot_iters = 1;
+  int nseq = 8, seq_mode = 0;
+  std::vector<int> hot_iters_list;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -1643,6 +1796,12 @@ int main(int argc, char ** argv)
       hot_gws = std::atoi(next().c_str());
     } else if (a == "--hot-iters") {
       hot_iters = std::atoi(next().c_str());
+    } else if (a == "--hot-sweep") {
+      hot_iters_list = parseInts(next());
+    } else if (a == "--nseq") {
+      nseq = std::atoi(next().c_str());
+    } else if (a == "--seq-mode") {
+      seq_mode = std::atoi(next().c_str());
     } else if (a == "--slm-kb") {
       slm_kb = std::atoi(next().c_str());
     } else if (a == "--mode") {
@@ -1704,6 +1863,11 @@ int main(int argc, char ** argv)
       conv_shapes = {{64, 0, 82, 82, "80s1_64"}, {16, 0, 162, 162, "160s1_16"},
                      {16, 0, 322, 322, "160s2_16"}, {3, 0, 322, 322, "stem"}};
     for (const auto & s : conv_shapes) rc |= benchReorder(rt, s, iters);
+  } else if (op == "reorder_seq") {
+    std::printf("[reorder_seq] additivity probe (--nseq N --seq-mode 0|cold 1|hot)\n");
+    if (conv_shapes.empty())
+      conv_shapes = {{64, 0, 82, 82, "80s1_64"}, {16, 0, 162, 162, "160s1_16"}};
+    for (const auto & s : conv_shapes) rc |= benchReorderSeq(rt, s, nseq, seq_mode, iters);
   } else if (op == "conv3x3" || op == "conv3x3rt" || op == "conv3x3osv" || op == "conv3x3sg" || op == "conv3x3db" || op == "conv3x3ov" || op == "conv3x3blk") {
     if (op == "conv3x3rt") conv.RT = 1;
     if (op == "conv3x3osv") conv.OSV = 1;
@@ -1761,6 +1925,11 @@ int main(int argc, char ** argv)
     if (wi_list.empty()) wi_list = {1024, 2048, 4096, 8192};
     if (fp_list.empty()) fp_list = {1, 2, 4, 8, 16, 32};
     rc = benchL3Pollute(rt, hot_lines, hot_gws, hot_iters, wi_list, fp_list, 5);
+  } else if (op == "l3retain") {
+    if (hot_iters_list.empty()) hot_iters_list = {1, 4, 16};
+    if (wi_list.empty()) wi_list = {1024, 2048, 4096, 8192};
+    if (fp_list.empty()) fp_list = {4, 8, 16, 24, 32, 48};
+    rc = benchL3Retain(rt, hot_lines, hot_gws, hot_iters_list, wi_list, fp_list, 5);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

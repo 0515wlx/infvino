@@ -194,6 +194,31 @@ double l3DefaultAnchorBytes();
 double l3DramBwGbps();
 double l3SramBwGbps();
 
+/**
+ * @brief R60: reorder（bfyx↔fsv16 等布局搬运）的**精确可加**成本模型。
+ *
+ * 把实测的单趟 `#reorder` 拆成两个**逐张量、可加**的项：
+ *   `reorder_ms = launch_floor + (read_bytes + write_bytes) / BW(state)`
+ * 其中 `launch_floor` 是一次 dispatch 的固定开销，`BW(state)` 取决于输入是否已在 L3：
+ *   * 输入已在 L3（`input_resident=true`）→ 用 `l3SramBwGbps()` 档；
+ *   * 输入需从 DRAM 取（默认）→ 用 `kReorderStreamBwGbps` 档（≈ 实测单趟 GB/s）。
+ *
+ * 这样「多趟 reorder」的合计不再是「张量数 × 单趟冷读价」，而是按各自状态求和——
+ * 可加性由此恢复（`kernel_bench --op reorder_seq` 实测验证，见 docs/round60-*）。
+ * 常数由本机 `kernel_bench --op reorder` 自行标定（非任何厂商内部文档）。
+ */
+extern const double kReorderLaunchMs;      ///< 一次 reorder dispatch 的 launch floor（ms）
+extern const double kReorderStreamBwGbps;  ///< 冷输入流式搬运带宽（GB/s，实测）
+/**
+ * @brief R60: 顺序 dispatch 之间的**逐次间隔**（ms），由 `kernel_bench --op reorder_seq` 实测。
+ *
+ * 事件计时的单趟 `#reorder.ms` 不含「前一个 kernel 结束→下一个开始」的硬件间隔；把 N 趟
+ * 相加会系统性少算 `N × kReorderDispatchGapMs`。锁频下实测：全热（共享输入+输出）N=16 的
+ * 每次成本比单趟高 ~12.4 µs，即该间隔。它给出「多趟 reorder 为什么不可加」的第一项。
+ */
+extern const double kReorderDispatchGapMs;
+double reorderCostMs(double read_bytes, double write_bytes, bool input_resident);
+
 /** @brief 理论峰值 ops/EU/cyc（FP16 packed = 32）。*/
 constexpr double kPeakOpsPerEuCycle = 32.0;
 /** @brief 纯寄存器 FP16 FMA 的结构上限（R13/R18）。*/

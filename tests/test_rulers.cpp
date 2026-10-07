@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "infvino/KernelFamily.hpp"
+#include "infvino/L3Model.hpp"
 #include "infvino/Tuning.hpp"
 #include "test_util.hpp"
 
@@ -197,6 +198,27 @@ static void run_tests()
     CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R59: legacy anchor = 1 MB");
     unsetenv("INFVINO_L3_LEGACY");
     CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R59: back to calibrated after unset");
+  }
+
+  // --- R60: reorder 可加成本 = launch floor + 传输/BW(state) + L3 策略解析 ---
+  {
+    CHECK_NEAR(reorderCostMs(0.0, 0.0, false), kReorderLaunchMs, 1e-12,
+               "R60: reorder cost = launch floor at zero bytes");
+    const double cold = reorderCostMs(2.0e6, 2.0e6, false);
+    const double hot = reorderCostMs(2.0e6, 2.0e6, true);
+    CHECK(cold > hot, "R60: L3-resident input is cheaper than cold input");
+    CHECK_NEAR(cold, kReorderLaunchMs + 4.0e6 / (kReorderStreamBwGbps * 1e6), 1e-12,
+               "R60: cold path = floor + bytes/BW_stream");
+    CHECK(reorderCostMs(4.0e6, 4.0e6, false) > cold, "R60: reorder monotone in bytes");
+    CHECK(kReorderStreamBwGbps > l3DramBwGbps(), "R60: reorder stream BW above DRAM platform");
+    CHECK(kReorderDispatchGapMs > kReorderLaunchMs, "R60: measured inter-dispatch gap > single launch floor");
+    // 策略解析：默认严格 LRU；INFVINO_L3_POLICY=nru 选 NRU 等价模型。
+    unsetenv("INFVINO_L3_POLICY");
+    CHECK(l3DefaultPolicy() == L3Policy::LRU, "R60: default L3 policy is strict LRU");
+    setenv("INFVINO_L3_POLICY", "nru", 1);
+    CHECK(l3DefaultPolicy() == L3Policy::NRU, "R60: INFVINO_L3_POLICY=nru selects NRU");
+    unsetenv("INFVINO_L3_POLICY");
+    CHECK(l3DefaultPolicy() == L3Policy::LRU, "R60: back to LRU after unset");
   }
 
   // --- R55: occupancyThreads 与 occupancyPressure 同源 ---

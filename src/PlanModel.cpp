@@ -1443,6 +1443,7 @@ double PlanModel::layoutModelScore() const { return layoutModelBreakdown().total
 PlanModel::LayoutScore PlanModel::layoutModelBreakdown() const
 {
   LayoutScore sc;
+  int reorderCalls = 0;
   for (size_t i = 0; i < nodes_.size(); ++i)
   {
     bool ok = false;
@@ -1457,8 +1458,15 @@ PlanModel::LayoutScore PlanModel::layoutModelBreakdown() const
     auto it = T_.find(n.ins[inIdx]);
     if (it == T_.end() || it->second.fsv16) continue;
     if (const TuningEntry * r = tuning_.lookup(OpSignature::custom(s.str() + "#reorder", {})))
+    {
       sc.reorder += r->ms;
+      ++reorderCalls;
+    }
   }
+  // R60: 整网把 N 趟 reorder 相加会少算 N×dispatch 间隙（实测 ~12.4 µs/次）。默认关，
+  // `INFVINO_LAYOUT_REORDER_GAP=1` 开启做 A/B——把「不可加」的第一项显式补回评分。
+  if (reorderCalls > 0 && std::getenv("INFVINO_LAYOUT_REORDER_GAP"))
+    sc.reorder += static_cast<double>(reorderCalls) * kReorderDispatchGapMs;
   L3ModelConfig cfg;
   cfg.compute_prices = false;
   sc.spill = evaluateL3(buildL3Access(), cfg).spill_ms;
@@ -1978,8 +1986,33 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutPr
   // 不再因为缺 `#reorder` 条目就把 reorder 当免费——那会系统性偏向「过度持久化」（R49 缺口 A）。
   // 这与 OV `reorder_inputs` 的两级目标一致：一级 = reorder 条数（固定 launch floor），
   // 二级 = 搬运元素量。有实测 `#reorder` 时以实测为准；可用 INFVINO_LAYOUT_REORDER_W 缩放。
-  const double kReorderFixedMs = 0.0035;     // ≈ 一次 dispatch 的 launch floor
-  const double kReorderMsPerElem = 6.7e-8;   // ≈ 60 GB/s，fp16 读+写 4 B/elem
+  // R60：结构性兜底升级为**状态感知的可加模型** `reorderCostMs`——输入若仍在 L3（生产者到
+  // 消费者之间的中间足迹 < 私有容量膝点）走 L3 档，否则走实测流式档。这样多趟 reorder 的
+  // 合计按各自状态相加，恢复可加性（`kernel_bench --op reorder_seq` 实测验证）。
+  const bool reorderState = std::getenv("INFVINO_NO_REORDER_STATE") == nullptr;
+  std::vector<double>              fluxPrefix;
+  std::unordered_map<std::string, size_t> producedBy;
+  if (reorderState)
+  {
+    const std::vector<L3Access> acc = buildL3Access();
+    fluxPrefix.assign(acc.size() + 1, 0.0);
+    for (size_t k = 0; k < acc.size(); ++k)
+    {
+      double b = 0.0;
+      for (const auto & r : acc[k].reads) b += r.second;
+      for (const auto & w : acc[k].writes) b += w.second;
+      fluxPrefix[k + 1] = fluxPrefix[k] + b;
+      for (const auto & w : acc[k].writes) producedBy[w.first] = k;
+    }
+  }
+  auto inputResident = [&](size_t ni) -> bool {
+    if (!reorderState) return false;
+    const std::string & tname = nodes_[ni].ins[static_cast<size_t>(actSlot(ni))];
+    auto pit = producedBy.find(tname);
+    if (pit == producedBy.end() || pit->second >= ni) return false;
+    const double drain = fluxPrefix[ni] - fluxPrefix[pit->second + 1];  // 中间的读写字节
+    return drain <= l3PrivateCapBytes();
+  };
   const double reorderW =
       std::getenv("INFVINO_LAYOUT_REORDER_W") ? std::atof(std::getenv("INFVINO_LAYOUT_REORDER_W")) : 1.0;
   auto reorderCost = [&](size_t ni) -> double {
@@ -1990,7 +2023,7 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutPr
       const std::string & tname = nodes_[ni].ins[static_cast<size_t>(actSlot(ni))];
       auto it = T_.find(tname);
       const double numel = static_cast<double>(it != T_.end() ? it->second.numel() : 0);
-      r = kReorderFixedMs + kReorderMsPerElem * numel;
+      r = reorderCostMs(numel * 2.0, numel * 2.0, inputResident(ni));
     }
     return r * reorderW;
   };

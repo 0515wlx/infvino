@@ -11,6 +11,7 @@
 //
 // 纯 CPU、不需要 GPU。
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include "infvino/L3Model.hpp"
@@ -133,6 +134,124 @@ static void run_tests()
     const L3Result b = evaluateL3(n, cfg);
     CHECK_NEAR(a.spill_bytes, b.spill_bytes, 1e-9, "evaluateL3 deterministic");
     CHECK_NEAR(a.node_price_ms[0], b.node_price_ms[0], 1e-12, "prices deterministic");
+  }
+
+  // ================= R60: 精确 spill（复用/栈距离模型）=================
+
+  // --- 栈距离 CDF 与「常数容量有限 LRU 模拟」逐位一致 ---
+  {
+    auto buildSeq = []() {
+      std::vector<L3Access> n;
+      const double sz[8] = {0.5, 0.3, 0.9, 0.7, 1.1, 0.4, 0.8, 0.6};
+      const char * nm[8] = {"a", "b", "c", "d", "e", "f", "g", "h"};
+      unsigned seed = 12345u;
+      auto rnd = [&]() { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7fffu; };
+      for (int step = 0; step < 60; ++step)
+      {
+        L3Access a;
+        a.op = "n" + std::to_string(step);
+        const int t = static_cast<int>(rnd() % 8), u = static_cast<int>(rnd() % 8);
+        if (rnd() % 2)
+          a.writes.push_back({nm[t], sz[t] * MB});
+        else
+          a.reads.push_back({nm[t], sz[t] * MB});
+        if (u != t) a.reads.push_back({nm[u], sz[u] * MB});
+        n.push_back(std::move(a));
+      }
+      return n;
+    };
+    const std::vector<L3Access> seq = buildSeq();
+    bool allEq = true;
+    for (double C : {0.5, 1.0, 2.0, 3.75, 8.0})
+    {
+      L3ModelConfig cc;
+      cc.l3_bytes = C * MB;
+      cc.eff_cap_anchor = C * MB;
+      cc.occ_cap_slope = 0.0;
+      cc.compute_prices = false;
+      const double fin = evaluateL3(seq, cc).spill_bytes;
+      const double cdf = spillAtCapacity(seq, C * MB, L3Policy::LRU);
+      if (std::abs(fin - cdf) > 1e-6) allEq = false;
+    }
+    CHECK(allEq, "R60: stack-distance CDF == constant-capacity finite LRU spill");
+
+    // 复用/栈距离分解：非冷访问 d_t == I_other + bytes；冷访问 d_t == ∞。
+    const L3StackProfile prof = profileL3Stack(seq, L3ModelConfig{});
+    bool decomp = true;
+    int colds = 0;
+    for (const auto & t : prof.touches)
+    {
+      if (t.cold) { ++colds; if (!std::isinf(t.stack_dist)) decomp = false; }
+      else if (std::abs(t.stack_dist - (t.reuse_bytes + t.bytes)) > 1e-9) decomp = false;
+    }
+    CHECK(decomp, "R60: stack_dist == interference + own bytes (Delta_local + I_other)");
+    CHECK(colds > 0, "R60: cold accesses are flagged");
+    CHECK_NEAR(prof.spill_bytes, evaluateL3(seq, L3ModelConfig{}).spill_bytes, 1e-9,
+               "R60: profile spill == evaluateL3 spill");
+  }
+
+  // --- 精确逐出归因：唯一 aggressor 承担全部（干扰）价，Σ价 ≤ spill；冷读不记价 ---
+  {
+    std::vector<L3Access> n;
+    n.push_back(acc("p", 0.0));
+    n.back().writes.push_back({"t", 0.5 * MB});
+    n.push_back(acc("aggressor", 8.0 * MB));
+    n.back().writes.push_back({"u", 0.7 * MB});
+    n.push_back(acc("c", 0.0));
+    n.back().reads.push_back({"t", 0.5 * MB});
+    const L3Result r = evaluateL3(n, cfg);
+    CHECK(r.node_evict_ms.size() == 3, "R60: evict prices sized to node count");
+    CHECK(r.node_evict_ms[0] == 0.0 && r.node_evict_ms[2] == 0.0,
+          "R60: non-evictors have zero evict price");
+    CHECK_NEAR(r.node_evict_ms[1], 0.5 * MB * 1e-7, 1e-12,
+               "R60: sole evictor carries the whole interference price");
+    double sum = 0.0;
+    for (double v : r.node_evict_ms) sum += v;
+    CHECK(sum <= r.spill_ms + 1e-12, "R60: evict blame <= total spill");
+
+    std::vector<L3Access> c;
+    c.push_back(acc("r", 0.0));
+    c.back().reads.push_back({"in", 2.0 * MB});
+    const L3Result rc = evaluateL3(c, cfg);
+    double csum = 0.0;
+    for (double v : rc.node_evict_ms) csum += v;
+    CHECK_NEAR(csum, 0.0, 1e-12, "R60: cold read is not blamed on any node");
+  }
+
+  // --- NRU 等价工程模型：evict-first 插入保护反复重用的热点（抗流式污染）---
+  {
+    std::vector<L3Access> n;
+    n.push_back(acc("p", 0.0));
+    n.back().writes.push_back({"hot", 0.5 * MB});
+    n.push_back(acc("rd", 0.0));
+    n.back().reads.push_back({"hot", 0.5 * MB});   // 预热：命中 → 转为受保护
+    for (int round = 0; round < 6; ++round)
+    {
+      for (int k = 0; k < 4; ++k)
+      {
+        L3Access s;
+        s.op = "s";
+        s.writes.push_back({"s" + std::to_string(round) + "_" + std::to_string(k), 0.5 * MB});
+        n.push_back(std::move(s));
+      }
+      L3Access rd;
+      rd.op = "rd";
+      rd.reads.push_back({"hot", 0.5 * MB});
+      n.push_back(std::move(rd));
+    }
+    L3ModelConfig base;
+    base.l3_bytes = 1.0 * MB;
+    base.eff_cap_anchor = 1.0 * MB;
+    base.occ_cap_slope = 0.0;
+    base.compute_prices = false;
+    L3ModelConfig lru = base;
+    lru.policy = L3Policy::LRU;
+    L3ModelConfig nru = base;
+    nru.policy = L3Policy::NRU;
+    const double sl = evaluateL3(n, lru).spill_bytes;
+    const double sn = evaluateL3(n, nru).spill_bytes;
+    CHECK(sl > 0.0, "R60: strict LRU evicts the hot tensor under streaming pressure");
+    CHECK(sn < sl, "R60: NRU (evict-first insert) protects the reused hot tensor");
   }
 }
 

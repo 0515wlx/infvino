@@ -70,3 +70,33 @@ library is linked or required at build or run time — only source code was adap
       to these kernel files; attribution is provided here and in the file headers).
 - [x] No OpenVINO code is linked as a library, so there is no binary redistribution
       obligation beyond the source attribution above.
+
+---
+
+## L3 replacement model (equivalent, self-calibrated) — not third-party code
+
+infvino's cost model contains an **L3 cache replacement model** (`include/infvino/L3Model.hpp`,
+`src/L3Model.cpp`, `L3Policy`) and a **calibration harness**
+(`kernel_bench --op l3retain` / `--op reorder_seq`, `scripts/l3_calibrate.py`,
+`config/l3_calibration.json`).
+
+**Provenance and scope**
+
+- The model is an **independent, behaviour-equivalent engineering model** used only to rank
+  kernel/layout candidates in the compiler. It is **not** a reproduction of, and makes no claim
+  about, the tag RAM, way-selection logic, replacement-bit layout, or any other internal detail
+  of a specific vendor's microarchitecture.
+- It was derived **solely** from measurements taken by infvino's own microbenchmarks running on
+  the target device. Data collection and fitting are reproducible via the scripts above; the
+  emitted `config/l3_calibration.json` records this (`"vendor_documents_used": false`).
+- No vendor **internal, confidential, or non-public** documentation, register specification, or
+  source was read, used, or relied upon. The only external input is public, openly published
+  material: the *Tiger Lake Open Source PRM* (which states the GFX L3 is banked with a
+  64 B line and a 1-bit LRU-style replacement bit — used here only as a sanity cross-check that
+  the measured behaviour is a pseudo-LRU, **not** as an implementation source).
+- The default policy is **strict LRU**; the pseudo-LRU-equivalent (`NRU`) policy and the reorder
+  dispatch-gap term are opt-in and do not change default results. See
+  [`docs/round60-l3-exact-spill-plru-and-reorder.md`](docs/round60-l3-exact-spill-plru-and-reorder.md).
+
+No third-party license applies to this model; this section exists to document that it is
+original work derived from self-collected measurements.
