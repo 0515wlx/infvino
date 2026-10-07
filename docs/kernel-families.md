@@ -384,6 +384,27 @@ yolo11n-pose      14.152 -> 14.182 ms（噪声内）
 
 ---
 
+## 16. R69：访存几何契约（候选/内核 ↔ L3 spill 的最后一处硬编码）
+
+注册表此前是「候选 / 布局契约 / 上限」的单一真相源，唯独**占用/访存几何**还散在
+`Tuning.cpp::occupancyStats` 的 op 判据里（R48 §10.6-B）。R69 把它声明化：
+
+```cpp
+struct MemContract { bool valid; double concurrent; double perWgBytes; };
+// KernelFamily:
+std::function<MemContract(const OpSignature &, const std::string & options)> mem;
+```
+
+消费方（`occupancyPressure`/`occupancyThreads`、`PlanModel::buildL3Access`）**注册表优先**，
+未声明（小算子/未知）回退 legacy。加新族 = 加一条 `mem` 声明，spill 模型自动可见
+（`INFVINO_LEGACY_OCCUPANCY=1` 整份回退、`INFVINO_NO_MEM=<family>` 逐族消融）。
+
+实测：三模型**选择逐位不变**、`model_check`/`reuse_check` PASS 且 `mean_rel` 与 R68 逐位相同，
+仅诊断 spill 数值更完整（y8/y11 +0.328 ms）。详见
+[`round69-occupancy-contract-and-spill-interface.md`](round69-occupancy-contract-and-spill-interface.md)。
+
+---
+
 ## 11. 复现
 
 ```bash

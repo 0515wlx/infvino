@@ -72,6 +72,56 @@ Candidate mk(const char * kernel, const char * source, const std::string & optio
   return c;
 }
 
+// ============================================================================
+// R69: 访存几何（候选侧 → L3 溢出模拟的接口，见 Tuning.hpp `MemContract`）。
+//
+// 约定（与 R47/R55 的 occupancyPressure 口径一致）：
+//   concurrent  = 该候选的**总 work-item 数**（原始值；消费方按 8192 夹取）；
+//   perWgBytes  = 一个 work-**group** 触达的**输入激活**字节（权重/常量常驻不计、输出不计）。
+// 二者乘积 = 在飞占用压力 R。此前这些几何散在 `Tuning.cpp::occupancyStats` 的 op 判据里，
+// conv3x3 的四个 kernel、split-K、GEMV、非 blk depthwise 都落进了错误的判据（R48 §10.6-B）。
+// ============================================================================
+int optInt(const std::string & o, const char * key, int dflt)
+{
+  return tuningOptionInt(o, key, dflt);
+}
+
+long ceilDiv(long a, long b) { return b > 0 ? (a + b - 1) / b : 0; }
+
+MemContract memContract(double concurrent, double perWgBytes)
+{
+  MemContract m;
+  m.valid = true;
+  m.concurrent = concurrent;
+  m.perWgBytes = perWgBytes;
+  return m;
+}
+
+// GEMM 谱（gemm_f16 / gemm_cat4_f16 共用）：WG = (BM/TM)×(BN/TN)，staging 窗口 = 2·BK·(BM+BN)。
+MemContract gemmMem(const OpSignature & s, const std::string & o)
+{
+  const int M = (s.op == "gemm") ? s.M : s.Cout;
+  const int N = s.N;
+  const int bm = std::max(1, optInt(o, "-DBM=", 64));
+  const int bn = std::max(1, optInt(o, "-DBN=", 64));
+  const int bk = std::max(1, optInt(o, "-DBK=", 16));
+  const int tm = std::max(1, optInt(o, "-DTM=", 8));
+  const int tn = std::max(1, optInt(o, "-DTN=", 4));
+  const long nwg = ceilDiv(M, bm) * ceilDiv(N, bn);
+  const double threads = static_cast<double>(nwg) * (bm / tm) * (bn / tn);
+  return memContract(threads, 2.0 * bk * (bm + bn));
+}
+
+// depthwise（非 blk）：`conv_general` 1-D 网格，每个 WI 处理一个输出像素（DW_TW 个时处理一段）。
+MemContract dwGeneralMem(const OpSignature & s, const std::string & o)
+{
+  const int tw = std::max(1, optInt(o, "-DDW_TW=", 1));
+  const long nwg = ceilDiv(s.W, tw) * std::max(1L, static_cast<long>(s.H)) * std::max(1L, static_cast<long>(s.Cin));
+  const double strip = (tw - 1) * s.stride + s.K;   // DW_STRLEN
+  const double tile = 2.0 * strip * s.K;            // K 个输入行（每行 strip 个元素）
+  return memContract(static_cast<double>(nwg), tile);
+}
+
 // GEMM 族的**单一**候选配置谱（gemm_f16 / gemm_cat4_f16 共用，避免两处漂移）。
 // `cat4=true` 时编译 `-DCAT4=1`：B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量
 // （见 kernels/gemm.cl 与 PlanModel::fuseConcatConv1x1），从而让 concat4→conv1x1 融合
@@ -284,6 +334,16 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_ov";
       f.layout = {Layout::NCHW, Layout::NCHW, false, true};
       f.bottleneck = Bottleneck::Fma;
+      // R69: osv32 子组拥有 32 个输出通道（2/lane），通道块 = ceil(Cout/32)（R39 修正）；
+      // perWg = 输入 halo（(OBW-1)S+3 × (OBH-1)S+3 × Cin）。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int obw = optInt(o, "-DOBW=", s.stride == 2 ? 5 : 8);
+        const int obh = optInt(o, "-DOBH=", s.stride == 2 ? 4 : 2);
+        const int slm = std::max(1, optInt(o, "-DSLM_DIV=", 1));
+        const long nwg = ceilDiv(s.W, obw) * ceilDiv(s.H, obh) * ceilDiv(s.Cout, 32);
+        const double tile = 2.0 * s.Cin * ((obw - 1) * s.stride + 3) * ((obh - 1) * s.stride + 3);
+        return memContract(static_cast<double>(nwg) * 16.0 * slm, tile);
+      };
       f.supports = [](const OpSignature & s) { return s.op == "conv3x3" && s.Cin > 0; };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
@@ -342,6 +402,14 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_cin3";
       f.layout = {Layout::NCHW, Layout::NCHW, false, true};
       f.bottleneck = Bottleneck::Fma;
+      // R69: reqd_work_group_size(WGS=128,1,1)；每个 WI 对所有 Cout 输出一个像素，读 3×3×Cin。
+      // 一个 WG 覆盖约 (WGS+2) 列 × 3 行的输入带。
+      f.mem = [](const OpSignature & s, const std::string &) {
+        const int wgs = 128;
+        const long nwg = ceilDiv(s.W, wgs) * std::max(1L, static_cast<long>(s.H));
+        const double tile = 2.0 * s.Cin * 3.0 * (wgs + 2.0);
+        return memContract(static_cast<double>(nwg) * wgs, tile);
+      };
       f.supports = [](const OpSignature & s) {
         return s.op == "conv3x3" && s.Cin > 0 && s.Cin <= 4 && s.Cout > 0 && s.Cout % 2 == 0;
       };
@@ -367,6 +435,15 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_blk";
       f.layout = {Layout::FSV16, Layout::NCHW, true, true};
       f.bottleneck = Bottleneck::Fma;
+      // R69: 一个 WG 出一行输出（gws[0]=ceil(W/OBW)·H），通道块 ceil(Cout/16)；
+      // perWg = 一行为 (OBW-1)S+3 个元素的输入带。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int obw = optInt(o, "-DOBW=", 8);
+        const int slm = std::max(1, optInt(o, "-DSLM_DIV=", 1));
+        const long nwg = ceilDiv(s.W, obw) * std::max(1L, static_cast<long>(s.H)) * ceilDiv(s.Cout, 16);
+        const double tile = 2.0 * s.Cin * ((obw - 1) * s.stride + 3);
+        return memContract(static_cast<double>(nwg) * 16.0 * slm, tile);
+      };
       f.supports = [](const OpSignature & s) { return s.op == "conv3x3" && s.Cin > 0; };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
@@ -412,6 +489,19 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.bottleneck = Bottleneck::Fma;
+      // R69: WG = (TX/TM)×TY；每个 WG 覆盖 TX×TY 输出块、CB 个输出通道；通道块 ceil(Cout/CB)；
+      // perWg = 输入 halo（IN_ROWS×IN_COLS×Cin）。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int tx = std::max(1, optInt(o, "-DTX=", 40));
+        const int ty = std::max(1, optInt(o, "-DTY=", 8));
+        const int tm = std::max(1, optInt(o, "-DTM=", 1));
+        const int cb = std::max(1, optInt(o, "-DCB=", 32));
+        const long nwg = ceilDiv(s.W, tx) * ceilDiv(s.H, ty) * ceilDiv(s.Cout, cb);
+        const double rows = (ty - 1) * s.stride + 3;
+        const double cols = (tx - 1) * s.stride + 3;
+        const double tile = 2.0 * s.Cin * rows * cols;
+        return memContract(static_cast<double>(nwg) * (tx / tm) * ty, tile);
+      };
       f.supports = [](const OpSignature & s) { return s.op == "conv3x3" && s.Cin > 0; };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
@@ -472,6 +562,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.layout.inIndex = 1;   // gemm 槽 0 = 权重，激活在槽 1（R48 D4）
       f.bottleneck = Bottleneck::Fma;
+      f.mem = gemmMem;        // R69: 注册表声明的访存几何
       f.supports = [](const OpSignature & s) {
         return s.op == "gemm" || (s.op == "conv1x1" && s.N > 1);
       };
@@ -487,6 +578,16 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.layout.inIndex = 1;   // 槽 0 = 权重，激活在槽 1（与 gemm_f16/conv1x1_blk 同约定）
       f.bottleneck = Bottleneck::Fma;
+      // R69: split-K 在子组 lane 内做，WG = SK_SG；gws = ceil(N/TN)·SK_SG × ceil(M/TM)；
+      // perWg = A/B 各读整个 K：2·K·(TM+TN)。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int M = s.Cout, N = s.N, K = s.Cin;
+        const int tm = std::max(1, optInt(o, "-DSK_TM=", 8));
+        const int tn = std::max(1, optInt(o, "-DSK_TN=", 4));
+        const int sg = std::max(1, optInt(o, "-DSK_SG=", 16));
+        const long nwg = ceilDiv(N, tn) * ceilDiv(M, tm);
+        return memContract(static_cast<double>(nwg) * sg, 2.0 * K * (tm + tn));
+      };
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1" && s.N > 1; };
       f.candidates = [](const OpSignature & s) {
         struct SkOpt { int TM, TN, UK; };
@@ -526,6 +627,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.layout.inIndex = 1;   // 槽 0 = 权重，激活源在槽 1..4（与 gemm_f16 同约定）
       f.bottleneck = Bottleneck::Fma;
+      f.mem = gemmMem;        // R69: 与 gemm_f16 同几何（逻辑 B 由 4 源拼接）
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1_cat4"; };
       f.candidates = [](const OpSignature & s) { return gemmSpectrum(s, true); };
       f.ceiling = [](const OpSignature & s, const ClDeviceInfo &) { return gemmCeiling(s); };
@@ -543,6 +645,12 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.layout.inIndex = 1;   // R48 D4: conv1x1 槽 0 = 权重，激活在槽 1
       f.bottleneck = Bottleneck::Latency;
+      // R69: N=1 GEMV，WG = GEMV_SG(16)；gws = ceil(Cout/GEMV_TM)·16；perWg = W(GEMV_TM 行)+X。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int gtm = std::max(1, optInt(o, "-DGEMV_TM=", 1));
+        const long nwg = ceilDiv(s.Cout, gtm);
+        return memContract(static_cast<double>(nwg) * 16.0, 2.0 * s.Cin * (gtm + 1.0));
+      };
       f.supports = [](const OpSignature & s) { return s.op == "conv1x1" && s.N == 1; };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
@@ -574,6 +682,15 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.layout = {Layout::FSV16, Layout::NCHW, true, true};
       f.layout.inIndex = 1;   // R48 D4: 槽 0 = os_is_yx_isv16_osv16 权重，激活在槽 1
       f.bottleneck = Bottleneck::Fma;
+      // R69: WG = 16·SLM_DIV；tile = XB·YB；通道块 ceil(Cout/16)；perWg = 输入 tile 字节。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int xb = std::max(1, optInt(o, "-DX_BLOCK=", 4));
+        const int yb = std::max(1, optInt(o, "-DY_BLOCK=", 1));
+        const int slm = std::max(1, optInt(o, "-DSLM_DIV=", 1));
+        const long tile = static_cast<long>(xb) * yb;
+        const long nwg = ceilDiv(s.N, tile) * ceilDiv(s.Cout, 16);
+        return memContract(static_cast<double>(nwg) * 16.0 * slm, 2.0 * s.Cin * tile);
+      };
       f.supports = [](const OpSignature & s) {
         return s.op == "conv1x1" && s.N > 1 && s.Cin >= 16;
       };
@@ -629,6 +746,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_general";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.bottleneck = Bottleneck::Instruction;
+      f.mem = [](const OpSignature & s, const std::string & o) { return dwGeneralMem(s, o); };
       f.supports = [](const OpSignature & s) { return s.op == "depthwise" && (s.K == 3 || s.K == 5); };
       f.candidates = [](const OpSignature & s) {
         std::ostringstream o;
@@ -652,6 +770,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_general";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.bottleneck = Bottleneck::Instruction;
+      f.mem = [](const OpSignature & s, const std::string & o) { return dwGeneralMem(s, o); };
       f.supports = [](const OpSignature & s) { return s.op == "depthwise" && (s.K == 3 || s.K == 5); };
       f.candidates = [](const OpSignature & s) {
         std::vector<Candidate> out;
@@ -682,6 +801,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "conv_general";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
       f.bottleneck = Bottleneck::Instruction;
+      f.mem = [](const OpSignature & s, const std::string & o) { return dwGeneralMem(s, o); };
       // R31 负结果：默认不进候选，只有 INFVINO_DW_PAD 打开时才参与。
       f.supports = [](const OpSignature & s) {
         return std::getenv("INFVINO_DW_PAD") && s.op == "depthwise" && (s.K == 3 || s.K == 5);
@@ -715,6 +835,15 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.source = "depthwise_blk";
       f.layout = {Layout::FSV16, Layout::NCHW, true, true};
       f.bottleneck = Bottleneck::Instruction;
+      // R69: WG = 16（lane=通道）；通道块 ceil(Cout/16)；perWg = 16 通道 × 列 span × 行 span。
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int xb = std::max(1, optInt(o, "-DX_BLOCK=", 8));
+        const int yb = std::max(1, optInt(o, "-DY_BLOCK=", 1));
+        const long nwg = ceilDiv(s.W, xb) * ceilDiv(s.H, yb) * ceilDiv(s.Cout, 16);
+        const double colSpan = (xb - 1) * s.stride + s.K;
+        const double rowSpan = (yb - 1) * s.stride + s.K;
+        return memContract(static_cast<double>(nwg) * 16.0, 2.0 * 16.0 * colSpan * rowSpan);
+      };
       f.supports = [](const OpSignature & s) {
         return s.op == "depthwise" && (s.K == 3 || s.K == 5);
       };

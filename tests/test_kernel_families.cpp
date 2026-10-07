@@ -187,6 +187,41 @@ static void run_tests()
     }
     CHECK(saw_blk, "conv1x1_blk present for N>1/Cin>=16");
   }
+
+  // --- R69: 访存几何契约（候选侧 → L3 spill 模拟的接口）---
+  {
+    // 每个「大算子」族（服务 conv/gemm/depthwise 的候选）都必须声明 `mem`——否则新族会
+    // 静默不进 spill 模型（R48 §10.6-B 的缺口）。小算子/gap 契约族允许不声明。
+    auto isBigOp = [](const std::string & op) {
+      return op == "conv3x3" || op == "gemm" || op == "conv1x1" || op == "conv1x1_cat4" ||
+             op == "depthwise";
+    };
+    for (const auto & f : kernelFamilies())
+    {
+      if (!f.candidates) continue;   // gap_fsv16 等无候选的纯布局契约族
+      if (!isBigOp(f.op)) continue;  // 小算子（launch/带宽受限）由流式足迹处理
+      const std::string m = "family '" + f.name + "' declares a mem contract (R69)";
+      CHECK(static_cast<bool>(f.mem), m.c_str());
+    }
+
+    const KernelFamily * ov = familyByName("conv3x3_ov");
+    CHECK(ov && ov->mem, "conv3x3_ov has mem");
+    const MemContract mc =
+        ov->mem(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 0), "-DOBW=8 -DOBH=2 -DSLM_DIV=1");
+    CHECK(mc.valid && mc.concurrent > 0.0 && mc.perWgBytes > 0.0, "conv3x3_ov mem positive");
+    // osv32 通道块 = ceil(Cout/32)（R39）：nwg = 10·40·2 = 800，WG = 16 → 12800 WI。
+    CHECK_NEAR(mc.concurrent, 12800.0, 1.0, "conv3x3_ov concurrent uses ceil(Cout/32) blocks");
+
+    const KernelFamily * f16 = familyByName("conv3x3_f16");
+    const MemContract mf = f16->mem(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 0),
+                                    "-DTX=40 -DTY=8 -DTM=1 -DCB=32");
+    // native conv3x3：nwg = 2·10·2 = 40，WG = (TX/TM)·TY = 320 → 12800 WI（旧代码按 OBW
+    // 默认只算 16，差 20×）。
+    CHECK_NEAR(mf.concurrent, 12800.0, 1.0, "conv3x3_f16 concurrent uses TX/TY geometry");
+
+    const KernelFamily * sc = familyByName("small_ew_binary");
+    CHECK(sc && !sc->mem, "small-op family has no mem contract (streamed)");
+  }
 }
 
 ITEST_MAIN("test_kernel_families")

@@ -73,6 +73,11 @@ struct KernelFamily
   int actMask = 0x3F;
   std::function<bool(const OpSignature &)> supports;
   std::function<std::vector<Candidate>(const OpSignature &)> candidates;
+  // R69: 本族候选的**占用/访存几何**（候选侧 → L3 溢出模拟的接口，见 Tuning.hpp
+  // `MemContract`）。入参 = 签名 + 命中候选的 options。未声明（null）时消费方
+  // （`occupancyPressure`/`occupancyThreads`）回退到 Tuning 的 legacy op 判据，
+  // 保证小算子与未知 kernel 行为不变。
+  std::function<MemContract(const OpSignature &, const std::string & options)> mem;
   // 软预测（"我们认为这层能到多少"）：含 amort / gridFactor / 占用等**经验 derate**。
   // 仅用于排序与相对比较，**不是物理上界**。
   std::function<double(const OpSignature &, const ClDeviceInfo &)> ceiling;

@@ -184,6 +184,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round47-full-flow-findings.md`](docs/round47-full-flow-findings.md) | **R47 三模型全流程实测**：mb −2.2%（仅布局耦合型模型有收益）、yolo ≈0；逐节点归因（收益全在 blk 族、reorder 反升）；倒查 8 项 bug/设计缺陷；判定 blocked chain 是 mb 的主矛盾、非 yolo |
 | [`docs/round47-l3-model.md`](docs/round47-l3-model.md) | **R47 把 L3/DRAM 显式建模进标尺**：锁频重测 BW-足迹曲线（膝点 3→4MB）、通用内存 roofline、conv/gemm 软 expected 取 min；内存受限层从假余量纠正为贴墙 |
 | [`docs/round48-candidate-expansion-plan.md`](docs/round48-candidate-expansion-plan.md) | **R48 系统性扩充算子候选集计划**：按物理瓶颈×契约分 6 维（输出 tiling/split-K/数据通路/布局守护/小算子融合/全核内建）+ 基础设施前置 + M0–M6 里程碑 + 风险边界 |
+| [`docs/round69-occupancy-contract-and-spill-interface.md`](docs/round69-occupancy-contract-and-spill-interface.md) | **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选几何收进注册表，`occupancyPressure`/`buildL3Access` 注册表优先；选择逐位不变、`mean_rel` 与 R68 相同 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -363,6 +364,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] **修 autotune 目标函数**（R44）：从「单节点隔离 `min(ms)`」改为「整网 busy 坐标下降回验」——保留隔离 top-K 短名单，在真实 plan 上逐签名回验、只有降低端到端 busy 才接受（`kernel_autotune --global`，默认关）；轻量 GPU 机制自验通过；并**分层倒查调优体系缺陷**（per-plan 选择存储缺失、`choiceEntry` 接入不统一、数值契约未进缓存 ABI、候选静默跳过、内存族 ceiling 偏低等）（`docs/round44-global-objective.md`）
 - [x] **R45 P0–P2**：`choiceEntry` 统一所有可调族；**per-plan 选择覆盖**（`<plan>.tuning.json`，两级缓存让位置相关全局最优不被跨模型覆盖）；kernel 源指纹守卫（`INFVINO_TUNING_STRICT` 可强制作废）；候选跳过率/离散度告警；隔离 top-K 复测、整网短名单 = **top-K ∪ 每族代表**（隔离 top-K 可能整体漏掉某族）、噪声地板、`--global-budget`；`autotune.py --global --lock` 安全驱动（`docs/round45-perplan-and-search.md`）
 - [x] **R46 整网调优全流程实测**：跑通三模型（锁频/分批/无 HANG），暴露并修复 3 个基础设施 bug（`--global` 在有条目缓存时空操作 + `--retune` 分批不推进、P0#6 漏掉 N==1 GEMV、缺最终验收门）；加门后 mb 回归 +5.8%→−0.2%、y8 +0.5%（均噪声内），但**暂无可靠正收益**；实证 in-situ `min` 与稳态口径错配（同改动 in-situ −3~5% vs 稳态 +12%）；给出 **blocked chain 前置条件**（`docs/round46-global-flow-findings.md`）
+- [x] **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选占用几何收进注册表（补全 conv3x3 四 kernel / gemm_sk / GEMV / 非 blk depthwise），`occupancyPressure` 与 `buildL3Access` 注册表优先（R48 §10.6-B 缺口）；三模型选择逐位不变、`model_check`/`reuse_check` PASS、`mean_rel` 与 R68 相同；`INFVINO_LEGACY_OCCUPANCY`/`INFVINO_NO_MEM` 可回退/逐族消融（`docs/round69-occupancy-contract-and-spill-interface.md`）
 - [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
 - [ ] seg / obb 解码；多 Session 并行缓冲
 - [ ] 支持更多模型（detect 系列、其他 backbone）

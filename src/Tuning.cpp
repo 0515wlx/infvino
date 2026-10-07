@@ -3,6 +3,8 @@
 // Tuning 实现：OpSignature 编码 / TuningCache 读写 / expected_ops（中间标准）。
 #include "infvino/Tuning.hpp"
 
+#include "infvino/KernelFamily.hpp"   // R69: 占用/访存几何的注册表单一真相源
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -486,17 +488,38 @@ double reorderCostMs(double read_bytes, double write_bytes, bool input_resident)
   return kReorderLaunchMs + (bw > 0.0 ? total / (bw * 1e6) : 0.0);
 }
 
+// R69: 公开的 option 解析（族访存几何回调与 legacy 判据共用，避免两处漂移）。
+int tuningOptionInt(const std::string & options, const std::string & key, int dflt)
+{
+  const auto p = options.find(key);
+  if (p == std::string::npos) return dflt;
+  return std::atoi(options.c_str() + p + key.size());
+}
+
 namespace
 {
 // R55: 占用统计的**单一真相源**（occupancyPressure / occupancyThreads 共用）。
 // 出参 concurrent = min(总线程数, 8192)、perWg = 每 WG 触达字节；返回 false = 该 op 不计占用。
+// R69: **注册表优先**——按候选 kernel 名反查族，若该族声明了 `mem` 就用其访存几何
+// （`MemContract`）；否则回退到下面的 legacy op 判据（小算子/未知 kernel）。
 bool occupancyStats(const TuningEntry & e, const OpSignature & s, double & concurrent, double & perWg)
 {
+  if (!std::getenv("INFVINO_LEGACY_OCCUPANCY"))
+  {
+    const char * skip = std::getenv("INFVINO_NO_MEM");   // R69: 消融单个族的访存几何
+    if (const KernelFamily * f = familyByName(e.kernel))
+      if (f->mem && !(skip && f->name == skip))
+      {
+        const MemContract m = f->mem(s, e.options);
+        if (!m.valid) return false;
+        constexpr double kSatThreads = 8192.0;   // 实测：与 WG/寄存器无关的线程数上限
+        concurrent = std::min(m.concurrent, kSatThreads);
+        perWg = m.perWgBytes;
+        return true;
+      }
+  }
   auto optIntOf = [](const std::string & opts, const char * key, int def) -> int {
-    const std::string k(key);
-    const auto p = opts.find(k);
-    if (p == std::string::npos) return def;
-    return std::atoi(opts.c_str() + p + k.size());
+    return tuningOptionInt(opts, key, def);
   };
   double totalThreads = 1.0;
   perWg = 0.0;

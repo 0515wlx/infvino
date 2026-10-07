@@ -159,9 +159,41 @@ double copyBwGbps(double footprint);
 /** @brief R47: 小算子每 dispatch 的 launch 地板（µs）。 */
 extern const double kSmallLaunchUs;
 
+/**
+ * @brief R69: 候选的**占用/访存几何契约**（候选侧 ↔ L3 溢出模拟的接口）。
+ *
+ * 整网 L3 溢出模拟（`L3Model`）对每个节点需要一个「在飞占用压力」R。R 由候选的**执行
+ * 几何**决定：`concurrent` 个并发内存请求源，每个触达 `perWgBytes` 字节 →
+ * `R = concurrent × perWgBytes`（= `occupancyPressure`）。
+ *
+ * 语义（与 R47/R55 标定口径一致）：
+ *   * `concurrent` = 该候选的总 work-item 数（声明**原始值**；消费方 `occupancyStats`
+ *     按 8192 饱和夹取）；
+ *   * `perWgBytes` = 一个 work-**group** 触达的**输入激活**字节（权重/常量视作常驻不计、
+ *     输出不计，与旧的 `occupancyPressure` 口径一致）；
+ *   * `valid=false` → 该候选不计占用（launch/带宽受限的小算子，其外溢并入流式成本）。
+ *
+ * 此前这套几何散在 `Tuning.cpp::occupancyStats` 的 op 判据里（R48 §10.6-B 的「加族只加
+ * 声明未落地」缺口）——新族/新候选不会自动进入 spill 模型，且 conv3x3 的四个 kernel、
+ * split-K、GEMV、非 blk depthwise 都落进错误的判据。R69 把它声明化进 `KernelFamily`，
+ * 注册表成为「候选 / 布局 / 上限 / **访存几何**」的完整单一真相源。
+ */
+struct MemContract
+{
+  bool   valid = false;
+  double concurrent = 0.0;   ///< 原始总 work-item 数（消费方按 8192 夹取）
+  double perWgBytes = 0.0;   ///< 每个 work-group 触达的输入激活字节
+};
+
+/** @brief R69: 从 kernel 编译选项串里取 `-D<key>=<int>`（找不到返回 `dflt`）。
+ *  `key` 含完整 token（如 `"-DOBW="`）；供族声明的访存几何回调解析自己的 knob。*/
+int tuningOptionInt(const std::string & options, const std::string & key, int dflt);
+
 /** @brief R47/R49: 一个候选在整网里的**瞬时占用压力**（并发线程 × 每 WG 足迹字节）。
- *  线性、可加、设备无关（只依赖候选 options 与 shape）。是 L3/占用会计的单一真相源：
- *  `globalRetune` 的 L3 模拟与 `resolveLayoutMinCut` 的节点代价共用。*/
+ *  R69: 改为**注册表优先**——按候选 kernel 名反查族，读族声明的 `MemContract`；
+ *  未声明（小算子/未知）时回退到 legacy op 判据。`INFVINO_LEGACY_OCCUPANCY=1` 强制回退
+ *  （A/B 消融）。线性、可加、设备无关（只依赖候选 options 与 shape）。是 L3/占用会计的
+ *  单一真相源：`globalRetune` 的 L3 模拟与 `resolveLayoutMinCut` 的节点代价共用。*/
 double occupancyPressure(const TuningEntry & e, const OpSignature & sig);
 /** @brief R55: 某候选的**并发线程数** C = min(总线程数, 8192)（与 occupancyPressure 同源；
  *  供二维内存 roofline 的并发/MLP 因子使用）。小算子/未知 op 返回 0。*/

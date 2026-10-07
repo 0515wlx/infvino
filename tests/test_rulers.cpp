@@ -146,6 +146,25 @@ static void run_tests()
     s.kernel = "copy_c";
     CHECK_NEAR(occupancyPressure(s, OpSignature::custom("copy_c", {25600, 16})), 0.0, 1e-12,
                "small-op occupancy pressure is 0 (launch/bandwidth bounded)");
+
+    // R69: 注册表声明的访存几何——非 blk depthwise 现在计入占用（旧代码 fall-through=0），
+    // 且 legacy 消融开关可强制回退（A/B）。
+    TuningEntry d;
+    d.kernel = "depthwise_v";
+    d.options = "-DDW_K=5 -DDW_S=1 -DDW_P=2 -DDW_TW=4";
+    const OpSignature ds = OpSignature::depthwise(56, 56, 1, 2, 96, 5, 0);
+    CHECK(occupancyPressure(d, ds) > 0.0, "R69: depthwise_v now contributes occupancy");
+    setenv("INFVINO_LEGACY_OCCUPANCY", "1", 1);
+    CHECK_NEAR(occupancyPressure(d, ds), 0.0, 1e-12,
+               "R69: legacy fallback ignores depthwise_v (A/B switch)");
+    unsetenv("INFVINO_LEGACY_OCCUPANCY");
+
+    // R69: conv3x3_f16 用 TX/TY 几何（旧代码落进 conv3x3 分支、按 OBW 默认算错）。
+    TuningEntry f;
+    f.kernel = "conv3x3_f16";
+    f.options = "-DTX=40 -DTY=8 -DTM=1 -DCB=32";
+    CHECK(occupancyThreads(f, OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 0)) > 0.0,
+          "R69: conv3x3_f16 occupancy positive");
   }
 
   // --- R55: l3MlpFactor（并发/MLP 因子）---

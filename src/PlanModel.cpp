@@ -1394,12 +1394,6 @@ const TuningEntry * PlanModel::choiceEntry(size_t ni, const OpSignature & sig) c
 
 std::vector<L3Access> PlanModel::buildL3Access() const
 {
-  // 小算子：流式（读输入 + 写输出，保留工作集小）→ 其流式足迹即有效占用压力。
-  auto isSmall = [](const std::string & op) {
-    return op == "ew_binary" || op == "ew_binary_bcast" || op == "ew_unary" || op == "copy_c" ||
-           op == "slice_axis" || op == "concat4" || op == "maxpool" || op == "resize_nn" ||
-           op == "permute_0213" || op == "bmm" || op == "softmax_axis" || op == "gap";
-  };
   std::vector<L3Access> out;
   out.reserve(nodes_.size());
   for (size_t i = 0; i < nodes_.size(); ++i)
@@ -1424,13 +1418,17 @@ std::vector<L3Access> PlanModel::buildL3Access() const
       if (it != T_.end())
         a.writes.push_back({nodes_[i].outs[0], static_cast<double>(it->second.numel()) * 2.0});
     }
+    // R69: 占用压力来自**选中候选声明的访存几何**（`occupancyPressure`，注册表单一真相源）。
+    // 无占用模型的节点（launch/带宽受限的小算子——其 kernel 不在注册表族内，如 `copy_c`）
+    // 回退到其**流式足迹**（读+写）——这正是旧代码硬编码 `isSmall` 列表想表达的东西，现在
+    // 由「族是否声明 `mem`」自动判定，新族/新候选无需再改这里。
     double press = (ok && e) ? occupancyPressure(*e, s) : 0.0;
-    if (isSmall(nodes_[i].op))
+    if (press <= 0.0)
     {
       double fb = 0.0;
       for (const auto & r : a.reads) fb += r.second;
       for (const auto & w : a.writes) fb += w.second;
-      press = std::max(press, fb);
+      press = fb;
     }
     a.occ_bytes = press;
     out.push_back(std::move(a));
