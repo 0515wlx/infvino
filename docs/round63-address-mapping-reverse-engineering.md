@@ -125,9 +125,13 @@ INFVINO_L3_GEOM=1 python3 scripts/model_check.py --model yolov8n-pose --repo "$P
 
 ## 6. 下一步（继续逆向）
 
-1. **物理地址可控实验**：把 victim/aggressor 放在同一 2 MB 大页内并扫页内偏移，或申请
-   大对齐缓冲，消除页表扰动，直接测 `index(Δ)`。
-2. **bank/set 分离**：用两条步进（一条扰动 set、一条扰动 bank）或「同一 set 不同 bank」的
-   指针追逐，测出 bank 位与 set 位。
-3. **no-allocate 判定**：比较流式读 vs 回写写对热集合的污染强度，判定 aggressor 是否分配。
-4. 逆出后把 `L3LineModel` 的 `sets/ways/hash` 换成实测映射，重新评估逐出曲线**形状**保真度。
+> ⚠️ **R65 已尝试并给出结论**：硬件计数器不可用（`Activate failed`），且**层次性使计时探针
+> 无法隔离私有 L3**（填 LLC 必先填 L3）。地址→(bank,set) 只能逆到「周期 512 行」；周期 + 容量
+> 已由公开 PRM 落到 **512×120**。见
+> [`round65-l3-isolation-and-geometry-conclusion.md`](round65-l3-isolation-and-geometry-conclusion.md) §1/§3。
+> 完整 XOR 哈希**不可逆**（除非有 OA 计数器或物理地址可控 + MOCS no-LLC）。
+
+若要继续（收益递减）：
+1. 换内核打开 `CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS` 以用 `gpu_metrics` 读 L3 计数；
+2. 或申请大页对齐缓冲 + 基址偏移扫描，间接逼近 XOR；
+3. 否则建议把两级容量接进主问题并做整网 A/B（见 R65 §5）。
