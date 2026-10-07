@@ -711,7 +711,10 @@ const std::vector<KernelFamily> & kernelFamilies()
         for (int xb : {2, 4, 8}) {
           if (s.W > 0 && xb > s.W) continue;
           for (int slm : {1, 2, 4}) {
-            if (slm > 1 && s.N < 64) continue;
+            // R71: 此前 `slm>1 && s.N<64` 会**排除**小空间层（如 mb 的 7x7 N=49）的
+            // split-K 候选；但隔离实测 XB4/slm2 比 XB2/slm1 快 ~1.3x（mb 576->96）。放宽到
+            // N>=16，让 autotune 用实测决定（不再静默丢掉赢的配置）。
+            if (slm > 1 && s.N < 16) continue;
             emit(xb, 1, slm);
           }
         }
