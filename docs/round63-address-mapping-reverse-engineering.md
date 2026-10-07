@@ -1,11 +1,11 @@
 # R63：地址→bank/set 逆向（进度）+「物理容量 ≠ 跨算子热容量」的实测澄清
 
 > 用户：逆出地址→bank/set 是必须的；继续。
-> 结论先给：**索引周期（512 行 = 2¹⁵ B）已钉死**；但**完整 bank/set XOR 哈希未逆出**，
-> 且实测揭示一个更重要的**两个容量**问题——
-> **物理/流式容量 = 3.75 MiB**，而**跨算子热重用的有效容量 ≈ 8–12 MB**（热集合抗 ~24 MB 流式
-> 污染仍不丢）。R59 的 8 MB 物理上是 CPU 值（错），但**数值上**恰好落在热重用区，故 `L3Model`
-> 的默认容量仍取 ~8 MB；物理几何由 `l3PhysicalBytes()` 单独给出。
+> 结论先给：**索引周期（512 行 = 2¹⁵ B）已钉死**；但**完整 bank/set XOR 哈希未逆出**。
+> 更重要的是澄清了**内存层次**：**GPU 私有 L3 Data Cache = 3.75 MiB**，其后是**与 CPU 共享的
+> LLC = 8 MiB**（本机 4 核；sysfs index3）→ **跨算子热重用有效容量 ≈ 3.75+8 ≈ 12 MB**（别名实测
+> 阈值 ~12MB）。R59 的 8 MB 物理上其实是**共享 LLC**；`L3Model` 默认容量改为 L3+LLC ≈12.3 MB
+> （评分改善，选择不变），`INFVINO_L3_GEOM=1` 用仅 GPU 私有值做 A/B。
 
 ---
 
@@ -37,44 +37,59 @@
 `l3conflict --line-stride 1 --passes 1024`：0.26MB→200 GB/s，1MB→170，2MB→144，4.19MB→126，
 6.29→115，8.39→93.5，12.58→50，16.78→35。膝点 ~4 MB。
 
-### 2.3 单缓冲别名：热集合**几乎不被流式污染**
+### 2.3 单缓冲别名：阈值为 **~12 MB ≈ GPU L3 + 共享 LLC**
 
-`l3alias --nlines 4096`（victim 256 KB，先预热；aggressor 一次流式，Δ 行后）：
+> 初测用 256 KB victim + `hiters=8`，**不敏感**（一次 1 MB 内 miss 的成本被 kernel 底噪/摊销
+> 掩盖）→ 误得「24 MB 也不逐出」。改用 **1 MB victim + `hiters=1`** 重测：
 
-| aggressor | Δ=0 | Δ=512 | Δ=1024 | Δ=2048 |
-|---|---:|---:|---:|---:|
-| 4 MB | 0.0100 | 0.0101 | 0.0102 | 0.0102 |
-| 12 MB | 0.0105 | 0.0105 | 0.0107 | 0.0109 |
-| 24 MB | 0.0125 | 0.0130 | 0.0124 | 0.0141 |
+`l3alias --nlines 16384 --passes 1`（victim 1 MB，先预热；aggressor 一次流式，Δ 行后）：
 
-→ **24 MB 流式 aggressor 也只让热读慢 ~30%**，且**与偏移 Δ 无关**（无别名特征）。
-与 R55 双租户（1 MB 热集合到 ~12.6 MB 才开始被逐出）一致。
+| aggressor | Δ=0 | Δ=512 | Δ=2048 |
+|---|---:|---:|---:|
+| 2–8 MB | 0.0098 | 0.0098 | 0.0099 |
+| 12 MB | 0.0104 | 0.0108 | 0.0106 |
+| 16 MB | 0.0131 | 0.0122 | 0.0122 |
+| 24 MB | 0.0186 | 0.0176 | 0.0236 |
+| 32 MB | 0.0243 | 0.0202 | 0.0209 |
+
+→ 逐出阈值 **≈12 MB**（1 MB victim + 12 MB aggressor ≈ 13 MB），到 24–32 MB 明显变慢；
+且仍**与 Δ 无关**（地址映射/共享 LLC 使偏移不敏感）。
+
+**≈12 MB ≈ GPU 私有 L3（3.75）+ 共享 LLC（8）≈ 11.75 MB** —— 与**两级层次**吻合。
 
 ### 2.4 未逆出的部分（诚实）
 
 * stride=512 的**冲突起点 ≈512 行**（`l3conflict --line-stride 512` 扫 nlines：≤512 平、≥640 起）。
   若桶 = `line mod 512`、ways=120，起点应为 120——不符。说明存在**bank 层**或高位参与，
   单一步进实验无法分离 bank 与 set。
-* 别名对 Δ 不敏感 → aggressor 可能**不分配**进 L3（流式 no-allocate），或索引用了**高位**
-  使 victim/aggressor 落在不同 bank/set。
+* 别名对 Δ 不敏感 → 主因是**共享 LLC**：victim 被 GPU L3 逐出后仍驻留 LLC（8 MiB），
+  偏移不影响「谁在 LLC 里」；也与高位索引/共享映射一致。no-allocate 仍需后续实验判定。
 * 要彻底逆出 XOR 哈希，需要**物理地址可控**的实验（大页对齐缓冲 + 基址偏移扫描，或 GPU 侧
   地址翻译），本轮工具尚不足以定论。
 
 ---
 
-## 3. 关键澄清：**物理容量 ≠ 跨算子热容量**
+## 3. 关键澄清：**两级层次**（GPU 私有 L3 → 共享 LLC → DRAM）
+
+用户澄清 + 文档确认：**3.75 MB 是 Iris Xe 核显私有 L3 Data Cache**；**共享 LLC（= CPU L3）**
+是核显与 CPU 共用的下一级（本机 4 核/8 线程，sysfs `index3` = **8 MiB**）。PRM Vol.7 也明确写
+GPU L3「把 dirty line push 到 **LLC**」（见 §1 表/`third_party/intel-prm/NOTICE.md`）。
 
 | 量 | 值 | 证据 |
 |---|---:|---|
-| GPU L3 **物理/流式**容量 | **3.75 MiB** = 8×480 KiB = 512×120×64 | §2.1 周期 512 + §2.2 膝点 ~4MB + 公开 PRM |
-| **跨算子热重用**有效容量 | **≈8–12 MB** | §2.3 别名（24MB 仍不丢）+ R55 双租户 |
+| GPU **私有** L3 Data Cache | **3.75 MiB** = 8×480 KiB = 512×120×64 | §2.1 周期 512 + §2.2 膝点 ~4MB + PRM |
+| **共享 LLC**（CPU L3） | **8 MiB** | `lscpu` / sysfs index3（shared_cpu_list=0-7） |
+| **跨算子热重用**有效容量 | **≈12 MB** ≈ 3.75+8 | §2.3 别名阈值 ~12MB + R55 双租户 8–12MB |
 
 因此：
-* R59 的 `8.0e6` **物理上是 CPU 值（错）**；
-* 但 `L3Model` 模拟的是**跨算子、被重用的张量**的逐出——面对的有效容量本就是热重用区 ~8 MB，
-  所以 R59 的 8 MB **数值上是对的**（巧合）。
-* 正确做法：**分开两个量**——`l3PhysicalBytes()`=3.75 MiB（几何/流式）、`l3WarmCapBytes()`=8 MB
-  （`L3Model` 默认容量），`INFVINO_L3_GEOM=1` 用物理值做 A/B。
+* R59 的 `8.0e6` 物理上是**共享 LLC**（sysfs），**不是** GPU 私有 L3，也不是 CPU 独有；
+* GPU L3 逐出后数据仍在共享 LLC → 面向**重用张量**的有效容量 ≈ **L3 + LLC ≈ 12 MB**；
+* 正确模型：`l3PhysicalBytes()`=3.75 MiB（GPU 私有）、`l3LlcBytes()`=8 MiB（共享）、
+  `l3WarmCapBytes()`=`l3PhysicalBytes()+l3LlcBytes()`≈12.3 MB（`L3Model` 默认），
+  `INFVINO_L3_GEOM=1` 用仅 GPU 私有值 A/B。
+
+评分影响（**不改选择**，三模型 `model_check` 逐位不变）：y8 `spill 1.1357→0.9239`、
+`total 11.379→11.167`（对实测 busy 误差 +7.6%→**+5.6%**）；y11 `1.2508→1.0367`（+7.6%→+5.7%）。
 
 ---
 
@@ -101,9 +116,9 @@ for nl in 1024 4096 16384 32768 65536 131072 262144; do
 for a in 65536 131072 196608 262144 393216; do
   ./build/kernel_bench --op l3alias --nlines 4096 --agg-lines $a --passes 8 --line-stride 0,512,1024,2048; done
 scripts/gpu_clocks.sh unlock
-# 数值（默认=热容量 8MB，与 R59 逐位相同）
+# 数值（默认=跨算子热容量 L3+LLC≈12.3MB，与 R59 逐位相同）
 python3 scripts/model_check.py --model yolov8n-pose --repo "$PWD"
-INFVINO_L3_GEOM=1 python3 scripts/model_check.py --model yolov8n-pose --repo "$PWD"   # A/B（物理 3.75MiB）
+INFVINO_L3_GEOM=1 python3 scripts/model_check.py --model yolov8n-pose --repo "$PWD"   # A/B（仅 GPU 私有 3.75MiB）
 ```
 
 ---

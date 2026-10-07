@@ -13,10 +13,11 @@
 >   （未建模真实地址哈希/分段）。
 > * 复杂度结论随之**收紧**：ways=120（>64）需要两字位掩码或 sector 分组才能 O(1) 选 victim。
 >
-> ⚠️ **R63 更正**：物理 3.75 MiB 是**流式/物理**容量；实测（单缓冲别名 + R55 双租户）表明
-> **跨算子热重用**的有效容量 ≈ **8–12 MB**。`L3Model` 模拟的是重用张量 ⇒ 默认容量仍取 8 MB
-> （与 R59 数值一致），物理几何由 `l3PhysicalBytes()` 单独给出；`INFVINO_L3_GEOM=1` A/B。
-> 见 [`round63-address-mapping-reverse-engineering.md`](round63-address-mapping-reverse-engineering.md)。
+> ⚠️ **R63 更正（含用户澄清）**：内存是**两级**——GPU **私有** L3 Data Cache = 3.75 MiB，
+> 其后是**与 CPU 共享的 LLC** = 8 MiB（本机 4 核；sysfs index3）。故**跨算子热重用**有效容量
+> ≈ **3.75+8 ≈ 12 MB**（别名实测阈值 ~12MB）。`l3Model` 默认容量取 L3+LLC ≈12.3 MB
+> （`INFVINO_L3_GEOM=1` 用仅 GPU 私有值 A/B）。见
+> [`round63-address-mapping-reverse-engineering.md`](round63-address-mapping-reverse-engineering.md)。
 
 ---
 

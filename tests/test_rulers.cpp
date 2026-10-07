@@ -189,9 +189,11 @@ static void run_tests()
     CHECK_NEAR(l3PhysicalBytes(), 3932160.0, 1.0, "R62: GPU L3 = 3.75 MiB (8 bank x 480 KiB)");
     CHECK_NEAR(l3PhysicalBytes(), 512.0 * 120.0 * 64.0, 1.0, "R62: GPU L3 = 512 set x 120 way x 64B");
     CHECK_NEAR(l3CpuL3Bytes(), 8388608.0, 1.0, "R62: CPU L3 = 8 MiB (reference)");
+    CHECK_NEAR(l3LlcBytes(), 8388608.0, 1.0, "R63: shared LLC = 8 MiB");
     CHECK(l3PhysicalBytes() < l3CpuL3Bytes(), "R62: GPU L3 < CPU L3 (R59 had used the CPU value)");
-    CHECK_NEAR(l3WarmCapBytes(), 8.0e6, 1.0, "R63: cross-operator warm reuse capacity ~8 MB");
-    CHECK(l3WarmCapBytes() > l3PhysicalBytes(), "R63: warm reuse cap > physical/streaming cap");
+    CHECK_NEAR(l3WarmCapBytes(), l3PhysicalBytes() + l3LlcBytes(), 1.0,
+               "R63: cross-op capacity = GPU L3 + shared LLC (two-level)");
+    CHECK(l3WarmCapBytes() > l3PhysicalBytes(), "R63: cross-op cap > GPU-private cap");
     CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R55: private-tile cap knee = 2 MB");
     CHECK_NEAR(l3DefaultCapBytes(), l3WarmCapBytes(), 1.0, "R63: default (model) cap == warm reuse cap");
     CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R63: default anchor == private cap");

@@ -446,13 +446,14 @@ double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
  *  R59：BW 用实测平台/峰值（DRAM 20 GB/s、L3 copy 峰值 145 GB/s）。*/
 const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 145e9) * 1e3;
 
-// R62/R63: 几何锚点（见 Tuning.hpp）。GPU L3 物理/流式容量 = 8 bank × 480 KiB = 3.75 MiB
-// = 512 set × 120 way × 64 B = 3,932,160 B（公开 PRM + 512 行冲突周期 + ~4MB 容量膝点）。
-// ⚠️ 跨算子**热重用**有效容量更大（R55 双租户 + R63 别名探针：热集合抗 ~8–24 MB 流式污染），
-// 这是 `L3Model` 真正要用的量 → `l3DefaultCapBytes()` 取 `l3WarmCapBytes()`。
-double l3PhysicalBytes() { return 3932160.0; }          // 3.75 MiB (GPU, streaming/physical)
-double l3CpuL3Bytes() { return 8388608.0; }             // 8 MiB (CPU sysfs; R59 误用值)
-double l3WarmCapBytes() { return 8.0e6; }               // 跨算子热重用有效容量（R55/R63）
+// R62/R63: 内存层次锚点（见 Tuning.hpp）。
+//   GPU 私有 L3 Data Cache = 8 bank × 480 KiB = 3.75 MiB = 512 set × 120 way × 64 B。
+//   共享 LLC（= CPU sysfs index3）= 8 MiB（TGL-U 4 核；TGL-H 8 核 24 MiB）。
+//   两级：GPU L3 → LLC → DRAM。跨算子热重用有效容量 ≈ L3 + LLC ≈ 12.3 MB（R63 别名实测 ~12MB）。
+double l3PhysicalBytes() { return 3932160.0; }          // 3.75 MiB (GPU private L3)
+double l3CpuL3Bytes() { return 8388608.0; }             // 8 MiB (shared LLC, sysfs)
+double l3LlcBytes() { return 8388608.0; }               // 8 MiB (shared LLC)
+double l3WarmCapBytes() { return l3PhysicalBytes() + l3LlcBytes(); }   // ≈12.3 MB cross-op
 double l3PrivateCapBytes() { return 2.0e6; }
 double l3DefaultCapBytes()
 {
