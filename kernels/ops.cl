@@ -85,6 +85,11 @@ __kernel void slice_axis(__global const half *restrict x, __global half *restric
 // ---- concat up to 4 inputs along an axis (outer, inner) with axis dims ca..cd ----
 // R23: 3-D grid (r, ax, o) removes the per-element integer div/mod of the original
 // 1-D version; gid0 (inner) stays contiguous so reads/writes remain coalesced.
+// R71: OUT_FSV16=1 -> 直接写 b_fs_yx_fsv16（仅当 outer==1，即沿通道拼接），供后面的
+// blocked 1x1（conv1x1_blk）零 reorder 直读（对齐 OV 的 concatenation->bfyx_f16_1x1 链）。
+#ifndef OUT_FSV16
+#define OUT_FSV16 0
+#endif
 __kernel void concat4(__global const half *restrict a, const int ca,
                       __global const half *restrict b, const int cb,
                       __global const half *restrict c, const int cc,
@@ -101,6 +106,9 @@ __kernel void concat4(__global const half *restrict a, const int ca,
   else if (ax < ca + cb) v = b[(o * cb + (ax - ca)) * inner + r];
   else if (ax < ca + cb + cc) v = c[(o * cc + (ax - ca - cb)) * inner + r];
   else v = d[(o * cd + (ax - ca - cb - cc)) * inner + r];
+#if OUT_FSV16
+  if (outer == 1) { y[((size_t)(ax / 16) * inner + r) * 16 + (ax % 16)] = v; return; }
+#endif
   y[(o * sum + ax) * inner + r] = v;
 }
 

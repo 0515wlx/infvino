@@ -889,6 +889,10 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.op = op;
       f.source = "ops";
       f.layout = {Layout::NCHW, Layout::NCHW, false, false};
+      // R71: concat4 可直写 b_fs_yx_fsv16（-DOUT_FSV16=1，仅 outer==1 的通道拼接），
+      // 使后面的 blocked 1x1（conv1x1_blk）零 reorder 直读——对齐 OV 的
+      // `concatenation -> convolution_gpu_bfyx_f16_1x1` 链。
+      if (std::string(op) == "concat4") f.layout.canOutFsv16 = true;
       f.bottleneck = Bottleneck::Memory;
       std::string o = op;
       f.supports = [o](const OpSignature & s) { return s.op == o; };

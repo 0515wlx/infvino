@@ -547,7 +547,10 @@ void PlanModel::parse()
   // R30c：把「4 路 concat -> 1x1 conv」融合（Route A）：conv1x1 走 gemm_f16 的
   // CAT4 B-staging（B 的逻辑 K=Cin 行按 ca/cb/cc/cd 重定向到 4 个源张量），
   // 省掉 concat 的物化（写+再读），同时保留 gemm_f16 的 tile/流水。
-  fuseConcatConv1x1();
+  // R71: cat4 融合（concat4→conv1x1 用 gemm CAT4）现可由 OV 式的「concat 直写 fsv16 +
+  // blocked 1x1」取代。默认保持融合；`INFVINO_NO_FUSE_CAT4=1` 关闭融合以走 blocked 链
+  // （A/B 用，验证后再决定默认）。
+  if (!std::getenv("INFVINO_NO_FUSE_CAT4")) fuseConcatConv1x1();
 
   // R33：把「conv1x1/conv3x3 + ew_binary(add)」的残差加折进卷积 epilogue（RES），
   // 省掉一次 elementwise launch（数值顺序不变：act(conv+bias)+res）。
@@ -1288,6 +1291,9 @@ void PlanModel::planBlockedLayout()
     // R51 D4+ / R52：gap 视为「可读 fsv16」的消费者（kernel 侧 -DGAP_IN_FSV16），
     // 使 SE 的 value（depthwise_blk 输出）能被持久 fsv16，D5 融合才是纯收益。
     if (n.op == "gap") return familyByName("gap_fsv16");
+    // R71: concat4 作为「可写 fsv16」的生产者，让其输出可持久化、被 blocked 1x1 直读。
+    // 仅 outer==1（沿通道拼接）支持 fsv16 直写；其它拼接轴返回 nullptr。
+    if (n.op == "concat4") return attrInt(n, "outer", 1) == 1 ? familyByName("small_concat4") : nullptr;
     return nullptr;
   };
 
@@ -1510,6 +1516,25 @@ void PlanModel::resolveLayoutChoices()
   const bool mincutOn = std::getenv("INFVINO_NO_LAYOUT_MINCUT") == nullptr;
 
   const int kIters = 4;
+  // R71: producer map + 「该生产者能否直写 fsv16」——用于**链感知定价**。
+  std::unordered_map<std::string, size_t> prodOf;
+  for (size_t i = 0; i < nodes_.size(); ++i)
+    for (const auto & o : nodes_[i].outs)
+      if (o != "-") prodOf[o] = i;
+  auto nodeCanOutFsv16 = [&](size_t pi) -> bool {
+    const Node & pn = nodes_[pi];
+    if (pn.op == "concat4") return attrInt(pn, "outer", 1) == 1;   // 仅通道拼接支持 fsv16 直写
+    bool ok = false;
+    const OpSignature ps = nodeSignature(pn, &ok);
+    if (!ok) return false;
+    const TuningEntry * pe = choiceEntry(pi, ps);
+    const KernelFamily * pf = (pe && !pe->kernel.empty()) ? familyByName(pe->kernel) : nullptr;
+    return pf && pf->layout.canOutFsv16;
+  };
+  std::unordered_map<std::string, int> inUseCount;
+  for (const auto & nd : nodes_)
+    for (const auto & s : nd.ins)
+      if (s != "-") ++inUseCount[s];
   for (int it = 0; it < kIters; ++it)
   {
     planBlockedLayout();
@@ -1528,6 +1553,17 @@ void PlanModel::resolveLayoutChoices()
         auto xit = T_.find(n.ins[inIdx]);
         if (xit != T_.end()) in_fsv16 = xit->second.fsv16;
       }
+      // R71 链感知：若激活输入只有本节点一个消费者，且其生产者**能直写 fsv16**，则选 blk
+      // 会让 planBlockedLayout 把该生产者标记为 fsv16 → 这一趟 reorder 实际可省。此前定价
+      // 只按**当前**是否已 fsv16，导致 fixpoint 卡在「non」局部最优（concat→1x1、1x1→dw 链
+      // 都因此断掉，与 OV 的 fsv16 贯穿链差距的主因）。
+      bool chainFree = false;
+      if (n.ins.size() > inIdx && n.ins[inIdx] != "-")
+      {
+        const std::string & xname = n.ins[inIdx];
+        auto pit = prodOf.find(xname);
+        if (pit != prodOf.end() && inUseCount[xname] == 1) chainFree = nodeCanOutFsv16(pit->second);
+      }
       // R50: 若本节点输出已被规划为 fsv16（契约 canOutFsv16），用 fsv16 输出的实测成本
       // （`#blkfsv16`）；否则用 bfyx 输出成本。缺失 `#blkfsv16` 时回退为旧行为。
       bool out_fsv16 = false;
@@ -1538,7 +1574,7 @@ void PlanModel::resolveLayoutChoices()
       }
       const double blkKernelMs =
           (out_fsv16 && !alt[ni].blkFsv16.kernel.empty()) ? alt[ni].blkFsv16.ms : alt[ni].blk.ms;
-      double blkCost = blkKernelMs + (in_fsv16 ? 0.0 : alt[ni].reorder.ms);
+      double blkCost = blkKernelMs + ((in_fsv16 || chainFree) ? 0.0 : alt[ni].reorder.ms);
       const TuningEntry & want = (blkCost <= alt[ni].non.ms) ? alt[ni].blk : alt[ni].non;
       if (node_choice_[ni].kernel != want.kernel || node_choice_[ni].options != want.options)
       {
@@ -3176,6 +3212,12 @@ void PlanModel::run()
         auto oit = T_.find(n.outs[0]);
         if (oit != T_.end() && oit->second.fsv16 && optsOut.find("-DEWCH_OUT_FSV16=") == std::string::npos)
           optsOut += " -DEWCH_OUT_FSV16=1";
+      }
+      // R71: concat4 直写 fsv16（仅 outer==1），供 blocked 1x1 直读。
+      if (kernOut.rfind("concat4", 0) == 0 && !n.outs.empty() && !std::getenv("INFVINO_NO_D4")) {
+        auto oit = T_.find(n.outs[0]);
+        if (oit != T_.end() && oit->second.fsv16 && optsOut.find("-DOUT_FSV16=") == std::string::npos)
+          optsOut += " -DOUT_FSV16=1";
       }
       return getKernel("ops", kernOut, optsOut);
     };

@@ -207,6 +207,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/open-items.md`](docs/open-items.md) | **开放项登记表**：系统「未完成/未决/暂缓/负结果」的单一权威清单（R70 起维护） |
 | [`docs/round70-status.md`](docs/round70-status.md) | **R70 统一收尾**：逐节点 spill 归因 + `--global` NO-OP 硬信号 + 残差落盘；三模型 `model_check`/`reuse_check` 回归；全量 retune 激活 fixpoint 的负结果 |
 | [`docs/round71-binding-wall-model.md`](docs/round71-binding-wall-model.md) | **R71 绑定墙分析框架**：带宽侧补 GPU 私有 L3/共享 LLC/DRAM 三级足迹与两级 spill（`memTierTime`/`l3TwoLevelSplit`）；计算侧补寄存器 ILP 与 SLM 带宽/容量（`computeWall`/`attributeWall`）；`kernel_autotune --wall-report` + `scripts/analyze_walls.py`（按调用加权）。**纯诊断，不参与选择** |
+| [`docs/round71-1x1-depthwise-layout.md`](docs/round71-1x1-depthwise-layout.md) | **R71 三项实施 + blocked 链布局缺陷**：① 1×1 split-K 候选放开小空间（mb busy −4.7%）；② cat4→blocked 1×1 管道（concat `OUT_FSV16`）；③ **链感知布局定价**——修复「不动点卡在 NCHW、跨算子 fsv16 链断掉」的缺陷（对 OV 差距的核心；`INFVINO_NO_FUSE_CAT4` 对照） |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
