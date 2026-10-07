@@ -264,6 +264,91 @@ double l3DefaultAnchorBytes();
 double l3DramBwGbps();
 double l3SramBwGbps();
 
+// ============================================================================
+// R71: **绑定墙（binding wall）归因模型** —— 诊断/报告层，不参与任何选择。
+//
+// 此前 `expectedOps` 的「计算类」上限只有一把尺子（ISA 指令配额 × 网格），
+// 「内存类」只有一条 `copyBwGbps` 曲线。R71 把两个开发中反复出现的物理维度显式化：
+//
+//   1. **带宽受限**：数据足迹按 **GPU 私有 L3（3.75 MiB）→ 共享 LLC（8 MiB）→ DRAM**
+//      三段拆分，各段用自己的带宽（`memTierTime`）。这使「撞 GPU-L3 容量」与
+//      「已经溢出到 CPU 共享 LLC」区分开——二者的每字节代价差 ~3×。
+//   2. **计算受限**：FPU 跑不满不是「指令配额」单独能解释的，另有
+//      (a) **寄存器文件大小**：128 GRF/线程里只有 ~40 给数据（IGC overhead ~85–95），
+//          累加器链数 `ACC` 被顶到 ~16–19，若 `7·ACC < FMA 延迟 L≈30` 就掉进延迟受限；
+//      (b) **SLM 带宽 / 容量耦合**：operand 从 SLM 流入的速率、以及 SLM 足迹
+//          （每 WG ≤64 KiB、每 lane ≤73 B 否则掉 SIMD 宽度）。
+//
+// 所有系数都来自本项目实测/公开资料，见 docs/round71-*、docs/register-model.md、
+// docs/xe-lp-isa.md。整层是**纯 host、零 GPU**，可离线单测。
+// ============================================================================
+
+/** @brief R71: 数据/算子撞的**那一堵墙**。*/
+enum class WallKind
+{
+  FmaIssue,      ///< ISA 指令配额（mad 占比）——纯发射上限
+  RegIlp,        ///< 寄存器文件大小 → ACC 上限 → 延迟受限（7·ACC < L）
+  SlmBandwidth,  ///< SLM 读带宽喂不满 FMA
+  SlmCapacity,   ///< SLM 足迹（>64 KiB/WG 或 >73 B/lane 掉 SIMD 宽度）
+  GpuL3,         ///< 带宽：命中 GPU 私有 L3（3.75 MiB）
+  SharedLlc,     ///< 带宽：GPU-L3 溢出，但命中 CPU 共享 LLC（8 MiB）
+  Dram,          ///< 带宽：两级都溢出 → DRAM
+  Launch,        ///< dispatch/网格地板或有界归约
+  Unknown,
+};
+const char * wallKindName(WallKind w);
+
+/** @brief R71: 寄存器/发射/SLM 侧的物理常数（全部有实测出处）。*/
+constexpr double kEfResidentThreads = 7.0;     ///< 每 EU 驻留线程数（R27 实测）
+constexpr double kFmaLatencyCyc = 30.0;        ///< FP16 FMA 延迟 L（R10/R18）
+constexpr double kSlmBytesPerWg = 65536.0;     ///< 每 WG SLM 上限（clinfo）
+constexpr double kSlmBytesPerLaneCliff = 73.0; ///< >73 B/lane 掉 SIMD 宽度（Intel guide）
+constexpr double kSlmReadBwGbps = 350.0;       ///< SLM 流式读带宽（R71 实测 300–500 中值）
+
+/** @brief R71: 一个算子的**单遍足迹按三级缓存拆分**（诊断；见 `memTierTime`）。*/
+struct MemTierTime
+{
+  double footprint_bytes = 0.0;
+  double l3_bytes = 0.0, llc_bytes = 0.0, dram_bytes = 0.0;   ///< 字节拆分
+  double l3_ms = 0.0, llc_ms = 0.0, dram_ms = 0.0;            ///< 各段耗时（用各段带宽）
+  double total_ms = 0.0;                                      ///< = l3+llc+dram（串行下界）
+  WallKind tier = WallKind::GpuL3;                            ///< 主导段
+};
+/** @brief 把一个算子单遍足迹按 GPU-L3/LLC/DRAM 三段拆分（每段用各自实测带宽）。*/
+MemTierTime memTierTime(const OpSignature & sig);
+
+/** @brief R71: 计算侧的多堵墙（ISA 配额 / 寄存器 ILP / SLM 带宽 / SLM 容量）。*/
+struct ComputeWall
+{
+  bool   fma_family = false;   ///< 是否 FMA 主导（conv3x3/gemm/conv1x1_blk/gemv）
+  bool   instr_quota = false;  ///< 指令配额主导（depthwise：地址/边界指令）
+  double acc = 0.0;            ///< 每线程独立累加链数
+  double isa_ops = 0.0;        ///< 指令配额上限（ops/EU/cyc）
+  double rf_ilp = 1.0;         ///< min(1, T_res·ACC/L)
+  double rf_ops = 0.0;         ///< isa_ops × rf_ilp
+  double slm_bw_ops = 0.0;     ///< SLM 读带宽上限（0 = 不适用/未知）
+  double slm_bytes_per_wg = 0.0;
+  double slm_bytes_per_lane = 0.0;
+  bool   slm_capacity_ok = true;  ///< 足迹同时满足 ≤64 KiB/WG 与 ≤73 B/lane
+  WallKind binding = WallKind::Unknown;
+};
+ComputeWall computeWall(const OpSignature & sig, const TuningEntry & e, const ClDeviceInfo & dev);
+
+/** @brief R71: 一个节点的**绑定墙判决**（诊断；`measured_ms` 来自实测缓存）。*/
+struct WallVerdict
+{
+  WallKind    binding = WallKind::Unknown;
+  MemTierTime mem;
+  ComputeWall comp;
+  double      measured_ops = 0.0;   ///< 实测 ops/EU/cyc
+  double      fma_ops = 0.0;        ///< 计算侧硬上限（含寄存器/SLM derate）
+  double      mem_ops = 0.0;        ///< 内存侧硬上限（三段足迹 roofline）
+  double      hard_ops = 0.0;       ///< min(fma, mem)
+  double      ratio_to_wall = 0.0;  ///< measured / hard（1 = 已贴住该墙）
+};
+WallVerdict attributeWall(const OpSignature & sig, const TuningEntry & e, const ClDeviceInfo & dev,
+                          double measured_ms);
+
 /**
  * @brief R60: reorder（bfyx↔fsv16 等布局搬运）的**精确可加**成本模型。
  *

@@ -46,7 +46,7 @@ int main(int argc, char ** argv)
   std::vector<std::string> ops;
   int  limit = 0, iters = 30;
   bool report = false, expected = false, bake = false, list = false, retune = false;
-  bool refresh = false, candidates_ = false;
+  bool refresh = false, candidates_ = false, wall_report = false;
   bool global = false;
   int  gIters = 0, gTopK = 3, gRounds = 3, gLimit = 0;
   double gMargin = 0.0;
@@ -69,6 +69,7 @@ int main(int argc, char ** argv)
     else if (a == "--expected") expected = true;
     else if (a == "--list") list = true;
     else if (a == "--candidates") candidates_ = true;
+    else if (a == "--wall-report") wall_report = true;
     else if (a == "--retune") retune = true;
     else if (a == "--refresh-expected") refresh = true;
     else if (a == "--global") global = true;
@@ -92,6 +93,8 @@ int main(int argc, char ** argv)
         "  --iters N          每个候选的计时迭代数（默认 30）\n"
         "  --list             只列出唯一签名，不跑 GPU 计时\n"
         "  --candidates       列出每个签名的候选数（按族），不跑 GPU 计时\n"
+        "  --wall-report      R71 绑定墙归因（零 GPU；用缓存实测 ms）：逐节点判计算墙\n"
+        "                     (ISA 配额/寄存器 ILP/SLM 带宽/容量) 还是带宽墙 (GPU-L3/LLC/DRAM)\n"
         "  --retune           忽略缓存里已有的 tuned 条目，强制重新扫描（候选/标准更新后用）\n"
         "  --refresh-expected  仅用当前中间标准重算缓存命中项的 expected/ratio（**零 GPU**）\n"
         "  --global           R44/R47: 整网 busy 回验（R47：min+median 双口径 + 交错 + 可加目标\n"
@@ -166,6 +169,62 @@ int main(int argc, char ** argv)
                   sigs.empty() ? 0.0 : static_cast<double>(total) / sigs.size());
       if (over) std::printf("WARN: %zu signature(s) at/over the per-signature cap %d\n", over,
                             infvino::kSigCandidateCap);
+      return 0;
+    }
+
+    if (wall_report)
+    {
+      // R71: 绑定墙归因（**零 GPU**；用缓存里的实测 ms）。逐节点判断撞的是哪堵墙：
+      // 计算侧（ISA 配额 / 寄存器 ILP / SLM 带宽 / SLM 容量）还是带宽侧
+      // （GPU 私有 L3 / 共享 LLC / DRAM）。详见 docs/round71-*。
+      const auto sigs = model.tuningSignatures(ops);
+      struct Row
+      {
+        std::string sig, kernel;
+        double ms, meas, hard, ratio, foot_mb, llc_mb, dram_mb;
+        infvino::WallKind bind, tier;
+      };
+      std::vector<Row> rows;
+      for (const auto & s : sigs)
+      {
+        const infvino::TuningEntry * e = model.tuning().lookup(s);
+        if (!e || e->ms <= 0.0) continue;
+        const infvino::WallVerdict v = infvino::attributeWall(s, *e, model.device(), e->ms);
+        rows.push_back({s.str(), e->kernel, e->ms, v.measured_ops, v.hard_ops, v.ratio_to_wall,
+                        v.mem.footprint_bytes / 1e6, v.mem.llc_bytes / 1e6, v.mem.dram_bytes / 1e6,
+                        v.binding, v.mem.tier});
+      }
+      std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) {
+        if (a.bind != b.bind) return static_cast<int>(a.bind) < static_cast<int>(b.bind);
+        return a.ratio < b.ratio;   // 同墙内：离墙最远（最可优化）的排前面
+      });
+      std::printf("%-46s %-15s %8s %6s %8s %7s %7s  %-11s %-10s %7s\n", "signature", "kernel",
+                  "ms", "meas", "hard", "wallR", "footMB", "binding", "mem-tier", "llcMB");
+      int cur = -1;
+      for (const auto & r : rows)
+      {
+        if (static_cast<int>(r.bind) != cur)
+        {
+          cur = static_cast<int>(r.bind);
+          std::printf("-- %s --\n", infvino::wallKindName(r.bind));
+        }
+        std::printf("%-46s %-15s %8.4f %6.2f %8.2f %7.2f %7.2f  %-11s %-10s %7.2f\n",
+                    r.sig.c_str(), r.kernel.c_str(), r.ms, r.meas, r.hard, r.ratio, r.foot_mb,
+                    infvino::wallKindName(r.bind), infvino::wallKindName(r.tier), r.llc_mb);
+      }
+      std::printf("\n== wall budget (sum of measured ms by binding wall) ==\n");
+      const infvino::WallKind kinds[] = {
+        infvino::WallKind::FmaIssue, infvino::WallKind::RegIlp, infvino::WallKind::SlmBandwidth,
+        infvino::WallKind::SlmCapacity, infvino::WallKind::GpuL3, infvino::WallKind::SharedLlc,
+        infvino::WallKind::Dram, infvino::WallKind::Launch};
+      for (infvino::WallKind wk : kinds)
+      {
+        double ms = 0.0;
+        int    n = 0;
+        for (const auto & r : rows)
+          if (r.bind == wk) { ms += r.ms; ++n; }
+        if (n) std::printf("  %-11s %8.3f ms  (%d nodes)\n", infvino::wallKindName(wk), ms, n);
+      }
       return 0;
     }
 

@@ -220,4 +220,34 @@ double spillAtCapacity(const std::vector<L3Access> & nodes, double capacity_byte
   return spill;
 }
 
+L3TwoLevelSplit l3TwoLevelSplit(const std::vector<L3Access> & nodes, const L3ModelConfig & cfg)
+{
+  L3TwoLevelSplit out;
+  L3ModelConfig c = cfg;
+  c.compute_prices = false;
+  const L3StackProfile prof = profileL3Stack(nodes, c);
+  const double cL3 = (cfg.l3_private_bytes > 0.0) ? cfg.l3_private_bytes : l3PhysicalBytes();
+  const double cAll = (cfg.l3_bytes > 0.0) ? cfg.l3_bytes : l3WarmCapBytes();
+  out.l3_cap_bytes = cL3;
+  out.llc_cap_bytes = cAll;
+  const double bwL3 = (cfg.l3_bw_gbps > 0.0) ? cfg.l3_bw_gbps : 145.0;
+  const double bwLlc = (cfg.llc_bw_gbps > 0.0) ? cfg.llc_bw_gbps : 35.0;
+  const double bwDram = (cfg.dram_bw_gbps > 0.0) ? cfg.dram_bw_gbps : 20.0;
+  const double perByteLlc = (1.0 / (bwLlc * 1e9) - 1.0 / (bwL3 * 1e9)) * 1e3;   // ms/byte
+  const double perByteDram = (1.0 / (bwDram * 1e9) - 1.0 / (bwL3 * 1e9)) * 1e3; // ms/byte
+  for (const auto & t : prof.touches)
+  {
+    if (t.write) continue;                       // 与既有口径一致：只计读 miss
+    const bool l3miss = t.cold || t.stack_dist > cL3;
+    if (!l3miss) continue;
+    out.l3_miss_bytes += t.bytes;
+    if (t.cold || t.stack_dist > cAll) out.dram_miss_bytes += t.bytes;
+    else out.llc_served_bytes += t.bytes;
+  }
+  out.llc_miss_ms = out.llc_served_bytes * perByteLlc;
+  out.dram_miss_ms = out.dram_miss_bytes * perByteDram;
+  out.total_ms = out.llc_miss_ms + out.dram_miss_ms;
+  return out;
+}
+
 }  // namespace infvino

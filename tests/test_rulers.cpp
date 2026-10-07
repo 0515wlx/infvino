@@ -288,6 +288,105 @@ static void run_tests()
     CHECK_NEAR(occupancyThreads(e, OpSignature::custom("copy_c", {25600, 16})), 0.0, 1e-12,
                "occupancyThreads 0 for small op");
   }
+
+  // --- R71: 内存三级拆分（GPU-L3 / 共享 LLC / DRAM）---
+  {
+    const MemTierTime small = memTierTime(OpSignature::conv3x3(20, 20, 1, 1, 64, 64, 1));
+    CHECK(small.footprint_bytes > 0.0, "R71: footprint positive");
+    CHECK(small.tier == WallKind::GpuL3, "R71: small conv fits GPU L3");
+    CHECK_NEAR(small.dram_bytes, 0.0, 1e-9, "R71: no DRAM bytes for small footprint");
+    const MemTierTime stem = memTierTime(OpSignature::conv3x3(320, 320, 2, 1, 3, 16, 1));
+    CHECK(stem.footprint_bytes > l3PhysicalBytes(), "R71: stem output/input exceeds GPU L3");
+    CHECK(stem.llc_bytes + stem.dram_bytes > 0.0, "R71: stem spills to LLC/DRAM");
+    CHECK_NEAR(stem.total_ms, stem.l3_ms + stem.llc_ms + stem.dram_ms, 1e-12, "R71: tier sum");
+    const MemTierTime huge = memTierTime(OpSignature::conv3x3(640, 640, 1, 1, 64, 64, 1));
+    CHECK(huge.tier == WallKind::Dram, "R71: huge footprint reaches DRAM tier");
+    CHECK(memTierTime(OpSignature::custom("copy_c", {25600, 16})).footprint_bytes == 0.0,
+          "R71: unknown op -> zero footprint");
+  }
+
+  // --- R71: 计算侧多堵墙（寄存器 ILP / SLM 带宽 / 指令配额）---
+  {
+    TuningEntry ov;
+    ov.kernel = "conv3x3_ov";
+    ov.options = "-DOBW=8 -DOBH=2 -DSLM_DIV=1";
+    ov.hard_ceiling = 20.3;
+    const ComputeWall c = computeWall(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1), ov, dev());
+    CHECK(c.fma_family, "R71: conv3x3 is FMA family");
+    CHECK_NEAR(c.acc, 16.0, 1e-9, "R71: OBW8*OBH2 = 16 accumulators");
+    CHECK_NEAR(c.rf_ilp, 1.0, 1e-9, "R71: 7*16/30 saturates -> no reg-ILP derate");
+    CHECK(c.slm_bw_ops > 0.0, "R71: conv3x3 has an SLM-BW ceiling");
+    CHECK(c.slm_capacity_ok, "R71: typical conv3x3 SLM tile fits a WG");
+
+    TuningEntry blk;
+    blk.kernel = "conv3x3_blk";
+    blk.options = "-DOBW=2 -DOBH=2";
+    blk.hard_ceiling = 10.9;
+    const ComputeWall c2 = computeWall(OpSignature::conv3x3(20, 20, 1, 1, 64, 64, 1), blk, dev());
+    CHECK_NEAR(c2.acc, 4.0, 1e-9, "R71: OBW2*OBH2 = 4 accumulators");
+    CHECK(std::abs(c2.rf_ilp - 28.0 / 30.0) < 1e-9, "R71: 7*4/30 reg-ILP derate");
+
+    TuningEntry dw;
+    dw.kernel = "depthwise_f16";
+    dw.hard_ceiling = 32.0 * 0.086;
+    const ComputeWall cd = computeWall(OpSignature::depthwise(80, 80, 1, 1, 64, 3, 1), dw, dev());
+    CHECK(cd.instr_quota && !cd.fma_family, "R71: depthwise = instruction quota, not FMA family");
+
+    TuningEntry ew;
+    ew.kernel = "ew_binary";
+    const ComputeWall ce = computeWall(OpSignature::custom("ew_binary", {100, 2, 0}), ew, dev());
+    CHECK(!ce.fma_family && !ce.instr_quota, "R71: small op has no compute wall");
+  }
+
+  // --- R71: 绑定墙判决 ---
+  {
+    TuningEntry ov;
+    ov.kernel = "conv3x3_ov";
+    ov.options = "-DOBW=8 -DOBH=2 -DSLM_DIV=1";
+    ov.hard_ceiling = 20.3;
+    ov.ms = 0.37;
+    ov.ops = 13.6;
+    const WallVerdict v = attributeWall(OpSignature::conv3x3(80, 80, 1, 1, 64, 64, 1), ov, dev(), 0.37);
+    CHECK(v.hard_ops > 0.0, "R71: hard ceiling positive");
+    CHECK(v.binding == WallKind::FmaIssue || v.binding == WallKind::RegIlp ||
+            v.binding == WallKind::SlmBandwidth,
+          "R71: 80x80 conv3x3 attributed to a compute wall");
+    CHECK(v.ratio_to_wall > 0.0 && v.ratio_to_wall < 1.5, "R71: measured near/under ceiling");
+
+    TuningEntry stem;
+    stem.kernel = "conv3x3_cin3";
+    stem.options = "";
+    stem.hard_ceiling = 12.0;
+    stem.ms = 0.21;
+    const WallVerdict vs = attributeWall(OpSignature::conv3x3(320, 320, 2, 1, 3, 16, 1), stem, dev(), 0.21);
+    CHECK(vs.binding == WallKind::SharedLlc || vs.binding == WallKind::Dram ||
+            vs.binding == WallKind::GpuL3,
+          "R71: stem attributed to a memory tier");
+
+    TuningEntry ew;
+    ew.kernel = "ew_binary";
+    ew.ms = 0.02;
+    const WallVerdict ve = attributeWall(OpSignature::custom("ew_binary", {100, 2, 0}), ew, dev(), 0.02);
+    CHECK(ve.binding == WallKind::Launch, "R71: small op attributed to launch/grid");
+  }
+
+  // --- R71: L3 两级 miss 拆分 ---
+  {
+    std::vector<L3Access> n;
+    L3Access w; w.op = "producer"; w.writes = {{"a", 1.0e6}};
+    n.push_back(w);
+    L3Access big; big.op = "bigread"; big.reads = {{"b", 8.0e6}};
+    n.push_back(big);
+    L3Access re; re.op = "reread"; re.reads = {{"a", 1.0e6}};
+    n.push_back(re);
+    const L3TwoLevelSplit s = l3TwoLevelSplit(n);
+    CHECK(s.l3_cap_bytes > 0.0 && s.llc_cap_bytes > s.l3_cap_bytes, "R71: two-tier capacities ordered");
+    CHECK(s.llc_served_bytes >= 1.0e6 - 1e-6, "R71: 9MB reuse distance served by shared LLC");
+    CHECK(s.dram_miss_bytes >= 8.0e6 - 1e-6, "R71: cold 8MB read goes to DRAM");
+    CHECK(s.l3_miss_bytes >= s.llc_served_bytes + s.dram_miss_bytes - 1e-6, "R71: l3 miss = llc + dram");
+    CHECK_NEAR(s.total_ms, s.llc_miss_ms + s.dram_miss_ms, 1e-12, "R71: two-level cost additivity");
+    CHECK(s.total_ms >= 0.0, "R71: two-level cost non-negative");
+  }
 }
 
 ITEST_MAIN("test_rulers")

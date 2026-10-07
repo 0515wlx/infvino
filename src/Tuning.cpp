@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -826,6 +827,217 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev, const Tuning
   if (s.op == "bias_add") return 1.0;
 
   return 1.0;
+}
+
+// ============================================================================
+// R71: 绑定墙归因（见 Tuning.hpp 的说明）。纯诊断，不参与选择。
+// ============================================================================
+namespace
+{
+bool isFmaKernel(const std::string & k)
+{
+  return k.rfind("conv3x3", 0) == 0 || k.rfind("gemm", 0) == 0 || k == "conv1x1_blk" ||
+         k == "conv1x1_gemv_f16";
+}
+bool isInstrQuotaKernel(const std::string & k) { return k.rfind("depthwise", 0) == 0; }
+
+double flopsOf(const OpSignature & s)
+{
+  if (s.op == "conv3x3") return 2.0 * s.Cout * s.H * s.W * s.Cin * 9.0;
+  if (s.op == "gemm") return 2.0 * s.M * s.N * s.K;
+  if (s.op == "conv1x1" || s.op == "conv1x1_cat4") return 2.0 * s.Cout * s.N * s.Cin;
+  if (s.op == "depthwise" || s.op == "conv_general")
+    return 2.0 * s.Cout * s.H * s.W * s.K * s.K;
+  return 0.0;
+}
+
+// 每线程独立累加链数 ACC（FMA 主导族）。寄存器文件只有 ~40 数据 GRF → ACC 被顶住。
+double accOf(const OpSignature & s, const std::string & k, const std::string & o)
+{
+  if (k.rfind("conv3x3", 0) == 0)
+  {
+    const int obw = tuningOptionInt(o, "-DOBW=", s.stride == 2 ? 5 : 8);
+    const int obh = tuningOptionInt(o, "-DOBH=", s.stride == 2 ? 4 : 2);
+    return static_cast<double>(obw) * obh;
+  }
+  if (k.rfind("gemm", 0) == 0)
+    return static_cast<double>(std::max(1, tuningOptionInt(o, "-DTM=", 8))) *
+           std::max(1, tuningOptionInt(o, "-DTN=", 4));
+  if (k == "conv1x1_blk")
+    return static_cast<double>(std::max(1, tuningOptionInt(o, "-DX_BLOCK=", 4))) *
+           std::max(1, tuningOptionInt(o, "-DY_BLOCK=", 1));
+  if (k == "conv1x1_gemv_f16") return 8.0;   // split-K 归约
+  return 1.0;
+}
+
+// SLM 足迹（与 `occupancyStats` 同源）与「每 SLM 字节喂多少 FLOP」（决定 SLM 带宽上限）。
+// 返回 flop/byte；perWg = 每 WG 触达的输入激活字节；wgThreads = WG 线程数。
+double slmFlopsPerByte(const OpSignature & s, const std::string & k, const std::string & o,
+                       double & perWg, double & wgThreads)
+{
+  perWg = 0.0;
+  wgThreads = 64.0;
+  if (k.rfind("conv3x3", 0) == 0)
+  {
+    const int obw = tuningOptionInt(o, "-DOBW=", s.stride == 2 ? 5 : 8);
+    const int obh = tuningOptionInt(o, "-DOBH=", s.stride == 2 ? 4 : 2);
+    const int slm = std::max(1, tuningOptionInt(o, "-DSLM_DIV=", 1));
+    wgThreads = 16.0 * slm;
+    perWg = 2.0 * s.Cin * (obw + 2.0) * (obh + 2.0);
+    return 16.0;   // lane = 16 输出通道 → 每个输入字节被 16 个 mad 复用
+  }
+  if (k.rfind("gemm", 0) == 0)
+  {
+    const int bm = std::max(1, tuningOptionInt(o, "-DBM=", 64));
+    const int bn = std::max(1, tuningOptionInt(o, "-DBN=", 64));
+    const int bk = std::max(1, tuningOptionInt(o, "-DBK=", 16));
+    const int tm = std::max(1, tuningOptionInt(o, "-DTM=", 8));
+    const int tn = std::max(1, tuningOptionInt(o, "-DTN=", 4));
+    wgThreads = static_cast<double>(bm / tm) * (bn / tn);
+    perWg = 2.0 * bk * (bm + bn);
+    return static_cast<double>(bm) * bn / static_cast<double>(bm + bn);
+  }
+  if (k == "conv1x1_blk")
+  {
+    const int xb = std::max(1, tuningOptionInt(o, "-DX_BLOCK=", 4));
+    const int yb = std::max(1, tuningOptionInt(o, "-DY_BLOCK=", 1));
+    const int slm = std::max(1, tuningOptionInt(o, "-DSLM_DIV=", 1));
+    wgThreads = 16.0 * slm;
+    perWg = 2.0 * s.Cin * xb * yb;
+    return static_cast<double>(xb) * yb;
+  }
+  return 0.0;
+}
+}  // namespace
+
+const char * wallKindName(WallKind w)
+{
+  switch (w)
+  {
+    case WallKind::FmaIssue: return "FMA-issue";
+    case WallKind::RegIlp: return "reg-ILP";
+    case WallKind::SlmBandwidth: return "SLM-bw";
+    case WallKind::SlmCapacity: return "SLM-cap";
+    case WallKind::GpuL3: return "GPU-L3";
+    case WallKind::SharedLlc: return "shared-LLC";
+    case WallKind::Dram: return "DRAM";
+    case WallKind::Launch: return "launch";
+    default: return "unknown";
+  }
+}
+
+MemTierTime memTierTime(const OpSignature & s)
+{
+  MemTierTime t;
+  const double bytes = singlePassBytes(s);
+  if (bytes <= 0.0) return t;
+  t.footprint_bytes = bytes;
+  const double capL3 = l3PhysicalBytes();       // GPU 私有 L3 = 3.75 MiB
+  const double capAll = l3WarmCapBytes();       // L3 + 共享 LLC ≈ 12.3 MB
+  const double b3 = std::min(bytes, capL3);
+  const double bl = std::min(std::max(bytes - b3, 0.0), std::max(0.0, capAll - capL3));
+  const double bd = std::max(0.0, bytes - b3 - bl);
+  t.l3_bytes = b3;
+  t.llc_bytes = bl;
+  t.dram_bytes = bd;
+  // 各段代表带宽：GPU-L3 用锁频 copy 峰值 145；共享 LLC 段用实测 4–8 MB 段中值 ~35；
+  // DRAM 用实测平台 20。三段耗时相加 = 串行足迹下界。
+  constexpr double kBwL3 = 145.0, kBwLlc = 35.0;
+  const double bwDram = l3DramBwGbps();
+  t.l3_ms = b3 / (kBwL3 * 1e6);
+  t.llc_ms = bl / (kBwLlc * 1e6);
+  t.dram_ms = bd / (bwDram * 1e6);
+  t.total_ms = t.l3_ms + t.llc_ms + t.dram_ms;
+  t.tier = (bd > 0.0) ? WallKind::Dram : (bl > 0.0 ? WallKind::SharedLlc : WallKind::GpuL3);
+  return t;
+}
+
+ComputeWall computeWall(const OpSignature & s, const TuningEntry & e, const ClDeviceInfo & dev)
+{
+  ComputeWall c;
+  const std::string & k = e.kernel;
+  c.fma_family = isFmaKernel(k);
+  c.instr_quota = isInstrQuotaKernel(k);
+  if (!c.fma_family && !c.instr_quota) return c;   // 小算子/内存族：计算侧不适用
+  c.isa_ops = (e.hard_ceiling > 0.0) ? e.hard_ceiling : e.expected;
+  if (c.isa_ops <= 0.0) return c;
+  if (c.fma_family)
+  {
+    c.acc = accOf(s, k, e.options);
+    c.rf_ilp = std::max(0.0, std::min(1.0, kEfResidentThreads * c.acc / kFmaLatencyCyc));
+  }
+  c.rf_ops = c.isa_ops * c.rf_ilp;
+  double perWg = 0.0, wgThr = 64.0;
+  const double fpb = slmFlopsPerByte(s, k, e.options, perWg, wgThr);
+  c.slm_bytes_per_wg = perWg;
+  c.slm_bytes_per_lane = (perWg > 0.0 && wgThr > 0.0) ? perWg / wgThr : 0.0;
+  c.slm_capacity_ok = (perWg <= kSlmBytesPerWg);
+  if (fpb > 0.0 && c.fma_family)
+  {
+    const double eu = dev.eu > 0 ? dev.eu : 80;
+    const double clk = dev.clock_mhz > 0 ? dev.clock_mhz : 1300.0;
+    c.slm_bw_ops = fpb * kSlmReadBwGbps * 1e9 / (eu * clk * 1e6);
+  }
+  // 计算侧 binding = 在 isa / rf / slm-bw 里取最小；容量不足直接判 SLM-cap。
+  double best = c.isa_ops;
+  c.binding = WallKind::FmaIssue;
+  if (c.rf_ops < best) { best = c.rf_ops; c.binding = WallKind::RegIlp; }
+  if (c.slm_bw_ops > 0.0 && c.slm_bw_ops < best) { best = c.slm_bw_ops; c.binding = WallKind::SlmBandwidth; }
+  if (!c.slm_capacity_ok) c.binding = WallKind::SlmCapacity;
+  return c;
+}
+
+WallVerdict attributeWall(const OpSignature & s, const TuningEntry & e, const ClDeviceInfo & dev,
+                          double measured_ms)
+{
+  WallVerdict v;
+  v.comp = computeWall(s, e, dev);
+  v.mem = memTierTime(s);
+  const double eu = dev.eu > 0 ? dev.eu : 80;
+  const double clk = dev.clock_mhz > 0 ? dev.clock_mhz : 1300.0;
+  const double flops = flopsOf(s);
+
+  double fma = 0.0;
+  if (v.comp.fma_family && v.comp.isa_ops > 0.0)
+  {
+    fma = std::min(v.comp.isa_ops, v.comp.rf_ops);
+    if (v.comp.slm_bw_ops > 0.0) fma = std::min(fma, v.comp.slm_bw_ops);
+    if (!v.comp.slm_capacity_ok) fma *= 0.5;
+  }
+  else if (v.comp.instr_quota && v.comp.isa_ops > 0.0)
+    fma = v.comp.isa_ops;
+
+  double mem = std::numeric_limits<double>::infinity();
+  if (flops > 0.0 && v.mem.total_ms > 0.0)
+    mem = flops / (eu * clk * 1e6 * v.mem.total_ms * 1e-3);
+
+  v.fma_ops = fma;
+  v.mem_ops = mem;
+  if (flops > 0.0 && measured_ms > 0.0)
+    v.measured_ops = flops / (eu * clk * 1e6 * measured_ms * 1e-3);
+  else
+    v.measured_ops = e.ops;
+
+  if (fma <= 0.0 && !std::isfinite(mem))
+  {
+    v.binding = WallKind::Launch;
+    v.hard_ops = 0.0;
+  }
+  else if (fma <= mem)
+  {
+    v.hard_ops = fma;
+    v.binding = v.comp.binding;
+  }
+  else
+  {
+    v.hard_ops = mem;
+    v.binding = v.mem.tier;
+  }
+  // N=1 GEMV 的瓶颈是**归约延迟 / 网格**（每行一条 sub-group 归约链），不是内存 roofline：
+  // 把它的 mem 上限当绑定墙会把它误判成「离带宽墙还远」。归到 Launch/网格。
+  if (e.kernel == "conv1x1_gemv_f16") v.binding = WallKind::Launch;
+  v.ratio_to_wall = (v.hard_ops > 0.0) ? v.measured_ops / v.hard_ops : 0.0;
+  return v;
 }
 
 }  // namespace infvino

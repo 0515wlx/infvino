@@ -89,6 +89,11 @@ struct L3ModelConfig
   double occ_cap_slope = 0.5;                      ///< effCap = max(anchor, L3 − slope·press)
   bool   compute_prices = true;                    ///< 是否用有限差分算逐节点价 ρ_i
   L3Policy policy = l3DefaultPolicy();             ///< R60: 替换策略等价模型（默认严格 LRU）
+  // R71: 两级 miss 拆分（`l3TwoLevelSplit`）用；不影响 `evaluateL3` 的既有语义。
+  double l3_private_bytes = l3PhysicalBytes();    ///< GPU 私有 L3 有效容量（3.75 MiB）
+  double l3_bw_gbps = 145.0;                       ///< L3 命中带宽（copy 峰值）
+  double llc_bw_gbps = 35.0;                       ///< 共享 LLC 段服务带宽（实测中值）
+  double dram_bw_gbps = 20.0;                      ///< DRAM 平台带宽
 };
 
 struct L3Result
@@ -137,6 +142,33 @@ struct L3StackProfile
  * `L3Result::node_evict_ms` 给出精确逐出归因价。
  */
 L3Result evaluateL3(const std::vector<L3Access> & nodes, const L3ModelConfig & cfg = {});
+
+/**
+ * @brief R71: **两级缓存（GPU 私有 L3 → 共享 LLC → DRAM）miss 拆分**（诊断，不参与选择）。
+ *
+ * `evaluateL3` 把「读 miss」统一按 `(1/BW_DRAM − 1/BW_L3)` 折算——它不区分「只是从
+ * GPU 私有 L3（3.75 MiB）掉到共享 LLC（8 MiB）」（每字节便宜 ~3×）与「两级都溢出、真打
+ * DRAM」。R71 用**栈距离**把读 miss 拆成两档（与 `spillAtCapacity` 同源、容量无关）：
+ *
+ *   * `llc_served_bytes` = 栈距离 > GPU 私有 L3 但 ≤ 两级和（服务自 LLC）；
+ *   * `dram_miss_bytes`  = 栈距离 > 两级和（或冷启动，服务自 DRAM）。
+ *
+ * 两档分别按各自相对 L3 命中的**增量代价**计价（LLC：`1/BW_LLC − 1/BW_L3`；
+ * DRAM：`1/BW_DRAM − 1/BW_L3`）。这是纯诊断视图，`evaluateL3` 的既有语义与选择不变。
+ */
+struct L3TwoLevelSplit
+{
+  double l3_cap_bytes = 0.0;       ///< GPU 私有 L3 有效容量
+  double llc_cap_bytes = 0.0;      ///< 跨算子有效容量（L3 + LLC）
+  double l3_miss_bytes = 0.0;      ///< 超过 GPU L3 的读字节（= llc_served + dram）
+  double llc_served_bytes = 0.0;   ///< 由共享 LLC 服务
+  double dram_miss_bytes = 0.0;    ///< 直接打 DRAM
+  double llc_miss_ms = 0.0;        ///< LLC 服务部分的增量耗时
+  double dram_miss_ms = 0.0;       ///< DRAM 服务部分的增量耗时
+  double total_ms = 0.0;           ///< = llc_miss_ms + dram_miss_ms
+};
+L3TwoLevelSplit l3TwoLevelSplit(const std::vector<L3Access> & nodes,
+                                const L3ModelConfig & cfg = {});
 
 /**
  * @brief R60: 无限栈复用/栈距离画像 + 精确逐出归因。

@@ -1751,6 +1751,15 @@ void PlanModel::resolveLayoutChoices()
                      nodes_[i].op.c_str(), rows[k].first,
                      l3r.spill_ms > 0.0 ? rows[k].first / l3r.spill_ms * 100.0 : 0.0);
       }
+      // R71: 把总 spill 按**两级层次**拆开：GPU 私有 L3 掉到共享 LLC 的字节（便宜）与
+      // 两级都溢出、真打 DRAM 的字节（贵）。这是「带宽受限到底撞的是哪级」的直接答案。
+      const L3TwoLevelSplit split = l3TwoLevelSplit(buildL3Access(), l3c);
+      std::fprintf(stderr,
+                   "[layout] spill tiers: GPU-L3-miss=%.4f MB (->LLC %.4f MB, ->DRAM %.4f MB); "
+                   "cost LLC=%.4f ms DRAM=%.4f ms total=%.4f ms\n",
+                   split.l3_miss_bytes / 1e6, split.llc_served_bytes / 1e6,
+                   split.dram_miss_bytes / 1e6, split.llc_miss_ms, split.dram_miss_ms,
+                   split.total_ms);
     }
   }
   // R52: 池/布局一致性守卫。任何被标记 fsv16 的张量都必须有放得下补齐布局的缓冲，

@@ -206,6 +206,7 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round69-occupancy-contract-and-spill-interface.md`](docs/round69-occupancy-contract-and-spill-interface.md) | **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选几何收进注册表，`occupancyPressure`/`buildL3Access` 注册表优先；选择逐位不变、`mean_rel` 与 R68 相同 |
 | [`docs/open-items.md`](docs/open-items.md) | **开放项登记表**：系统「未完成/未决/暂缓/负结果」的单一权威清单（R70 起维护） |
 | [`docs/round70-status.md`](docs/round70-status.md) | **R70 统一收尾**：逐节点 spill 归因 + `--global` NO-OP 硬信号 + 残差落盘；三模型 `model_check`/`reuse_check` 回归；全量 retune 激活 fixpoint 的负结果 |
+| [`docs/round71-binding-wall-model.md`](docs/round71-binding-wall-model.md) | **R71 绑定墙分析框架**：带宽侧补 GPU 私有 L3/共享 LLC/DRAM 三级足迹与两级 spill（`memTierTime`/`l3TwoLevelSplit`）；计算侧补寄存器 ILP 与 SLM 带宽/容量（`computeWall`/`attributeWall`）；`kernel_autotune --wall-report` + `scripts/analyze_walls.py`（按调用加权）。**纯诊断，不参与选择** |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -387,4 +388,5 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] **R46 整网调优全流程实测**：跑通三模型（锁频/分批/无 HANG），暴露并修复 3 个基础设施 bug（`--global` 在有条目缓存时空操作 + `--retune` 分批不推进、P0#6 漏掉 N==1 GEMV、缺最终验收门）；加门后 mb 回归 +5.8%→−0.2%、y8 +0.5%（均噪声内），但**暂无可靠正收益**；实证 in-situ `min` 与稳态口径错配（同改动 in-situ −3~5% vs 稳态 +12%）；给出 **blocked chain 前置条件**（`docs/round46-global-flow-findings.md`）
 - [x] **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选占用几何收进注册表（补全 conv3x3 四 kernel / gemm_sk / GEMV / 非 blk depthwise），`occupancyPressure` 与 `buildL3Access` 注册表优先（R48 §10.6-B 缺口）；三模型选择逐位不变、`model_check`/`reuse_check` PASS、`mean_rel` 与 R68 相同；`INFVINO_LEGACY_OCCUPANCY`/`INFVINO_NO_MEM` 可回退/逐族消融（`docs/round69-occupancy-contract-and-spill-interface.md`）
 - [x] **R70 统一收尾**：逐节点 spill 归因暴露（`INFVINO_LAYOUT_REPORT=1` + `INFVINO_LAYOUT_SPILL=1`）；`--global` 空操作硬信号（`globalRetune` 返回 `-1` → `kernel_autotune` 退出码 3、`autotune.py` 检测停止）；整网回验残差数据集落盘（`--residual` / `INFVINO_GLOBAL_RESIDUAL`）；新增 [`docs/open-items.md`](docs/open-items.md) 开放项权威清单（`docs/round70-status.md`）
+- [x] **R71 绑定墙分析框架**：带宽侧补 **GPU 私有 L3/共享 LLC/DRAM 三级足迹**与**两级 spill 拆分**（`memTierTime`/`l3TwoLevelSplit`）；计算侧补**寄存器 ILP**与**SLM 带宽/容量**（`computeWall`/`attributeWall`）；`kernel_autotune --wall-report` + `scripts/analyze_walls.py`（按调用加权墙预算）；**纯诊断、不改选择与数值**（三模型 `model_check` 逐位不变、`reuse_check` PASS、`ctest` 6/6）。把框架用于三模型与 OpenVINO 逐层对照的结论另文记录（未随本框架提交）
 - [ ] 其余开放/暂缓项见 [`docs/open-items.md`](docs/open-items.md)：`KernelFamily::launch` 声明化（A2）、完整 blocked chain（B1）、conv3x3 布局链（B3）、epilogue 可组合化（D6）、降低 launch 开销（E1）、多 Session 并行缓冲（E3）、seg/obb 解码（F1）、更多模型（F2）等

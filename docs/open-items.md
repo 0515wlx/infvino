@@ -114,6 +114,8 @@
 | G2 | `scripts/kernel_diag.sh`（feed/store 隔离 + hard_ratio + 墙判决） | ✅ | R42 §6-2 已做成一条命令。 | — |
 | G3 | 接 `unitrace` / MD API 做 L3/DRAM 字节与 EU stall 交叉验证 | 🟡 | R42 §6-5：OA 采样受本机内核 `CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS` 未开限制（R43）。 | 内核 tracepoint 可用 |
 | G4 | host 分段 / 墙钟进一步归因 | 🔴 | `benchmark.md` §2.4：入队提交 / 同步 / 其余 host 三分。 | 与 E1 联动 |
+| G5 | **绑定墙归因框架**（带宽三级 + 计算多墙） | ✅ R71 | 新增 `memTierTime`/`computeWall`/`attributeWall` + `l3TwoLevelSplit`；`kernel_autotune --wall-report` + `scripts/analyze_walls.py`（按调用加权）。诊断层，**不参与选择**；三模型数值逐位不变。见 `round71-binding-wall-model.md`。 | — |
+| G6 | 绑定墙框架**应用于三模型 + 与 OpenVINO 逐层对照** | 🟡 | 框架已提交；把框架跑在 OV 的同一批模型上、定位 OV 优势来源的结论尚未落库（待 OV 构建/对照）。目的是判断本项目技术是否**系统性**强于 OV，而非单点。 | 完成 OV 逐层对照并把结论写入文档 |
 
 ---
 
