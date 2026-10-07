@@ -1570,11 +1570,12 @@ int benchL3Pollute(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hite
   cl_kernel khot = rt.buildKernel("micro", "l3_hot_read", "-cl-mad-enable");
   cl_kernel kagg = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
   const size_t lws = 64;
-  const uint hl = static_cast<uint>(hot_lines), hi = static_cast<uint>(hiters), one = 1u;
+  const uint hl = static_cast<uint>(hot_lines), hi = static_cast<uint>(hiters), one = 1u, zero = 0u;
   clSetKernelArg(khot, 0, sizeof(hot), &hot);
   clSetKernelArg(khot, 1, sizeof(sink), &sink);
   clSetKernelArg(khot, 2, sizeof(hl), &hl);
   clSetKernelArg(khot, 3, sizeof(hi), &hi);
+  clSetKernelArg(khot, 4, sizeof(zero), &zero);
   const size_t hotGws = static_cast<size_t>(hot_gws);
   const double hotBytes = static_cast<double>(hot_lines) * hiters * 64.0;
   auto measure = [&](int agws, int afp) -> double {
@@ -1634,12 +1635,12 @@ int benchL3Pollute(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hite
 // Machine-readable CSV: iters,R_A_MB,hot_ms,hot_gbps,retained (retained = ref_ms/hot_ms).
 // Sweeps the *reuse count* (hot_iters) too, so a fitter can tell whether heavily-reused
 // data resists streaming pollution (pLRU/NRU-like) or not (strict LRU).
-int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
+int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hot_off,
                   const std::vector<int> & iters_list, const std::vector<int> & agg_wi,
                   const std::vector<int> & agg_fp, int fi)
 {
   const int maxWi = 8192, maxFp = 256;
-  const size_t hn = static_cast<size_t>(hot_lines) * 16 + 16;
+  const size_t hn = (static_cast<size_t>(hot_off) + hot_lines) * 16 + 16;
   const size_t an = static_cast<size_t>(maxWi) * maxFp * 16;
   cl_mem hot = rt.alloc(hn * 4, CL_MEM_READ_ONLY);
   cl_mem agg = rt.alloc(an * 4, CL_MEM_READ_ONLY);
@@ -1649,14 +1650,15 @@ int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
   cl_kernel khot = rt.buildKernel("micro", "l3_hot_read", "-cl-mad-enable");
   cl_kernel kagg = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
   const size_t lws = 64;
-  const uint hl = static_cast<uint>(hot_lines), one = 1u;
+  const uint hl = static_cast<uint>(hot_lines), one = 1u, off = static_cast<uint>(hot_off);
   clSetKernelArg(khot, 0, sizeof(hot), &hot);
   clSetKernelArg(khot, 1, sizeof(sink), &sink);
   clSetKernelArg(khot, 2, sizeof(hl), &hl);
+  clSetKernelArg(khot, 4, sizeof(off), &off);
   const size_t hotGws = static_cast<size_t>(hot_gws);
-  std::printf("# l3retain hot=%d lines (%d KB) hot_gws=%d  (self-calibration; no vendor docs)\n",
-              hot_lines, hot_lines * 64 / 1024, hot_gws);
-  std::printf("iters,R_A_MB,hot_ms,hot_gbps,retained\n");
+  std::printf("# l3retain hot=%d lines (%d KB) hot_gws=%d hot_off=%d  (self-calibration; no vendor docs)\n",
+              hot_lines, hot_lines * 64 / 1024, hot_gws, hot_off);
+  std::printf("iter,off,R_A_MB,hot_ms,hot_gbps,retained\n");
   for (int hi : iters_list)
   {
     if (hi <= 0) continue;
@@ -1685,7 +1687,7 @@ int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
     (void)measure(1024, 4);                        // discard first (cold)
     const double base = measure(4096, 4);          // ref: R_A = 1 MB (no pollution)
     const double baseGbs = base > 0 ? hotBytes / (base * 1e-3) / 1e9 : 0.0;
-    std::printf("%d,1.05,%.6f,%.2f,1.000\n", hi, base, baseGbs);
+    std::printf("%d,%d,1.05,%.6f,%.2f,1.000\n", hi, hot_off, base, baseGbs);
     struct Row { double R; int wi, fp; double ms; };
     std::vector<Row> rows;
     for (int wi : agg_wi)
@@ -1698,7 +1700,7 @@ int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
     for (const auto & r : rows)
     {
       const double gbs = r.ms > 0 ? hotBytes / (r.ms * 1e-3) / 1e9 : 0.0;
-      std::printf("%d,%.2f,%.6f,%.2f,%.3f\n", hi, r.R / 1e6, r.ms, gbs,
+      std::printf("%d,%d,%.2f,%.6f,%.2f,%.3f\n", hi, hot_off, r.R / 1e6, r.ms, gbs,
                   base > 0 && r.ms > 0 ? base / r.ms : 0.0);
     }
   }
@@ -1707,6 +1709,53 @@ int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws,
   clReleaseMemObject(sink);
   clReleaseKernel(khot);
   clReleaseKernel(kagg);
+  return 0;
+}
+
+// R61: set/associativity geometry probe. Touch `nlines` lines at a fixed line stride,
+// repeatedly; a stride sharing factors with the set count collapses the touched lines
+// onto few sets -> associativity-limited thrash -> bandwidth drop.
+int benchL3Conflict(infvino::ClRuntime & rt, const std::vector<int> & strides, int nlines,
+                    int iters, int wi)
+{
+  const int maxStride = 8192;
+  size_t maxUsed = 16;
+  for (int s : strides) maxUsed = std::max(maxUsed, static_cast<size_t>(std::max(1, s)) * nlines);
+  maxUsed += 16;
+  const size_t kMaxLines = 64ull * 1024 * 1024;   // 4 GiB cap (uint32 elements)
+  if (maxUsed > kMaxLines)
+  {
+    std::fprintf(stderr, "[l3conflict] refusing: span %zu lines exceeds cap\n", maxUsed);
+    return 1;
+  }
+  cl_mem in = rt.alloc(maxUsed * 64, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(maxUsed * 16, 1); rt.write(in, maxUsed * 64, z.data()); }
+  cl_kernel k = rt.buildKernel("micro", "l3_stride", "-cl-mad-enable");
+  const size_t lws = 64;
+  std::printf("[l3conflict] nlines=%d wi=%d iters=%d\n", nlines, wi, iters);
+  std::printf("  stride_lines  span_MB    ms     GB/s\n");
+  for (int s : strides)
+  {
+    if (s < 1 || s > maxStride) continue;
+    const uint nl = static_cast<uint>(nlines), sl = static_cast<uint>(s), it = static_cast<uint>(iters);
+    clSetKernelArg(k, 0, sizeof(in), &in);
+    clSetKernelArg(k, 1, sizeof(sink), &sink);
+    clSetKernelArg(k, 2, sizeof(nl), &nl);
+    clSetKernelArg(k, 3, sizeof(sl), &sl);
+    clSetKernelArg(k, 4, sizeof(it), &it);
+    const size_t gws = static_cast<size_t>(wi);
+    double ms = 0.0;
+    try { ms = rt.timeMs([&] { return infvino::ClRuntime::enqueueND(rt.queue(), k, 1, &gws, &lws); }, 2, 5); }
+    catch (const std::exception &) { ms = 0.0; }
+    const double acc = static_cast<double>(iters) * static_cast<double>(wi);
+    const double bytes = acc * 64.0;   // each thread does one 64B line touch per iter
+    std::printf("  %-13d %7.2f  %7.4f  %7.1f\n", s, static_cast<double>(nlines) * s * 64.0 / 1e6,
+                ms, ms > 0 ? bytes / (ms * 1e-3) / 1e9 : 0.0);
+  }
+  clReleaseMemObject(in);
+  clReleaseMemObject(sink);
+  clReleaseKernel(k);
   return 0;
 }
 
@@ -1733,7 +1782,9 @@ int main(int argc, char ** argv)
   int passes = 32;
   int hot_lines = 16384, hot_gws = 4096, hot_iters = 1;
   int nseq = 8, seq_mode = 0;
+  int hot_off = 0, nlines = 128;
   std::vector<int> hot_iters_list;
+  std::vector<int> stride_list;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -1798,6 +1849,12 @@ int main(int argc, char ** argv)
       hot_iters = std::atoi(next().c_str());
     } else if (a == "--hot-sweep") {
       hot_iters_list = parseInts(next());
+    } else if (a == "--hot-offset") {
+      hot_off = std::atoi(next().c_str());
+    } else if (a == "--nlines") {
+      nlines = std::atoi(next().c_str());
+    } else if (a == "--line-stride") {
+      stride_list = parseInts(next());
     } else if (a == "--nseq") {
       nseq = std::atoi(next().c_str());
     } else if (a == "--seq-mode") {
@@ -1929,7 +1986,11 @@ int main(int argc, char ** argv)
     if (hot_iters_list.empty()) hot_iters_list = {1, 4, 16};
     if (wi_list.empty()) wi_list = {1024, 2048, 4096, 8192};
     if (fp_list.empty()) fp_list = {4, 8, 16, 24, 32, 48};
-    rc = benchL3Retain(rt, hot_lines, hot_gws, hot_iters_list, wi_list, fp_list, 5);
+    rc = benchL3Retain(rt, hot_lines, hot_gws, hot_off, hot_iters_list, wi_list, fp_list, 5);
+  } else if (op == "l3conflict") {
+    if (stride_list.empty())
+      stride_list = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048};
+    rc = benchL3Conflict(rt, stride_list, nlines, passes, wi_list.empty() ? 1024 : wi_list[0]);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

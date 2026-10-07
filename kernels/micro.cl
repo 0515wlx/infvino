@@ -326,12 +326,27 @@ __kernel void l3_probe(__global const uint *restrict in, __global uint *sink,
 // 「B 的输入（热点）是否被 A 的占用（aggressor）冲掉」——即跨算子 L3 污染的直接测量。
 // ---------------------------------------------------------------------------
 __kernel void l3_hot_read(__global const uint *restrict hot, __global uint *sink,
-                          const uint hot_lines, const uint hiters) {
+                          const uint hot_lines, const uint hiters, const uint hot_off) {
   const uint gid = get_global_id(0);
   const uint gsz = get_global_size(0);
   uint acc = 0;
   for (uint p = 0; p < hiters; ++p)
-    for (uint k = gid; k < hot_lines; k += gsz) acc += hot[(size_t)k * 16u];
+    for (uint k = gid; k < hot_lines; k += gsz) acc += hot[(size_t)(k + hot_off) * 16u];
+  if (acc == 0xdeadbeefu) sink[0] = acc;
+}
+
+// R61 几何探针：协作触碰 `nlines` 条 line，**行距 stride_lines**（单位=64B line），重复
+// `iters` 遍。当 stride 与「组数」不互质（尤其 stride = 组数 的倍数）时，触碰的行塌到少数
+// set → 相连度不足 → 吞吐塌陷。扫 stride 可探测 set 数 / 相连度 / 组索引哈希。
+__kernel void l3_stride(__global const uint *restrict in, __global uint *sink,
+                        const uint nlines, const uint stride_lines, const uint iters) {
+  const uint gid = get_global_id(0);
+  const uint gsz = get_global_size(0);
+  uint acc = 0;
+  for (uint j = 0; j < iters; ++j) {
+    const uint idx = (j * gsz + gid) % nlines;      // 所有线程活跃，只触碰 nlines 条 line
+    acc += in[(size_t)idx * (size_t)stride_lines * 16u];
+  }
   if (acc == 0xdeadbeefu) sink[0] = acc;
 }
 

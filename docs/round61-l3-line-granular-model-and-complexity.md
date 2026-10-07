@@ -6,9 +6,14 @@
 > 结论先给：
 > * 公开 PRM（Tiger Lake Vol.7 Memory Cache）**逐字给出**替换算法：**每 set 一个 N-bit 向量的
 >   1b LRU**（Fill 选第一个 0 位 way 并翻转为 1；命中置 1；全 1 清空；"Allocate on fill"）。
->   几何：**bank = 480 KB = 120 way × 64 set × 64 B**。→ 精确模型是**组相联、行粒度 1b-NRU**，
->   不是幂律。已实现 `L3LineModel` + 实验台 `l3linesim`，复现出**阈值 ≈ 物理容量（7.86 MB）**；
+>   几何：**bank = 480 KiB = 120 way × 64 set × 64 B**。→ 精确模型是**组相联、行粒度 1b-NRU**，
+>   不是幂律。已实现 `L3LineModel` + 实验台 `l3linesim`，复现出**阈值 ≈ 物理容量**；
 >   `reuse^0.30` 的经验上升**主要来自测量摊销**（多遍掩盖首遍 miss），已降级为交叉验证。
+>
+> ⚠️ **R62 更正**：本文原先按 16 bank 取 1024 set（7.86 MB）。R62 的独立几何测量表明
+> **组周期 512 行**、容量膝点 ~4 MB ⇒ GPU L3 = **8 bank × 480 KiB = 512 set × 120 way = 3.75 MiB**；
+> R59 的 8 MiB 是 **CPU** L3。本文下方出现 `1024 set / 7.86 MB` 处均以 R62 为准。见
+> [`round62-l3-fidelity-geometry-correction.md`](round62-l3-fidelity-geometry-correction.md)。
 > * 复杂度：**严格 LRU 单次＝ O(A)（哈希表+双向链表）**；当前实现是 **O(A·D)**（vector 线性
 >   扫描+`erase`）；有限差分定价再乘节点数。**栈距离把「容量扫描」从 O(K·A) 降到
 >   O(A log D) 一次 + O(1)/容量**。行粒度 A_L≈3×10⁶ 时：naive O(A·D) 不可行（~10¹³）；
@@ -28,7 +33,7 @@
 * **分配**：*"Allocate on fill"*（数据回来后分配，不是命中 miss 时）。
 * **几何**：每个 bank `480 KB = 120 logical ways`（≤104 way 作 L3$，其余 URB），`64B` 行，
   `2 ways/sector`，8 KB 分段粒度 ⇒ **64 set/bank**。SKU bank 数见 Configurations 卷；本机 8 MB
-  工作点取 **1024 set × 120 way × 64 B = 7.86 MB**。
+  工作点取 **512 set × 120 way × 64 B = 3.75 MiB**（R62）。
 
 ### 1.2 实现与验证
 
@@ -36,10 +41,10 @@
 与严格 LRU 对照；每 set 用 `tag→way` 表（O(1) 命中）与逐 way 位向量。`src/tools/l3linesim.cpp`：
 
 ```
-$ ./build/l3linesim --op probe --sets 1024 --ways 120 --hot-lines 16384 --reuse 1,4,16 --agg 4,6,8,12,16,25
+$ ./build/l3linesim --op probe --sets 512 --ways 120 --hot-lines 16384 --reuse 1,4,16 --agg 4,6,8,12,16,25
  reuse  agg_MB   NRU1B_hit%  LRU_hit%
   1      4/6      100 / 100
-  1      8/…/25    0 /   0        <- 阈值 ≈ 7.86 MB ≈ 物理容量
+  1      8/…/25    0 /   0        <- 阈值 ≈ 3.75 MiB ≈ 物理容量
   4      8+        75 /  75       <- 后几遍补回（摊销）
  16      8+       93.8/ 93.8
 ```
@@ -118,7 +123,7 @@ Cost = Σ_i kernel_ms     (O(N)，查表，可加)
 | 定价 ×P 节点 | ×~10² | 秒–分钟级（离线可接受） |
 | 栈距离 O(A log D)：3×10⁶ × 22 | ~0.1–0.5 s **一次**，之后任意容量 O(1) | **可行** |
 
-内存：`sets×ways`（1024×120）+ 每 set 的 `tag→way` 表；行粒度常驻仅 `1.3×10⁵` 项 → 几 MB。
+内存：`sets×ways`（512×120）+ 每 set 的 `tag→way` 表；行粒度常驻仅 `1.3×10⁵` 项 → 几 MB。
 
 ### 3.3 实测（`l3linesim --op scale`，纯 host）
 
@@ -162,13 +167,13 @@ accesses=3000000 -> 1513.2 ms(252 ns/access)   # 严格线性：O(A)
 ```bash
 # 公开文档所述的 1b-NRU 行粒度模型（host，无需 GPU）
 cmake --build build -j --target l3linesim
-./build/l3linesim --op probe --sets 1024 --ways 120 --hot-lines 16384 \
+./build/l3linesim --op probe --sets 512 --ways 120 --hot-lines 16384 \
     --reuse 1,4,16 --agg 4,6,8,12,16,25
 ./build/l3linesim --op scale --accesses 3000000 --working-mb 64 --reps 2
 
 # 标定（documented_model 为权威；reuse^alpha 仅交叉验证）
 python3 scripts/l3_calibrate.py --raw /tmp/l3retain.csv --out config/l3_calibration.json \
-    --sets 1024 --ways 120
+    --sets 512 --ways 120
 
 # 回归
 ./build/test_l3_model   # 新增 L3LineModel 用例

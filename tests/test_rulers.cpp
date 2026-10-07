@@ -184,20 +184,22 @@ static void run_tests()
           "effectiveBw rises with concurrency");
   }
 
-  // --- R59: L3 实测标定锚点（物理 L3 = 8 MiB，非旧 3.75 MB）---
+  // --- R62: L3 几何锚点（GPU L3 = 3.75 MiB，非 R59 误用的 CPU 8 MiB）---
   {
-    CHECK_NEAR(l3PhysicalBytes(), 8.0e6, 1.0, "R59: physical L3 = 8 MiB (measured)");
-    CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R59: private-tile cap knee = 2 MB (R55)");
-    CHECK(l3DefaultCapBytes() > 3.75e6, "R59: default LRU capacity uses the real L3 (not legacy)");
-    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R59: default cap == physical L3");
-    CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R59: default anchor == private cap");
-    CHECK(l3SramBwGbps() > l3DramBwGbps(), "R59: SRAM BW > DRAM BW");
-    // legacy 开关（A/B）：置 1 时回退 R47 的 3.75MB / 1MB。
+    CHECK_NEAR(l3PhysicalBytes(), 3932160.0, 1.0, "R62: GPU L3 = 3.75 MiB (8 bank x 480 KiB)");
+    CHECK_NEAR(l3PhysicalBytes(), 512.0 * 120.0 * 64.0, 1.0, "R62: GPU L3 = 512 set x 120 way x 64B");
+    CHECK_NEAR(l3CpuL3Bytes(), 8388608.0, 1.0, "R62: CPU L3 = 8 MiB (reference)");
+    CHECK(l3PhysicalBytes() < l3CpuL3Bytes(), "R62: GPU L3 < CPU L3 (R59 had used the CPU value)");
+    CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R62: private-tile cap knee = 2 MB (R55)");
+    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R62: default cap == GPU L3 (geometry)");
+    CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R62: default anchor == private cap");
+    CHECK(l3SramBwGbps() > l3DramBwGbps(), "R62: SRAM BW > DRAM BW");
+    // legacy 开关（A/B）：置 1 时回退 R59 的 CPU 值 8 MiB / 1 MiB。
     setenv("INFVINO_L3_LEGACY", "1", 1);
-    CHECK_NEAR(l3DefaultCapBytes(), 3.75e6, 1.0, "R59: legacy cap = 3.75 MB");
-    CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R59: legacy anchor = 1 MB");
+    CHECK_NEAR(l3DefaultCapBytes(), l3CpuL3Bytes(), 1.0, "R62: legacy cap = CPU L3 (8 MiB)");
+    CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R62: legacy anchor = 1 MB");
     unsetenv("INFVINO_L3_LEGACY");
-    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R59: back to calibrated after unset");
+    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R62: back to geometry after unset");
   }
 
   // --- R60: reorder 可加成本 = launch floor + 传输/BW(state) + L3 策略解析 ---

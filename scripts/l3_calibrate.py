@@ -58,12 +58,17 @@ def parse_raw(text):
         if not line or line.startswith("#") or line.lower().startswith("iters,"):
             continue
         parts = line.split(",")
-        if len(parts) != 5:
+        # 5 columns (iter,R_A,ms,gbs,retained) or 6 (iter,off,R_A,ms,gbs,retained)
+        if len(parts) == 5:
+            it_s, r_s, ret_s = parts[0], parts[1], parts[4]
+        elif len(parts) == 6:
+            it_s, r_s, ret_s = parts[0], parts[2], parts[5]
+        else:
             continue
         try:
-            iters = int(parts[0])
-            r_mb = float(parts[1])
-            retained = float(parts[4])
+            iters = int(it_s)
+            r_mb = float(r_s)
+            retained = float(ret_s)
         except ValueError:
             continue
         groups.setdefault(iters, []).append((r_mb * 1e6, retained))
@@ -117,7 +122,7 @@ def main():
     ap.add_argument("--out", default="config/l3_calibration.json")
     ap.add_argument("--level", type=float, default=0.5, help="retention level for the knee (default 0.5)")
     ap.add_argument("--hot-set-bytes", type=int, default=HOT_SET_BYTES_DEFAULT)
-    ap.add_argument("--sets", type=int, default=1024, help="L3 sets (= banks x 64)")
+    ap.add_argument("--sets", type=int, default=512, help="L3 sets (8 banks x 64 sets; R62 geometry)")
     ap.add_argument("--ways", type=int, default=120, help="L3 ways/set (PRM: 120 logical ways)")
     args = ap.parse_args()
 
@@ -151,7 +156,11 @@ def main():
                           "microarchitecture (tag RAM / way-select / replacement bits)."),
             "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
-        "machine": {"physical_l3_bytes": phys, "hot_set_bytes": args.hot_set_bytes},
+        "machine": {
+            "gpu_l3_bytes": args.sets * args.ways * 64,
+            "cpu_l3_bytes": phys,
+            "hot_set_bytes": args.hot_set_bytes,
+        },
         # 公开文档所述的真实机制（Intel Iris Xe / UHD Graphics Open Source PRM, TGL Vol.7
         # Memory Cache, Doc Ref IHD-OS-TGL-Vol 7-12.21）：
         #   每 set 一个 N-bit 向量；Fill 选第一个 0 位 way 并翻转为 1；命中把 way 置 1；
@@ -180,7 +189,8 @@ def main():
         },
         "recommended_policy": "nru1b",
         "tuning_anchors": {
-            "l3_physical_bytes": phys if phys else 8 * 1024 * 1024,
+            "l3_gpu_bytes": args.sets * args.ways * 64,
+            "l3_cpu_bytes": phys if phys else 8 * 1024 * 1024,
             "pollution_knee_bytes_reuse1": knees[iters_sorted[0]],
         },
     }
@@ -191,7 +201,9 @@ def main():
         f.write("\n")
 
     print(f"[l3_calibrate] wrote {args.out}")
-    print(f"  physical L3            : {phys} B")
+    print(f"  GPU L3 (geometry)      : {args.sets*args.ways*64} B"
+          f"  (sets={args.sets} x ways={args.ways} x 64B)")
+    print(f"  CPU L3 (sysfs)         : {phys} B")
     for it in iters_sorted:
         print(f"  R_50(reuse={it:<3})       : {knees[it]/1e6:6.2f} MB"
               f"   (x{knees[it]/knees[iters_sorted[0]]:.2f} vs reuse=1)")

@@ -113,7 +113,7 @@ int runScale(uint64_t accesses, uint64_t working_mb, int sets, int ways, int rep
 int main(int argc, char ** argv)
 {
   std::string op = "probe";
-  int sets = 1024, ways = 120, reps = 3, policy = 0;
+  int sets = 512, ways = 120, reps = 3, policy = 0;
   uint64_t hot_lines = 16384, accesses = 1000000, working_mb = 64, agg = 0;
   std::string reuse_list = "1,4,16", agg_list = "4,6,8,12,16,25";
   for (int i = 1; i < argc; ++i)

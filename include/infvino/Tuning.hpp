@@ -176,18 +176,27 @@ double effectiveBwGbps(double bytes, double threads);
 extern const double kL3SpillPerByteMs;
 
 /**
- * @brief R59: L3 标定的**实测锚点**（i5-1135G7）。
+ * @brief R62: L3 标定的**实测/公开资料锚点**（i5-1135G7，Iris Xe / Tiger Lake）。
  *
- * 此前模型用 `kL3Bytes = 3.75e6` 当 L3 容量——**实测物理 L3 = 8 MiB**
- * （`lscpu` / `/sys/devices/system/cpu/cpu0/cache/index3/size = 8192K`），不到一半 →
- * LRU 模拟系统性**过度逐出**（spill 高估）。R59 用实测锚点重标定：
- *   * `l3PhysicalBytes()`  = 8.0e6  （物理 L3，跨算子 LRU 的有效容量上限）；
- *   * `l3PrivateCapBytes()`= 2.0e6  （R55 §2.3：单 kernel 私有 tile 的有效容量膝点）；
- *   * `l3DefaultCapBytes()`= 物理 L3（`INFVINO_L3_LEGACY=1` 回退 3.75e6 做 A/B）；
+ * R59 曾把 L3 容量设为 `8.0e6`——那是 **CPU 的** L3（`lscpu` / sysfs index3），不是 GPU 的。
+ * R62 用**独立的几何测量**纠正：
+ *   * 步进冲突探针（`kernel_bench --op l3conflict`）显示冲突周期 = **512 行（32 KB）**；
+ *   * 容量扫描（stride 1）膝点 ≈ **4 MB**，8 MB 后骤降；
+ *   * 公开 PRM（TGL Vol.7）bank = 480 KB = 120 way × 64 set × 64 B，8 bank ⇒
+ *     `8 × 480 KiB = 3840 KiB = 3.75 MiB = 512 × 120 × 64 = 3,932,160 B`。
+ *   三者一致 ⇒ **GPU L3 = 3.75 MiB**。
+ *
+ *   * `l3PhysicalBytes()`  = 3,932,160（GPU L3 = 8 bank × 480 KiB）；
+ *   * `l3CpuL3Bytes()`     = 8,388,608（CPU L3，R59 误用值；A/B 用）；
+ *   * `l3PrivateCapBytes()`= 2.0e6（R55 §2.3：单 kernel 私有 tile 的膝点）；
+ *   * `l3DefaultCapBytes()`= GPU L3（`INFVINO_L3_LEGACY=1` 回退 R59 的 CPU 值 8 MiB 做 A/B）；
  *   * `l3DefaultAnchorBytes()` = 2.0e6（legacy 1.0e6）；
  *   * `l3DramBwGbps()`=20.0、`l3SramBwGbps()`=145.0（R55 copy 实测平台/峰值）。
+ *
+ * ⚠️ R62 只改**评分**；已核验三模型 `model_check` 逐位不变（选择不受影响）。
  */
 double l3PhysicalBytes();
+double l3CpuL3Bytes();
 double l3PrivateCapBytes();
 double l3DefaultCapBytes();
 double l3DefaultAnchorBytes();

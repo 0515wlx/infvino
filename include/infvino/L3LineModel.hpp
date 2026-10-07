@@ -30,11 +30,11 @@ enum class L3LinePolicy
   LRU = 1,    ///< 严格 LRU（对照基线）
 };
 
-/** @brief 行缓存的几何与策略（默认 = TGL GT2 工作点：bank 480KB = 120 way × 64 set × 64B，
- *  16 bank → 1024 set）。`ways`、`sets` 由 SKU 的 Configurations 文档决定，可配置。 */
+/** @brief 行缓存的几何与策略（默认 = TGL GT2 实测工作点，R62：bank 480KiB=120 way×64 set×64B，
+ *  8 bank → 512 set = 3.75 MiB）。`ways`、`sets` 由 SKU 的 Configurations 文档决定，可配置。*/
 struct L3LineConfig
 {
-  int sets = 1024;              ///< 组数（= bank 数 × 64）
+  int sets = 512;               ///< 组数（= bank 数 × 64；R62 实测 8 bank）
   int ways = 120;               ///< 每组相连度（way 数）
   int line_bytes = 64;          ///< 行大小
   L3LinePolicy policy = L3LinePolicy::NRU1B;

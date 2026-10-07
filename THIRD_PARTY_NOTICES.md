@@ -119,3 +119,5 @@ described in the **public** *Intel Iris Xe / UHD Graphics Open Source PRM, Volum
   [`third_party/intel-prm/NOTICE.md`](third_party/intel-prm/NOTICE.md).
 - A rigorous complexity analysis of the LRU cost function (and line-granular feasibility) is in
   [`docs/round61-l3-line-granular-model-and-complexity.md`](docs/round61-l3-line-granular-model-and-complexity.md).
+- The geometry/fidelity measurement campaign (which corrected the GPU L3 capacity to 3.75 MiB) is in
+  [`docs/round62-l3-fidelity-geometry-correction.md`](docs/round62-l3-fidelity-geometry-correction.md).
