@@ -1974,8 +1974,17 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutPr
                    rho.empty() ? 0.0 : *std::max_element(rho.begin(), rho.end()), priceScale);
     }
   }
+  // R67: 容量感知内存惩罚（目标函数级、逐节点、可加、默认关）。让布局选择**显式看见**
+  // 每个候选的占用/足迹：占用把有效容量压低 → 额外内存时间。默认关，`INFVINO_LAYOUT_CAP=1`
+  // 开启，`INFVINO_LAYOUT_CAP_W=<α>` 缩放（标定/消融）。
+  const bool useCap = std::getenv("INFVINO_LAYOUT_CAP") != nullptr;
+  const double capW =
+      std::getenv("INFVINO_LAYOUT_CAP_W") ? std::atof(std::getenv("INFVINO_LAYOUT_CAP_W")) : 1.0;
   auto inCurveMs = [&](size_t ni_i, const TuningEntry & e, const OpSignature & s) -> double {
-    return e.ms + (useL3 ? rho[ni_i] * occupancyPressure(e, s) : 0.0);
+    double v = e.ms;
+    if (useL3) v += rho[ni_i] * occupancyPressure(e, s);
+    if (useCap) v += capW * capacityMemPenaltyMs(e, s);
+    return v;
   };
   //   f(0,0) = min(eN, eB+r)   NCHW 入/出：non，或 blk 付输入 reorder 写 NCHW
   //   f(0,1) = eB + r          NCHW 入 / FSV16 出：必须 blk，付输入 reorder
@@ -2134,8 +2143,8 @@ bool PlanModel::resolveLayoutMinCut(const std::vector<LayoutAlt> & alt, MinCutPr
   {
     int nfsv = 0;
     for (size_t v = 0; v < varName.size(); ++v) if (sol.labels[v] == 1) ++nfsv;
-    std::fprintf(stderr, "[layout] mincut: %zu nodes, %zu vars, %d fsv16, E=%.4f\n",
-                 nodes.size(), varName.size(), nfsv, sol.energy);
+    std::fprintf(stderr, "[layout] mincut: %zu nodes, %zu vars, %d fsv16, E=%.4f (l3_price=%d cap=%d)\n",
+                 nodes.size(), varName.size(), nfsv, sol.energy, useL3 ? 1 : 0, useCap ? 1 : 0);
     if (std::getenv("INFVINO_LAYOUT_DEBUG"))
       for (size_t ni : nodes)
       {

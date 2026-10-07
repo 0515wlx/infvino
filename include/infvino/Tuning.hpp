@@ -178,6 +178,21 @@ double l3CapacityFactor(double residentBytes);
  *  `bytes` = 该节点的单遍工作集足迹（决定自有效容量断崖）；`threads` = 并发度（MLP）。
  *  跨算子的容量污染不在此项，由 `L3Model` 的全局 LRU 模拟/定价处理。*/
 double effectiveBwGbps(double bytes, double threads);
+/**
+ * @brief R67: 一个算子的**单遍内存字节**（输入+输出+权重/激活），用于内存代价估计。
+ * 与 `expectedOps` 的足迹口径一致；未知 op 返回 0。
+ */
+double singlePassBytes(const OpSignature & sig);
+/**
+ * @brief R67: 候选的**容量感知内存惩罚**（ms，逐节点、可加、≥0）。
+ *
+ * 只补「有效容量不足导致的**额外**内存时间」：
+ *   `penalty = (1/g(R) − 1) · bytes / (BW_mlp(C)·1e9) · 1e3`
+ * 其中 `R = occupancyPressure(e,s)`（在飞足迹）、`C = occupancyThreads(e,s)`、
+ * `g = l3CapacityFactor(R)`（R55 曲线）、`BW_mlp = l3MlpFactor(C)`、`bytes = singlePassBytes(s)`。
+ * `R` 小（放得下）时 `g=1` → 惩罚 0。量纲 ms，直接加到**布局节点代价**上；默认关（见 R67）。
+ */
+double capacityMemPenaltyMs(const TuningEntry & e, const OpSignature & sig);
 /** @brief R47/R55 标定：L3 miss 折算 (1/BW_DRAM − 1/BW_L3)，单位 ms/byte。*/
 extern const double kL3SpillPerByteMs;
 

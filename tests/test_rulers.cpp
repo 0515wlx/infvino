@@ -242,6 +242,22 @@ static void run_tests()
     CHECK(on2d > 0.0, "R66: 2D expected positive");
   }
 
+  // --- R67: 容量感知内存惩罚（目标函数级，默认关）---
+  {
+    TuningEntry blk; blk.kernel = "conv1x1_blk"; blk.options = "";
+    TuningEntry e;   e.kernel = "gemm"; e.options = "";
+    const OpSignature s = OpSignature::gemm(64, 1600, 64, 0);
+    const double p = capacityMemPenaltyMs(e, s);
+    CHECK(p >= 0.0, "R67: capacity penalty non-negative");
+    // 小算子（无占用压力）→ 0。
+    CHECK_NEAR(capacityMemPenaltyMs(blk, OpSignature::custom("copy_c", {25600, 16})), 0.0, 1e-12,
+               "R67: no occupancy -> zero penalty");
+    // 单遍字节：合理的正量级。
+    CHECK(singlePassBytes(s) > 0.0, "R67: single-pass bytes positive for conv1x1");
+    CHECK_NEAR(singlePassBytes(OpSignature::custom("copy_c", {25600, 16})), 0.0, 1e-12,
+               "R67: unknown op -> zero bytes");
+  }
+
   // --- R55: occupancyThreads 与 occupancyPressure 同源 ---
   {
     TuningEntry e;

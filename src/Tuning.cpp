@@ -609,6 +609,40 @@ double effectiveBwGbps(double bytes, double threads)
   return copyBwGbps(bytes) * l3MlpFactor(threads);
 }
 
+// R67: 单遍内存字节（与 expectedOps 足迹口径一致）。
+double singlePassBytes(const OpSignature & s)
+{
+  if (s.op == "conv3x3")
+  {
+    const double span = s.stride >= 2 ? static_cast<double>(s.stride) : 1.0;
+    return 2.0 * s.Cin * (s.H * span) * (s.W * span) + 2.0 * s.Cout * s.H * s.W +
+           2.0 * s.Cout * s.Cin * 9.0;
+  }
+  if (s.op == "gemm")
+    return 2.0 * (static_cast<double>(s.M) * s.K + static_cast<double>(s.K) * s.N +
+                  static_cast<double>(s.M) * s.N);
+  if (s.op == "conv1x1" || s.op == "conv1x1_cat4")
+    return singlePassBytes(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act));
+  if (s.op == "depthwise" || s.op == "conv_general")
+    return 2.0 * s.Cin * s.H * s.W + 2.0 * s.Cout * s.H * s.W + 2.0 * s.Cin * 9.0;
+  return 0.0;
+}
+
+// R67: 容量感知内存惩罚（ms）——只补「有效容量不足导致的额外内存时间」。
+double capacityMemPenaltyMs(const TuningEntry & e, const OpSignature & s)
+{
+  const double R = occupancyPressure(e, s);
+  if (R <= 0.0) return 0.0;
+  const double g = l3CapacityFactor(R);
+  if (g >= 1.0) return 0.0;
+  const double bytes = singlePassBytes(s);
+  if (bytes <= 0.0) return 0.0;
+  const double bw = effectiveBwGbps(bytes, occupancyThreads(e, s));  // GB/s
+  if (bw <= 0.0) return 0.0;
+  const double tMemMs = bytes / (bw * 1e6);
+  return (1.0 / g - 1.0) * tMemMs;
+}
+
 // R47: 导出的 launch 地板（供 PlanModel 的小算子外溢估计使用）。
 const double kSmallLaunchUs = 3.5;
 
