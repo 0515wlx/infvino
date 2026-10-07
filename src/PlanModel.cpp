@@ -1013,6 +1013,7 @@ void PlanModel::allocateActivations()
       if (f.layout.in != Layout::FSV16) continue;
       // R71: blocked cat4 的激活源在槽 1..4（4 路 concat 源）。
       if (f.name == "conv1x1_cat4_blk") { if (slot < 1 || slot > 4) continue; }
+      else if (f.name == "ew_binary_fsv16") { if (slot < 0 || slot > 4) continue; }
       else if (f.layout.inIndex != slot) continue;
       if (!(f.actMask & (1 << s.act))) continue;
       if (f.supports && !f.supports(s)) continue;
@@ -1312,6 +1313,15 @@ void PlanModel::planBlockedLayout()
     // R71: concat4 作为「可写 fsv16」的生产者，让其输出可持久化、被 blocked 1x1 直读。
     // 仅 outer==1（沿通道拼接）支持 fsv16 直写；其它拼接轴返回 nullptr。
     if (n.op == "concat4") return attrInt(n, "outer", 1) == 1 ? familyByName("small_concat4") : nullptr;
+    // R71: copy_c 视图（16 对齐）与 plain ew_binary 可进 fsv16 链（C2f Split→Concat 关键）。
+    if (n.op == "copy_c" && attrInt(n, "dst_off", 0) == 0 &&
+        attrInt(n, "c0", 0) % 16 == 0 && attrInt(n, "cnt", 0) % 16 == 0)
+      return familyByName("copy_c_fsv16");
+    if (n.op == "ew_binary") {
+      bool ok = false;
+      const OpSignature s = nodeSignature(n, &ok);
+      if (ok && s.op == "ew_binary") return familyByName("ew_binary_fsv16");
+    }
     return nullptr;
   };
 
@@ -1321,6 +1331,16 @@ void PlanModel::planBlockedLayout()
     const Node & n = nodes_[i];
     const KernelFamily * prod = nodeFamily(n);
     if (!prod || !prod->layout.canOutFsv16 || n.outs.empty()) continue;
+    // R71: ew_binary 逐元素 / copy_c 视图要求**所有输入已 fsv16**（否则线性读 NCHW 会错）。
+    if (prod->name == "ew_binary_fsv16" || prod->name == "copy_c_fsv16") {
+      bool allIn = true;
+      for (const auto & inName : n.ins)
+        if (inName != "-") {
+          auto iit = T_.find(inName);
+          if (iit == T_.end() || !iit->second.fsv16) { allIn = false; break; }
+        }
+      if (!allIn) continue;
+    }
     const std::string & t = n.outs[0];
     auto tit = T_.find(t);
     if (tit == T_.end()) continue;
@@ -1340,8 +1360,8 @@ void PlanModel::planBlockedLayout()
       // R48 D4: 用族声明的「激活输入槽」判定——conv1x1/gemm 的激活在槽 1（槽 0 是权重）。
       const int slot = d4 && cf ? cf->layout.inIndex : 0;
       // R71: blocked cat4 读槽 1..4（4 路 concat 源）。
-      const bool multi = (cf && cf->name == "conv1x1_cat4_blk");
-      const bool slotOk = multi ? (c.second >= 1 && c.second <= 4) : (c.second == slot);
+      const bool multi = (cf && (cf->name == "conv1x1_cat4_blk" || cf->name == "ew_binary_fsv16"));
+      const bool slotOk = multi ? (c.second >= 0 && c.second <= 4) : (c.second == slot);
       if (!cf || cf->layout.in != Layout::FSV16 || !slotOk)
       {
         all_blk = false;

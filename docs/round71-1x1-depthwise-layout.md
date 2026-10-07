@@ -132,6 +132,34 @@ concat4(outer==1)/ew_binary_ch）→ 认定选 blk 会令生产者被标记 fsv1
 > 我们的是"逐节点、保守、以 NCHW 为默认"**。把这个决策口径反过来，是比换 kernel 更根本的
 > 系统级方向。
 
+### 3.4 向"全链 fsv16"再走一步：`copy_c` 视图 + plain `ew_binary`（**部分落地，仍不够**）
+
+**关键洞察（本轮新增）**：`copy_c` 的连续通道切片（`dst_off=0`）与父张量**共享同一 buffer**；
+只要通道范围 16 对齐（`c0%16==0`、`cnt%16==0`），其字节区间在 NCHW 与 FSV16 下**完全相同**
+（fsv16 只是通道按 16 分块的置换：`(c0/16)·HW·16 == c0·HW`）。所以 **C2f 的 `Split`→`Concat`
+别名天然就是 fsv16 视图，零改动**。据此新增两个**声明式布局契约族**（无 kernel 改动）：
+* `copy_c_fsv16`（`{FSV16,FSV16,canIn,canOut}`）——别名/生产者传播；
+* `ew_binary_fsv16`（`plain ew_binary`，同 shape 逐元素，所有操作数同布局时线性映射相同）。
+规划器加了「多输入槽（ew 槽 0/1）」与「要求所有输入已 fsv16」的守护。
+
+**实测：链只形成了一部分，reorder 仍主导**（`INFVINO_CAT4_BLK=1` + blocked-cat4 缓存）：
+fsv16 张量 y8 **0→4**、y11 **0→21**，但 reorder y8 **29 趟/1.00 ms**、y11 **33 趟/1.23 ms**，
+busy 仍 **11.15 / 11.88**（> gemm 路径 10.53 / 11.34）。
+
+**为什么还是不行**：cat4 的源除了 `Split`(copy_c) 与 `add`(ew_binary)，还有 **`Resize`/`MaxPool`/
+`Slice` 等 NCHW-only 生产者**，以及**多消费者**（同一张量既喂 blocked 又喂 NCHW 分支）——
+这些仍把链钉在 NCHW。且默认 min-cut 求解器只把「有 `#blk/#non` 备选」的计算节点当变量，
+`copy_c/ew/concat4` 这些小算子不在其变量集里，标记会被求解器结果覆盖。
+
+**结论（比 §3.1 更强）**：**局部局部地给几个小算子加 fsv16 输出没有用**——只要链上**任何一个**
+节点或**任何一个分支消费者**是 NCHW，整条链就回到 reorder。要真正翻盘，必须做**全局布局策略**：
+1. 把 `copy_c/ew/concat/resize/maxpool/slice` 全部纳入布局求解器的**变量与代价**；
+2. **多消费者**：允许张量 fsv16、给 NCHW 分支消费者插**反向 reorder（FSV16→NCHW）并计入代价**
+   （目前没有反向 reorder kernel，且 min-cut 用 `consumerCanReadFsv16` 直接 pin 死）；
+3. **以 fsv16 为默认**（像 OV 那样），只在网络边界/无法 fsv16 的算子处转换。
+
+这三条一起才等价于 OV 的布局策略；单独任一条都会被 reorder 税抵消（本轮 §2.4、§3.4 两次实测佐证）。
+
 ---
 
 ## 4. conv3×3（待做：`conv_blk` 补 `OBH`）

@@ -968,6 +968,34 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.supports = [](const OpSignature & s) { return s.op == "gap"; };   // 布局契约族（无候选）
       v.push_back(std::move(f));
     }
+    {
+      // R71: `copy_c`（连续通道切片 dst_off=0、通道 16 对齐）作为 fsv16 **视图**：与父张量
+      // 共享同一 buffer；16 对齐通道范围 [c0,c0+cnt) 的字节区间在 NCHW 与 FSV16 下**相同**
+      // （fsv16 只是通道维按 16 分块的置换，(c0/16)·HW·16 == c0·HW）→ 零成本 fsv16 别名。
+      // 这是 C2f 的 `Split`→`Concat` 链能进 fsv16 的关键（否则 concat 源永远 NCHW）。
+      KernelFamily f;
+      f.name = "copy_c_fsv16";
+      f.op = "copy_c";
+      f.source = "ops";
+      f.layout = {Layout::FSV16, Layout::FSV16, true, true};
+      f.layout.inIndex = 0;
+      f.bottleneck = Bottleneck::Memory;
+      f.supports = [](const OpSignature & s) { return s.op == "copy_c"; };
+      v.push_back(std::move(f));
+    }
+    {
+      // R71: 逐元素（plain `ew_binary`，同 shape、非通道广播）在**所有操作数同布局**时与布局
+      // 无关（逐元素线性映射相同）→ 可读/写 fsv16。槽 0/1 都是激活（多输入，见规划器特判）。
+      KernelFamily f;
+      f.name = "ew_binary_fsv16";
+      f.op = "ew_binary";
+      f.source = "ops";
+      f.layout = {Layout::FSV16, Layout::FSV16, true, true};
+      f.layout.inIndex = 0;
+      f.bottleneck = Bottleneck::Memory;
+      f.supports = [](const OpSignature & s) { return s.op == "ew_binary"; };
+      v.push_back(std::move(f));
+    }
     // 激活码契约（规范码，全族统一）：conv3x3 只实现 {0,1,3}；depthwise {0..4}；其余 {0..5}。
     for (auto & f : v) f.actMask = (f.op == "conv3x3") ? 0xB : (f.op == "depthwise" ? 0x1F : 0x3F);
     // R43: 硬上限（只放 ISA 指令发射配额 / roofline 下界，不含 amort/gridFactor/延迟等
