@@ -121,3 +121,6 @@ described in the **public** *Intel Iris Xe / UHD Graphics Open Source PRM, Volum
   [`docs/round61-l3-line-granular-model-and-complexity.md`](docs/round61-l3-line-granular-model-and-complexity.md).
 - The geometry/fidelity measurement campaign (which corrected the GPU L3 capacity to 3.75 MiB) is in
   [`docs/round62-l3-fidelity-geometry-correction.md`](docs/round62-l3-fidelity-geometry-correction.md).
+- Address→bank/set reverse-engineering (index period 512 lines = 2¹⁵ B; physical vs warm-reuse
+  capacity) is in
+  [`docs/round63-address-mapping-reverse-engineering.md`](docs/round63-address-mapping-reverse-engineering.md).

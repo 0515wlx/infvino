@@ -12,6 +12,11 @@
 > * 保真度评估：`L3LineModel`（1b-NRU, 512×120）的容量膝点与实测吻合；过渡比实测**更陡**
 >   （未建模真实地址哈希/分段）。
 > * 复杂度结论随之**收紧**：ways=120（>64）需要两字位掩码或 sector 分组才能 O(1) 选 victim。
+>
+> ⚠️ **R63 更正**：物理 3.75 MiB 是**流式/物理**容量；实测（单缓冲别名 + R55 双租户）表明
+> **跨算子热重用**的有效容量 ≈ **8–12 MB**。`L3Model` 模拟的是重用张量 ⇒ 默认容量仍取 8 MB
+> （与 R59 数值一致），物理几何由 `l3PhysicalBytes()` 单独给出；`INFVINO_L3_GEOM=1` A/B。
+> 见 [`round63-address-mapping-reverse-engineering.md`](round63-address-mapping-reverse-engineering.md)。
 
 ---
 

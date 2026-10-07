@@ -184,22 +184,24 @@ static void run_tests()
           "effectiveBw rises with concurrency");
   }
 
-  // --- R62: L3 几何锚点（GPU L3 = 3.75 MiB，非 R59 误用的 CPU 8 MiB）---
+  // --- R62/R63: L3 几何 vs 跨算子热容量（区分物理 3.75 MiB 与热重用 ~8 MB）---
   {
     CHECK_NEAR(l3PhysicalBytes(), 3932160.0, 1.0, "R62: GPU L3 = 3.75 MiB (8 bank x 480 KiB)");
     CHECK_NEAR(l3PhysicalBytes(), 512.0 * 120.0 * 64.0, 1.0, "R62: GPU L3 = 512 set x 120 way x 64B");
     CHECK_NEAR(l3CpuL3Bytes(), 8388608.0, 1.0, "R62: CPU L3 = 8 MiB (reference)");
     CHECK(l3PhysicalBytes() < l3CpuL3Bytes(), "R62: GPU L3 < CPU L3 (R59 had used the CPU value)");
-    CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R62: private-tile cap knee = 2 MB (R55)");
-    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R62: default cap == GPU L3 (geometry)");
-    CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R62: default anchor == private cap");
+    CHECK_NEAR(l3WarmCapBytes(), 8.0e6, 1.0, "R63: cross-operator warm reuse capacity ~8 MB");
+    CHECK(l3WarmCapBytes() > l3PhysicalBytes(), "R63: warm reuse cap > physical/streaming cap");
+    CHECK_NEAR(l3PrivateCapBytes(), 2.0e6, 1.0, "R55: private-tile cap knee = 2 MB");
+    CHECK_NEAR(l3DefaultCapBytes(), l3WarmCapBytes(), 1.0, "R63: default (model) cap == warm reuse cap");
+    CHECK_NEAR(l3DefaultAnchorBytes(), l3PrivateCapBytes(), 1.0, "R63: default anchor == private cap");
     CHECK(l3SramBwGbps() > l3DramBwGbps(), "R62: SRAM BW > DRAM BW");
-    // legacy 开关（A/B）：置 1 时回退 R59 的 CPU 值 8 MiB / 1 MiB。
-    setenv("INFVINO_L3_LEGACY", "1", 1);
-    CHECK_NEAR(l3DefaultCapBytes(), l3CpuL3Bytes(), 1.0, "R62: legacy cap = CPU L3 (8 MiB)");
-    CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R62: legacy anchor = 1 MB");
-    unsetenv("INFVINO_L3_LEGACY");
-    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R62: back to geometry after unset");
+    // A/B：INFVINO_L3_GEOM=1 用物理/流式容量 + 1MB 锚点。
+    setenv("INFVINO_L3_GEOM", "1", 1);
+    CHECK_NEAR(l3DefaultCapBytes(), l3PhysicalBytes(), 1.0, "R63: geom A/B cap = physical 3.75 MiB");
+    CHECK_NEAR(l3DefaultAnchorBytes(), 1.0e6, 1.0, "R63: geom A/B anchor = 1 MB");
+    unsetenv("INFVINO_L3_GEOM");
+    CHECK_NEAR(l3DefaultCapBytes(), l3WarmCapBytes(), 1.0, "R63: back to warm cap after unset");
   }
 
   // --- R60: reorder 可加成本 = launch floor + 传输/BW(state) + L3 策略解析 ---

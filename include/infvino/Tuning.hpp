@@ -186,17 +186,23 @@ extern const double kL3SpillPerByteMs;
  *     `8 × 480 KiB = 3840 KiB = 3.75 MiB = 512 × 120 × 64 = 3,932,160 B`。
  *   三者一致 ⇒ **GPU L3 = 3.75 MiB**。
  *
- *   * `l3PhysicalBytes()`  = 3,932,160（GPU L3 = 8 bank × 480 KiB）；
- *   * `l3CpuL3Bytes()`     = 8,388,608（CPU L3，R59 误用值；A/B 用）；
+ *   * `l3PhysicalBytes()`  = 3,932,160（GPU L3 物理/流式容量 = 8 bank × 480 KiB）；
+ *   * `l3CpuL3Bytes()`     = 8,388,608（CPU L3，R59 误用的 sysfs 值）；
+ *   * `l3WarmCapBytes()`   = 8.0e6（**跨算子热重用**有效容量：R55 双租户 + R63 单缓冲
+ *     别名探针实测——热集合对 ~8–24 MB 流式 aggressor 仍不易被逐出，故「重用张量」面对的
+ *     有效容量远大于流式容量）；
  *   * `l3PrivateCapBytes()`= 2.0e6（R55 §2.3：单 kernel 私有 tile 的膝点）；
- *   * `l3DefaultCapBytes()`= GPU L3（`INFVINO_L3_LEGACY=1` 回退 R59 的 CPU 值 8 MiB 做 A/B）；
- *   * `l3DefaultAnchorBytes()` = 2.0e6（legacy 1.0e6）；
+ *   * `l3DefaultCapBytes()`= **跨算子热重用容量**（`L3Model` 模拟的正是重用张量）=
+ *     `l3WarmCapBytes()`；`INFVINO_L3_GEOM=1` 用物理/流式容量 3.75 MiB 做 A/B；
+ *   * `l3DefaultAnchorBytes()` = 2.0e6（`INFVINO_L3_GEOM=1` 时 1.0e6）；
  *   * `l3DramBwGbps()`=20.0、`l3SramBwGbps()`=145.0（R55 copy 实测平台/峰值）。
  *
- * ⚠️ R62 只改**评分**；已核验三模型 `model_check` 逐位不变（选择不受影响）。
+ * ⚠️ R62 曾把 `l3DefaultCapBytes()` 改成 3.75 MiB；R63 的别名探针表明**物理容量 ≠ 跨算子
+ * 有效容量**，故默认回到热重用值（与 R59 数值一致）；物理几何由 `l3PhysicalBytes()` 单独给出。
  */
 double l3PhysicalBytes();
 double l3CpuL3Bytes();
+double l3WarmCapBytes();
 double l3PrivateCapBytes();
 double l3DefaultCapBytes();
 double l3DefaultAnchorBytes();

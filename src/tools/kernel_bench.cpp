@@ -1529,10 +1529,12 @@ int benchL3Couple(infvino::ClRuntime & rt, const std::vector<int> & wi_list,
     {
       if (fp <= 0 || fp > maxFp) { std::printf("   %7s", "-"); continue; }
       const uint fpu = static_cast<uint>(fp);
+      const uint zeroU = 0u;
       clSetKernelArg(k, 0, sizeof(in), &in);
       clSetKernelArg(k, 1, sizeof(sink), &sink);
       clSetKernelArg(k, 2, sizeof(fpu), &fpu);
       clSetKernelArg(k, 3, sizeof(pu), &pu);
+      clSetKernelArg(k, 4, sizeof(zeroU), &zeroU);
       double med = 0.0;
       try {
         med = rt.timeMs(
@@ -1584,10 +1586,12 @@ int benchL3Pollute(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hite
       if (agws > 0)
       {
         const uint af = static_cast<uint>(afp);
+        const uint aoff = 0u;
         clSetKernelArg(kagg, 0, sizeof(agg), &agg);
         clSetKernelArg(kagg, 1, sizeof(sink), &sink);
         clSetKernelArg(kagg, 2, sizeof(af), &af);
         clSetKernelArg(kagg, 3, sizeof(one), &one);   // passes=1: pure stream
+        clSetKernelArg(kagg, 4, sizeof(aoff), &aoff);
         size_t ag = static_cast<size_t>(agws);
         aev = infvino::ClRuntime::enqueueND(rt.queue(), kagg, 1, &ag, &lws);
       }
@@ -1671,10 +1675,12 @@ int benchL3Retain(infvino::ClRuntime & rt, int hot_lines, int hot_gws, int hot_o
         if (agws > 0)
         {
           const uint af = static_cast<uint>(afp);
+          const uint aoff = 0u;
           clSetKernelArg(kagg, 0, sizeof(agg), &agg);
           clSetKernelArg(kagg, 1, sizeof(sink), &sink);
           clSetKernelArg(kagg, 2, sizeof(af), &af);
           clSetKernelArg(kagg, 3, sizeof(one), &one);
+          clSetKernelArg(kagg, 4, sizeof(aoff), &aoff);
           size_t ag = static_cast<size_t>(agws);
           aev = infvino::ClRuntime::enqueueND(rt.queue(), kagg, 1, &ag, &lws);
         }
@@ -1759,6 +1765,61 @@ int benchL3Conflict(infvino::ClRuntime & rt, const std::vector<int> & strides, i
   return 0;
 }
 
+// R62/R63: single-buffer aliasing probe. A small victim set at line 0 is warmed, then a
+// contiguous aggressor stream starts `delta` lines later (same allocation → known offset),
+// then the victim is re-read. If the aggressor aliases the victim's (bank,set) buckets,
+// retention drops for those deltas → reveals the index function's kernel/period.
+int benchL3Alias(infvino::ClRuntime & rt, int victim_lines, int agg_lines,
+                 const std::vector<int> & deltas, int iters, int fi)
+{
+  size_t maxD = 0;
+  for (int d : deltas) maxD = std::max(maxD, static_cast<size_t>(std::max(0, d)));
+  const size_t N = std::max<size_t>(static_cast<size_t>(victim_lines), maxD + agg_lines) + 1024;
+  cl_mem in = rt.alloc(N * 64, CL_MEM_READ_ONLY);
+  cl_mem sink = rt.alloc(4, CL_MEM_WRITE_ONLY);
+  { std::vector<uint32_t> z(N * 16, 1); rt.write(in, N * 64, z.data()); }
+  cl_kernel khot = rt.buildKernel("micro", "l3_hot_read", "-cl-mad-enable");
+  cl_kernel kagg = rt.buildKernel("micro", "l3_probe", "-cl-mad-enable");
+  const size_t lws = 64, hotGws = 8192;
+  const int wi = 1024;
+  const int fp = std::max(1, agg_lines / wi);
+  const uint vl = static_cast<uint>(victim_lines), hi = static_cast<uint>(iters), voff = 0u, one = 1u;
+  clSetKernelArg(khot, 0, sizeof(in), &in);
+  clSetKernelArg(khot, 1, sizeof(sink), &sink);
+  clSetKernelArg(khot, 2, sizeof(vl), &vl);
+  clSetKernelArg(khot, 3, sizeof(hi), &hi);
+  clSetKernelArg(khot, 4, sizeof(voff), &voff);
+  std::printf("[l3alias] victim=%d lines (%d KB) agg=%d lines (%.2f MB) wi=%d fp=%d\n",
+              victim_lines, victim_lines * 64 / 1024, agg_lines, agg_lines * 64.0 / 1e6, wi, fp);
+  std::printf("  delta_lines  delta_KB   hot_ms\n");
+  for (int d : deltas)
+  {
+    if (d < 0) continue;
+    const uint aoff = static_cast<uint>(d), afp = static_cast<uint>(fp);
+    clSetKernelArg(kagg, 0, sizeof(in), &in);
+    clSetKernelArg(kagg, 1, sizeof(sink), &sink);
+    clSetKernelArg(kagg, 2, sizeof(afp), &afp);
+    clSetKernelArg(kagg, 3, sizeof(one), &one);
+    clSetKernelArg(kagg, 4, sizeof(aoff), &aoff);
+    auto closure = [&]() -> cl_event {
+      cl_event w = infvino::ClRuntime::enqueueND(rt.queue(), khot, 1, &hotGws, &lws);  // warm victim
+      clReleaseEvent(w);
+      size_t ag = static_cast<size_t>(wi);
+      cl_event a = infvino::ClRuntime::enqueueND(rt.queue(), kagg, 1, &ag, &lws);       // aggressor
+      clReleaseEvent(a);
+      return infvino::ClRuntime::enqueueND(rt.queue(), khot, 1, &hotGws, &lws);         // timed
+    };
+    double ms = 0.0;
+    try { ms = rt.timeMs(closure, 2, fi); } catch (const std::exception &) { ms = 0.0; }
+    std::printf("  %-11d  %7.1f  %8.4f\n", d, d * 64.0 / 1024.0, ms);
+  }
+  clReleaseMemObject(in);
+  clReleaseMemObject(sink);
+  clReleaseKernel(khot);
+  clReleaseKernel(kagg);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -1782,7 +1843,7 @@ int main(int argc, char ** argv)
   int passes = 32;
   int hot_lines = 16384, hot_gws = 4096, hot_iters = 1;
   int nseq = 8, seq_mode = 0;
-  int hot_off = 0, nlines = 128;
+  int hot_off = 0, nlines = 128, agg_lines = 2048;
   std::vector<int> hot_iters_list;
   std::vector<int> stride_list;
 
@@ -1853,6 +1914,8 @@ int main(int argc, char ** argv)
       hot_off = std::atoi(next().c_str());
     } else if (a == "--nlines") {
       nlines = std::atoi(next().c_str());
+    } else if (a == "--agg-lines") {
+      agg_lines = std::atoi(next().c_str());
     } else if (a == "--line-stride") {
       stride_list = parseInts(next());
     } else if (a == "--nseq") {
@@ -1991,6 +2054,10 @@ int main(int argc, char ** argv)
     if (stride_list.empty())
       stride_list = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048};
     rc = benchL3Conflict(rt, stride_list, nlines, passes, wi_list.empty() ? 1024 : wi_list[0]);
+  } else if (op == "l3alias") {
+    if (stride_list.empty())
+      stride_list = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 448, 480, 496, 504, 508, 510, 511, 512, 513, 520, 576, 640, 768, 1024, 1536, 2048, 4096};
+    rc = benchL3Alias(rt, nlines, agg_lines, stride_list, passes, 5);
   } else {
     std::fprintf(stderr, "unknown op: %s\n", op.c_str());
     return 2;

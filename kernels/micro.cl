@@ -302,9 +302,9 @@ __kernel void footprint_scan(__global const uint *restrict in, __global uint *si
 //   stride 16 uint = 64 B），故与相邻 WI 的窗口不相交。
 // ---------------------------------------------------------------------------
 __kernel void l3_probe(__global const uint *restrict in, __global uint *sink,
-                       const uint fp, const uint passes) {
+                       const uint fp, const uint passes, const uint in_off) {
   const uint gid = get_global_id(0);
-  __global const uint *base = in + (size_t)gid * (size_t)fp * 16u;
+  __global const uint *base = in + ((size_t)in_off + (size_t)gid * (size_t)fp) * 16u;
   uint a0 = 0, a1 = 0, a2 = 0, a3 = 0;
   for (uint p = 0; p < passes; ++p) {
     uint k = 0;

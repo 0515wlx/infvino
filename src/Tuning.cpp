@@ -446,22 +446,25 @@ double copyBwGbps(double footprint) { return copyBwGbpsImpl(footprint); }
  *  R59：BW 用实测平台/峰值（DRAM 20 GB/s、L3 copy 峰值 145 GB/s）。*/
 const double kL3SpillPerByteMs = (1.0 / 20e9 - 1.0 / 145e9) * 1e3;
 
-// R62: 实测几何锚点（见 Tuning.hpp）。GPU L3 = 8 bank × 480 KiB = 3.75 MiB
+// R62/R63: 几何锚点（见 Tuning.hpp）。GPU L3 物理/流式容量 = 8 bank × 480 KiB = 3.75 MiB
 // = 512 set × 120 way × 64 B = 3,932,160 B（公开 PRM + 512 行冲突周期 + ~4MB 容量膝点）。
-double l3PhysicalBytes() { return 3932160.0; }          // 3.75 MiB (GPU)
+// ⚠️ 跨算子**热重用**有效容量更大（R55 双租户 + R63 别名探针：热集合抗 ~8–24 MB 流式污染），
+// 这是 `L3Model` 真正要用的量 → `l3DefaultCapBytes()` 取 `l3WarmCapBytes()`。
+double l3PhysicalBytes() { return 3932160.0; }          // 3.75 MiB (GPU, streaming/physical)
 double l3CpuL3Bytes() { return 8388608.0; }             // 8 MiB (CPU sysfs; R59 误用值)
+double l3WarmCapBytes() { return 8.0e6; }               // 跨算子热重用有效容量（R55/R63）
 double l3PrivateCapBytes() { return 2.0e6; }
 double l3DefaultCapBytes()
 {
-  const char * legacy = std::getenv("INFVINO_L3_LEGACY");
-  return (legacy && std::string(legacy) != "0" && std::string(legacy) != "") ? l3CpuL3Bytes()
-                                                                             : l3PhysicalBytes();
+  const char * geom = std::getenv("INFVINO_L3_GEOM");
+  return (geom && std::string(geom) != "0" && std::string(geom) != "") ? l3PhysicalBytes()
+                                                                      : l3WarmCapBytes();
 }
 double l3DefaultAnchorBytes()
 {
-  const char * legacy = std::getenv("INFVINO_L3_LEGACY");
-  return (legacy && std::string(legacy) != "0" && std::string(legacy) != "") ? 1.0e6
-                                                                             : l3PrivateCapBytes();
+  const char * geom = std::getenv("INFVINO_L3_GEOM");
+  return (geom && std::string(geom) != "0" && std::string(geom) != "") ? 1.0e6
+                                                                      : l3PrivateCapBytes();
 }
 double l3DramBwGbps() { return 20.0; }
 double l3SramBwGbps() { return 145.0; }
