@@ -178,6 +178,52 @@ double gemmCeiling(const OpSignature & s)
   return std::max(0.5, e);
 }
 
+// R71: blocked 1x1 的候选谱（`conv1x1_blk`），`cat4=true` 时追加 `-DCAT4=1`（融合
+// concat4→1x1，kernel 内按 ca/cb/cc/cd 把输入通道块重定向到 4 个 fsv16 源）。
+std::vector<Candidate> conv1x1BlkSpectrum(const OpSignature & s, bool cat4)
+{
+  std::vector<Candidate> out;
+  auto emit = [&](int xb, int yb, int slm) {
+    std::ostringstream o;
+    o << "-DX_BLOCK=" << xb << " -DY_BLOCK=" << yb << " -DSLM_DIV=" << slm
+      << " -DACT=" << s.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
+    if (cat4) o << " -DCAT4=1";
+    std::ostringstream cc;
+    cc << "XB" << xb << " YB" << yb << " slm" << slm << " act" << s.act
+       << (cat4 ? " cat4" : "");
+    out.push_back(mk("conv1x1_blk", "conv1x1_blk", o.str(), cc.str()));
+  };
+  for (int xb : {2, 4, 8})
+  {
+    if (s.W > 0 && xb > s.W) continue;
+    for (int slm : {1, 2, 4})
+    {
+      if (slm > 1 && s.N < 16) continue;
+      emit(xb, 1, slm);
+    }
+  }
+  for (int yb : {2, 4})
+  {
+    if (s.H > 0 && yb > s.H) continue;
+    for (int xb : {2, 4, 8})
+    {
+      if (s.W > 0 && xb > s.W) continue;
+      if (xb * yb > 16) continue;
+      emit(xb, yb, 1);
+    }
+  }
+  return out;
+}
+
+// R71: 融合 concat4→1x1 的段对齐判据（各段与总通道都是 16 的倍数；offset 在 dispatch 检查）。
+bool cat4Aligned(const OpSignature & s)
+{
+  if (s.op != "conv1x1_cat4" || s.Cin < 16 || s.Cin % 16 != 0) return false;
+  for (size_t i = 0; i < s.params.size() && i < 4; ++i)
+    if (s.params[i] % 16 != 0) return false;
+  return true;
+}
+
 // 小算子候选（launch/带宽受限，无数值语义差异）。原在 Autotuner.cpp，现为注册表真相源。
 std::vector<Candidate> smallCandidates(const OpSignature & sig)
 {
@@ -633,6 +679,43 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.ceiling = [](const OpSignature & s, const ClDeviceInfo &) { return gemmCeiling(s); };
       v.push_back(std::move(f));
     }
+    {
+      // R71: 融合 concat4→1x1 的 **blocked** 数据通路：保留融合（不物化 concat），
+      // `conv1x1_blk` 直接读 4 路 fsv16 源（kernel `-DCAT4=1`，按 ca/cb/cc/cd 把输入通道块
+      // 重定向到 b0..b3）。对齐 OV 的 `concatenation + bfyx_f16_1x1` 链，但省掉 concat 物化。
+      KernelFamily f;
+      f.name = "conv1x1_cat4_blk";
+      f.op = "conv1x1_cat4";
+      f.source = "conv1x1_blk";
+      f.layout = {Layout::FSV16, Layout::NCHW, true, true};
+      f.layout.inIndex = 1;   // 槽 0 = osv16 权重；激活源在槽 1..4
+      f.bottleneck = Bottleneck::Fma;
+      f.mem = [](const OpSignature & s, const std::string & o) {
+        const int xb = std::max(1, optInt(o, "-DX_BLOCK=", 4));
+        const int yb = std::max(1, optInt(o, "-DY_BLOCK=", 1));
+        const int slm = std::max(1, optInt(o, "-DSLM_DIV=", 1));
+        const long tile = static_cast<long>(xb) * yb;
+        const long nwg = ceilDiv(s.N, tile) * ceilDiv(s.Cout, 16);
+        return memContract(static_cast<double>(nwg) * 16.0 * slm, 2.0 * s.Cin * tile);
+      };
+      // R71: 融合 blocked cat4 需要 **4 路源都是持久 fsv16** 才净收益；否则每帧要为每路
+      // 源各付一趟 reorder（实测 y8 每帧 +32 趟 reorder = +1.1ms，整网反而 +7%）——因为
+      // concat 的源常是多消费者/NCHW 生产者，钉不进 fsv16。故**默认不进候选**，用
+      // `INFVINO_CAT4_BLK=1` 显式开启（供「整条链已 fsv16」的场景或后续布局修复后验证）。
+      f.supports = [](const OpSignature & s) {
+        static const bool on = std::getenv("INFVINO_CAT4_BLK") != nullptr;
+        return on && cat4Aligned(s) && s.N > 1;
+      };
+      f.candidates = [](const OpSignature & s) { return conv1x1BlkSpectrum(s, true); };
+      f.ceiling = [peak](const OpSignature & s, const ClDeviceInfo & dev) {
+        const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
+        const long n = static_cast<long>((s.N + 3) / 4) * static_cast<long>((s.Cout + 15) / 16);
+        double e = peak * 0.360 * (static_cast<double>(s.Cin) / (s.Cin + 32.0));
+        e *= std::max(0.25, gridFactor(n, eu));
+        return std::max(0.5, std::min(e, 11.5));
+      };
+      v.push_back(std::move(f));
+    }
 
     // =========================================================================
     // conv1x1
@@ -694,40 +777,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       f.supports = [](const OpSignature & s) {
         return s.op == "conv1x1" && s.N > 1 && s.Cin >= 16;
       };
-      f.candidates = [](const OpSignature & s) {
-        std::vector<Candidate> out;
-        // R48 D1: Y_BLOCK = 每 WI 的输出行数（空间 tiling）。权重跨行复用、摊薄权重读；
-        // 与 X_BLOCK 正交。实测：大 H（>=40）上 XB8+YB2 比 XB4+YB1 快 13–24%，小 H 上
-        // 因网格饥饿变慢——正是「按场景分族」要的跨瓶颈候选。约束 xb*yb<=16（累加器
-        // 寄存器预算）且 yb>1 时不再叠 split-K（两个 latency 旋钮同时上收益低、候选翻倍）。
-        auto emit = [&](int xb, int yb, int slm) {
-          std::ostringstream o;
-          o << "-DX_BLOCK=" << xb << " -DY_BLOCK=" << yb << " -DSLM_DIV=" << slm
-            << " -DACT=" << s.act << " -DSG=16 -cl-mad-enable -cl-fast-relaxed-math";
-          std::ostringstream cc;
-          cc << "XB" << xb << " YB" << yb << " slm" << slm << " act" << s.act;
-          out.push_back(mk("conv1x1_blk", "conv1x1_blk", o.str(), cc.str()));
-        };
-        for (int xb : {2, 4, 8}) {
-          if (s.W > 0 && xb > s.W) continue;
-          for (int slm : {1, 2, 4}) {
-            // R71: 此前 `slm>1 && s.N<64` 会**排除**小空间层（如 mb 的 7x7 N=49）的
-            // split-K 候选；但隔离实测 XB4/slm2 比 XB2/slm1 快 ~1.3x（mb 576->96）。放宽到
-            // N>=16，让 autotune 用实测决定（不再静默丢掉赢的配置）。
-            if (slm > 1 && s.N < 16) continue;
-            emit(xb, 1, slm);
-          }
-        }
-        for (int yb : {2, 4}) {
-          if (s.H > 0 && yb > s.H) continue;
-          for (int xb : {2, 4, 8}) {
-            if (s.W > 0 && xb > s.W) continue;
-            if (xb * yb > 16) continue;
-            emit(xb, yb, 1);
-          }
-        }
-        return out;
-      };
+      f.candidates = [](const OpSignature & s) { return conv1x1BlkSpectrum(s, false); };
       f.ceiling = [peak](const OpSignature & s, const ClDeviceInfo & dev) {
         const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
         const long n = static_cast<long>((s.N + 3) / 4) * static_cast<long>((s.Cout + 15) / 16);
@@ -932,6 +982,7 @@ const std::vector<KernelFamily> & kernelFamilies()
       else if (n == "gemm_f16" || n == "gemm_sk_f16" || n == "gemm_cat4_f16")
         f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 13.7; };
       else if (n == "conv1x1_blk")   f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 11.5; };
+      else if (n == "conv1x1_cat4_blk") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 11.5; };
       else if (n == "conv1x1_gemv_f16") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 8.0; };
       else if (n == "depthwise_f16" || n == "depthwise_v") f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.086; };
       else if (n == "depthwise_vp")  f.hardCeiling = [](const OpSignature &, const ClDeviceInfo &) { return 32.0 * 0.12; };

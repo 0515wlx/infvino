@@ -85,6 +85,11 @@
 #ifndef MUL_SCALE
 #define MUL_SCALE 0
 #endif
+// R71: CAT4 = 融合 concat4→1x1：逻辑输入通道 = 4 段(fsv16 源 b0..b3，段长 ca/cb/cc/cd，
+// 源内通道 offset o0..o3)顺序拼接。要求各段与 offset 都是 16 的倍数（16 通道块对齐）。
+#ifndef CAT4
+#define CAT4 0
+#endif
 
 #define FS 16           // FEATURE_SLICE_SIZE
 
@@ -145,6 +150,13 @@ __kernel void conv1x1_blk(
 #if MUL_SCALE
   , __global const half *restrict Scale    // [Cin] (MUL_SCALE=1)
 #endif
+#if CAT4
+  , __global const half *restrict b1
+  , __global const half *restrict b2
+  , __global const half *restrict b3
+  , const int ca, const int cb, const int cc, const int cd
+  , const int o0, const int o1, const int o2, const int o3
+#endif
 )
 {
   const int sglid = get_sub_group_local_id();
@@ -188,6 +200,21 @@ __kernel void conv1x1_blk(
   for (int k = 0; k < ic_blocks; ++k)
 #endif
   {
+#if CAT4
+    // R71 CAT4: 逻辑输入通道块 k 属于哪一段（b0..b3）→ 选源 + 源内 fsv16 块号。
+    __global const half *in_src = input;
+    int k_eff = k;
+    {
+      const int c = k * FS;
+      if (c >= ca + cb + cc) { in_src = b3; k_eff = k - (ca + cb + cc) / FS + o3 / FS; }
+      else if (c >= ca + cb) { in_src = b2; k_eff = k - (ca + cb) / FS + o2 / FS; }
+      else if (c >= ca)      { in_src = b1; k_eff = k - ca / FS + o1 / FS; }
+      else                   { in_src = input; k_eff = k + o0 / FS; }
+    }
+#else
+    __global const half *in_src = input;
+    const int k_eff = k;
+#endif
     const int gc = k * FS + sglid;
 #if FIT_CIN
     const bool in_left = false;
@@ -216,10 +243,10 @@ __kernel void conv1x1_blk(
         for (int i = 0; i < X_BLOCK; ++i) {
           const int xx = x0 + i;
           src[i] = (in_left || xx >= W) ? (half)0
-                   : input[(size_t)gc * H * W + (size_t)y * W + xx];
+                   : in_src[(size_t)gc * H * W + (size_t)y * W + xx];
         }
 #else
-        const int base = y * input_y_pitch + input_xoff + k * input_fs_pitch;
+        const int base = y * input_y_pitch + input_xoff + k_eff * input_fs_pitch;
 #if MUL_SCALE
         // R51 D5 fix: the packed BLOCK_READ lays out a 16x8 tile per sub-group (lane l
         // does NOT own channel l), so the per-channel scale below would be applied to the
@@ -227,19 +254,19 @@ __kernel void conv1x1_blk(
         _Pragma("unroll")
         for (int i = 0; i < X_BLOCK; ++i) {
           const int xx = x0 + i;
-          src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
+          src[i] = (in_left || xx >= W) ? (half)0 : in_src[base + i * FS + sglid];
         }
 #elif FIT_WH
         // Aligned: one packed block read (lane l gets channel l, columns x0..x0+X-1).
-        if (!in_left) src = AS_V(BLOCK_READ((__global const ushort *)input + base));
+        if (!in_left) src = AS_V(BLOCK_READ((__global const ushort *)in_src + base));
 #else
         if (!in_left && x0 + X_BLOCK <= W) {
-          src = AS_V(BLOCK_READ((__global const ushort *)input + base));
+          src = AS_V(BLOCK_READ((__global const ushort *)in_src + base));
         } else {
 #pragma unroll
           for (int i = 0; i < X_BLOCK; ++i) {
             const int xx = x0 + i;
-            src[i] = (in_left || xx >= W) ? (half)0 : input[base + i * FS + sglid];
+            src[i] = (in_left || xx >= W) ? (half)0 : in_src[base + i * FS + sglid];
           }
         }
 #endif

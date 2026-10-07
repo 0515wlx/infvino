@@ -1010,7 +1010,10 @@ void PlanModel::allocateActivations()
     if (!ok) return false;
     for (const auto & f : kernelFamilies())
     {
-      if (f.layout.in != Layout::FSV16 || f.layout.inIndex != slot) continue;
+      if (f.layout.in != Layout::FSV16) continue;
+      // R71: blocked cat4 的激活源在槽 1..4（4 路 concat 源）。
+      if (f.name == "conv1x1_cat4_blk") { if (slot < 1 || slot > 4) continue; }
+      else if (f.layout.inIndex != slot) continue;
       if (!(f.actMask & (1 << s.act))) continue;
       if (f.supports && !f.supports(s)) continue;
       return true;
@@ -1272,6 +1275,21 @@ void PlanModel::planBlockedLayout()
       const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
       if (e && e->kernel == "conv1x1_blk") return familyByName("conv1x1_blk");
     }
+    if (n.op == "conv1x1_cat4" && !n.outs.empty()) {
+      // R71: 融合 blocked cat4——选中 kernel 为 conv1x1_blk（且段/offset 16 对齐）时。
+      bool ok = false;
+      const OpSignature sig = nodeSignature(n, &ok);
+      bool aligned = ok && sig.Cin >= 16 && sig.Cin % 16 == 0;
+      for (size_t j = 0; aligned && j < sig.params.size() && j < 4; ++j)
+        if (sig.params[j] % 16 != 0) aligned = false;
+      const char * okk[4] = {"cat_o0", "cat_o1", "cat_o2", "cat_o3"};
+      for (int j = 0; aligned && j < 4; ++j)
+        if (attrInt(n, okk[j], 0) % 16 != 0) aligned = false;
+      if (aligned) {
+        const TuningEntry * e = choiceEntry(static_cast<size_t>(&n - nodes_.data()), sig);
+        if (e && e->kernel == "conv1x1_blk") return familyByName("conv1x1_cat4_blk");
+      }
+    }
     if (n.op == "conv_general" && n.ins.size() >= 2 && !n.outs.empty()) {
       auto xit = T_.find(n.ins[0]), oit = T_.find(n.outs[0]);
       if (xit == T_.end() || oit == T_.end()) return nullptr;
@@ -1321,7 +1339,10 @@ void PlanModel::planBlockedLayout()
       const KernelFamily * cf = nodeFamily(nodes_[c.first]);
       // R48 D4: 用族声明的「激活输入槽」判定——conv1x1/gemm 的激活在槽 1（槽 0 是权重）。
       const int slot = d4 && cf ? cf->layout.inIndex : 0;
-      if (!cf || cf->layout.in != Layout::FSV16 || c.second != slot)
+      // R71: blocked cat4 读槽 1..4（4 路 concat 源）。
+      const bool multi = (cf && cf->name == "conv1x1_cat4_blk");
+      const bool slotOk = multi ? (c.second >= 1 && c.second <= 4) : (c.second == slot);
+      if (!cf || cf->layout.in != Layout::FSV16 || !slotOk)
       {
         all_blk = false;
         break;
@@ -1365,7 +1386,10 @@ void PlanModel::planBlockedLayout()
     for (const auto & c : cit->second)
     {
       const KernelFamily * cf = nodeFamily(nodes_[c.first]);
-      if (!cf || cf->layout.in != Layout::FSV16 || c.second != cf->layout.inIndex)
+      const bool multi = (cf && cf->name == "conv1x1_cat4_blk");
+      const bool slotOk = multi ? (c.second >= 1 && c.second <= 4)
+                                : (cf && c.second == cf->layout.inIndex);
+      if (!cf || cf->layout.in != Layout::FSV16 || !slotOk)
       {
         all_blk = false;
         break;
@@ -3256,40 +3280,96 @@ void PlanModel::run()
       const OpSignature sig = OpSignature::conv1x1Cat4(Cout, HW, Cin, ca, cb, cc, cd, coff,
                                                        act, dres ? 1 : 0);
       // R45: 统一走 choiceEntry（per-node 覆盖优先，回退签名缓存）。
-      if (const TuningEntry * e = choiceEntry(ni, sig)) gopts = e->options;
-      if (dres) setResOpt(gopts, true);  // R33 融合残差
-      cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
-      auto optInt = [&](const char * key, int def) {
-        const auto p = gopts.find(key);
-        return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(key));
-      };
-      t.BM = optInt("-DBM=", t.BM); t.BN = optInt("-DBN=", t.BN);
-      t.TM = optInt("-DTM=", t.TM); t.TN = optInt("-DTN=", t.TN);
-      setArg(kg, 0, sizeof(dA), &dA);
-      setArg(kg, 1, sizeof(dB0), &dB0);
-      setArg(kg, 2, sizeof(dC), &dC);
-      setArg(kg, 3, sizeof(Cout), &Cout);
-      setArg(kg, 4, sizeof(HW), &HW);
-      setArg(kg, 5, sizeof(Cin), &Cin);
-      setArg(kg, 6, sizeof(db), &db);
-      setArg(kg, 7, sizeof(dres), &dres);
-      setArg(kg, 8, sizeof(dB1), &dB1);
-      setArg(kg, 9, sizeof(dB2), &dB2);
-      setArg(kg, 10, sizeof(dB3), &dB3);
-      setArg(kg, 11, sizeof(ca), &ca);
-      setArg(kg, 12, sizeof(cb), &cb);
-      setArg(kg, 13, sizeof(cc), &cc);
-      setArg(kg, 14, sizeof(o0), &o0);
-      setArg(kg, 15, sizeof(o1), &o1);
-      setArg(kg, 16, sizeof(o2), &o2);
-      setArg(kg, 17, sizeof(o3), &o3);
-      const size_t lws[2] = {t.localX(), t.localY()};
-      const size_t gws[2] = {
-        static_cast<size_t>((HW + t.BN - 1) / t.BN) * lws[0],
-        static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1]};
-      timed("conv1x1cat4@" + std::to_string(Cout) + "x" + std::to_string(HW) + "x" +
-              std::to_string(Cin),
-            kg, 2, gws, lws);
+      std::string gkernel = "gemm_f16";
+      if (const TuningEntry * e = choiceEntry(ni, sig)) {
+        gopts = e->options;
+        if (!e->kernel.empty()) gkernel = e->kernel;
+      }
+      if (gkernel == "conv1x1_blk" && ca % 16 == 0 && cb % 16 == 0 && cc % 16 == 0 &&
+          cd % 16 == 0 && o0 % 16 == 0 && o1 % 16 == 0 && o2 % 16 == 0 && o3 % 16 == 0)
+      {
+        // R71: 融合 blocked cat4 —— 保留融合（不物化 concat），conv1x1_blk 直读 4 路 fsv16 源。
+        auto optInt = [&](const char * key, int def) {
+          const auto p = gopts.find(key);
+          return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(key));
+        };
+        const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1),
+                  yb = optInt("-DY_BLOCK=", 1);
+        int H = 1, W = 1;
+        { const auto & od = out.dims; if (od.size() >= 2) { H = (int)od[od.size() - 2]; W = (int)od.back(); } }
+        const int  cnts[4] = {ca, cb, cc, cd};
+        const std::string sn[4] = {n.ins[1], n.ins[2], n.ins[3], n.ins[4]};
+        cl_mem sb0 = blkInput(sn[0], in(1), ca, H, W);
+        cl_mem sb[4] = {sb0, sb0, sb0, sb0};
+        for (int j = 1; j < 4; ++j)
+          if (cnts[j] > 0) sb[j] = blkInput(sn[j], in(j + 1), cnts[j], H, W);
+        cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
+        std::string kbopts = gopts;
+        if (out.fsv16 && kbopts.find("-DOUT_FSV16=") == std::string::npos)
+          kbopts += " -DOUT_FSV16=1";
+        if (dres) setResOpt(kbopts, true);
+        cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", kbopts);
+        setArg(kb, 0, sizeof(sb0), &sb0);
+        setArg(kb, 1, sizeof(dwb), &dwb);
+        setArg(kb, 2, sizeof(db), &db);
+        cl_mem dy = out.mem;
+        setArg(kb, 3, sizeof(dy), &dy);
+        setArg(kb, 4, sizeof(dres), &dres);
+        setArg(kb, 5, sizeof(Cin), &Cin);
+        setArg(kb, 6, sizeof(H), &H);
+        setArg(kb, 7, sizeof(W), &W);
+        setArg(kb, 8, sizeof(Cout), &Cout);
+        setArg(kb, 9, sizeof(sb[1]), &sb[1]);
+        setArg(kb, 10, sizeof(sb[2]), &sb[2]);
+        setArg(kb, 11, sizeof(sb[3]), &sb[3]);
+        int cints[4] = {ca, cb, cc, cd};
+        for (int j = 0; j < 4; ++j) setArg(kb, 12 + j, sizeof(cints[j]), &cints[j]);
+        int oints[4] = {o0, o1, o2, o3};
+        for (int j = 0; j < 4; ++j) setArg(kb, 16 + j, sizeof(oints[j]), &oints[j]);
+        const size_t blws[3] = {1, static_cast<size_t>(16 * slm), 1};
+        const size_t ybCount = static_cast<size_t>((H + yb - 1) / yb);
+        const size_t bgws[3] = {static_cast<size_t>((W + xb - 1) / xb) * ybCount,
+                                static_cast<size_t>((Cout + 15) / 16) * blws[1], 1};
+        timed("conv1x1cat4blk@" + std::to_string(Cout) + "x" + std::to_string(HW) + "x" +
+                std::to_string(Cin),
+              kb, 3, bgws, blws);
+      }
+      else
+      {
+        if (dres) setResOpt(gopts, true);  // R33 融合残差
+        cl_kernel kg = getKernel("gemm", "gemm_f16", gopts);
+        auto optInt = [&](const char * key, int def) {
+          const auto p = gopts.find(key);
+          return p == std::string::npos ? def : std::atoi(gopts.c_str() + p + std::strlen(key));
+        };
+        t.BM = optInt("-DBM=", t.BM); t.BN = optInt("-DBN=", t.BN);
+        t.TM = optInt("-DTM=", t.TM); t.TN = optInt("-DTN=", t.TN);
+        setArg(kg, 0, sizeof(dA), &dA);
+        setArg(kg, 1, sizeof(dB0), &dB0);
+        setArg(kg, 2, sizeof(dC), &dC);
+        setArg(kg, 3, sizeof(Cout), &Cout);
+        setArg(kg, 4, sizeof(HW), &HW);
+        setArg(kg, 5, sizeof(Cin), &Cin);
+        setArg(kg, 6, sizeof(db), &db);
+        setArg(kg, 7, sizeof(dres), &dres);
+        setArg(kg, 8, sizeof(dB1), &dB1);
+        setArg(kg, 9, sizeof(dB2), &dB2);
+        setArg(kg, 10, sizeof(dB3), &dB3);
+        setArg(kg, 11, sizeof(ca), &ca);
+        setArg(kg, 12, sizeof(cb), &cb);
+        setArg(kg, 13, sizeof(cc), &cc);
+        setArg(kg, 14, sizeof(o0), &o0);
+        setArg(kg, 15, sizeof(o1), &o1);
+        setArg(kg, 16, sizeof(o2), &o2);
+        setArg(kg, 17, sizeof(o3), &o3);
+        const size_t lws[2] = {t.localX(), t.localY()};
+        const size_t gws[2] = {
+          static_cast<size_t>((HW + t.BN - 1) / t.BN) * lws[0],
+          static_cast<size_t>((Cout + t.BM - 1) / t.BM) * lws[1]};
+        timed("conv1x1cat4@" + std::to_string(Cout) + "x" + std::to_string(HW) + "x" +
+                std::to_string(Cin),
+              kg, 2, gws, lws);
+      }
     }
     else if (n.op == "conv1x1")
     {
@@ -4695,11 +4775,49 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
       // gemm 谱并追加 -DCAT4=1（单一真相源）；每个候选已带 -DCAT4=1 -DEPI=1 -DACT=。
       const std::vector<Candidate> cands = candidatesFromRegistry(sig);
       auto makeEnqueue = [&](const Candidate & c) -> std::function<cl_event()> {
-        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
         auto optInt = [&](const char * k, int def) {
           const auto p = c.options.find(k);
           return p == std::string::npos ? def : std::atoi(c.options.c_str() + p + std::strlen(k));
         };
+        if (c.kernel == "conv1x1_blk") {
+          // R71: 融合 blocked cat4 —— 4 路 fsv16 源 + 通道块重定向（不物化 concat）。
+          const int xb = optInt("-DX_BLOCK=", 4), slm = optInt("-DSLM_DIV=", 1),
+                    yb = optInt("-DY_BLOCK=", 1);
+          int Hin = 1, Win = 1;
+          { const auto & od = ref(n.outs[0]).dims; if (od.size() >= 2) { Hin = (int)od[od.size()-2]; Win = (int)od.back(); } }
+          const int cnts[4] = {ca, cb, cc, cd};
+          const std::string sn[4] = {n.ins[1], n.ins[2], n.ins[3], n.ins[4]};
+          cl_mem sb0 = blkInput(sn[0], ref(sn[0]), ca, Hin, Win);
+          cl_mem sb[4] = {sb0, sb0, sb0, sb0};
+          for (int j = 1; j < 4; ++j)
+            if (cnts[j] > 0) sb[j] = blkInput(sn[j], ref(sn[j]), cnts[j], Hin, Win);
+          cl_mem dwb = blk1x1Weight(n.ins[0], w, Cout, Cin);
+          cl_kernel kb = getKernel("conv1x1_blk", "conv1x1_blk", c.options);
+          setArg(kb, 0, sizeof(sb0), &sb0);
+          setArg(kb, 1, sizeof(dwb), &dwb);
+          setArg(kb, 2, sizeof(db), &db);
+          setArg(kb, 3, sizeof(dC), &dC);
+          setArg(kb, 4, sizeof(dres), &dres);
+          setArg(kb, 5, sizeof(Cin), &Cin);
+          setArg(kb, 6, sizeof(Hin), &Hin);
+          setArg(kb, 7, sizeof(Win), &Win);
+          setArg(kb, 8, sizeof(Cout), &Cout);
+          setArg(kb, 9, sizeof(sb[1]), &sb[1]);
+          setArg(kb, 10, sizeof(sb[2]), &sb[2]);
+          setArg(kb, 11, sizeof(sb[3]), &sb[3]);
+          int cints[4] = {ca, cb, cc, cd};
+          for (int j = 0; j < 4; ++j) setArg(kb, 12 + j, sizeof(cints[j]), &cints[j]);
+          int oints[4] = {o0, o1, o2, o3};
+          for (int j = 0; j < 4; ++j) setArg(kb, 16 + j, sizeof(oints[j]), &oints[j]);
+          const size_t blws[3] = {1, static_cast<size_t>(16 * slm), 1};
+          const size_t ybCount = static_cast<size_t>((Hin + yb - 1) / yb);
+          const size_t bgws[3] = {static_cast<size_t>((Win + xb - 1) / xb) * ybCount,
+                                  static_cast<size_t>((Cout + 15) / 16) * blws[1], 1};
+          return [this, kb, bgws, blws]() {
+            return ClRuntime::enqueueND(rt_.queue(), kb, 3, bgws, blws);
+          };
+        }
+        cl_kernel kg = getKernel("gemm", "gemm_f16", c.options);
         const int BM = optInt("-DBM=", 128), BN = optInt("-DBN=", 64), TM = optInt("-DTM=", 8),
                   TN = optInt("-DTN=", 4);
         setArg(kg, 0, sizeof(dA), &dA);

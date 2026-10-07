@@ -65,11 +65,19 @@ unfused y11 的 kernel 分解（链感知修复后）：`conv1x1_blk 0.69→1.26
 **但 `concat4` 从 0.29 → 0.86 ms**（OV 的 `concatenation` 只 0.42）。**concat 物化的代价
 吃掉了 GEMM→blk 的收益**。
 
-### 2.4 真正的 1×1 赢法（下一步）
-**融合的 blocked-cat4**：保留 cat4 融合（不物化 concat），让 `conv1x1_blk` 直接读 4 路
-**fsv16** 源（通道块重定向，offset 需 16 对齐；不对齐则该源单独 reorder 或回退 gemm）。
-预期 y8/y11 conv1x1 各 −1~2 ms（因为省掉 0.86 ms 的 concat）。需要：kernel 加 4 源 +
-`opCanReadFsv16` 支持多输入槽 + dispatch 绑定。**这是 §3 布局缺陷的应用面。**
+### 2.4 融合 blocked-cat4（**已实现，负结果；默认关**）
+已实现：`conv1x1_blk` 加 `-DCAT4=1`（4 路 fsv16 源 + 通道块重定向）、`conv1x1_cat4_blk` 族、
+dispatch/autotune/planner 多输入槽（源在槽 1..4）；`INFVINO_CAT4_BLK=1` 开启，**默认关**
+（否则会污染 autotune 候选、被隔离 bench 选中）。
+
+* **逐层更快**：`128→128@20×20` 0.070→**0.035（2.0×）**；`256→384@20×20` 0.165→**0.106（1.55×）**；
+  `256→512@20×20` 0.220→0.127（1.73×）。
+* **整网反而更慢**：y8 **10.54→11.30（+7%）**、y11 **11.34→12.02（+6%）**（3 rep 一致）。
+* **根因**：blocked cat4 要求 **4 路源都持久 fsv16**；而 concat 的源多是多消费者 / NCHW 生产者
+  （resize/upsample），钉不进 fsv16 → 每帧为每路源各付一趟 reorder：y8 `reorder 5→32 趟
+  （0.07→1.10 ms）`，吃光并超过逐层收益。数值 PASS（CAT4 kernel 正确）。
+* **结论**：**这与 §3 是同一个缺陷**。只要「整条链持久 fsv16」没做到，blocked cat4 就必输给
+  gemm（后者直读 NCHW 源、零 reorder）。**必须先把 §3.3 的多消费者/整分量链做出来，本项才有意义。**
 
 ---
 
@@ -140,11 +148,12 @@ concat4(outer==1)/ew_binary_ch）→ 认定选 blk 会令生产者被标记 fsv1
 
 * **已提交**：`e4f2a79`（§1 候选谱 + mb retune）。
 * **本轮代码（默认中性，管道/地基）**：`concat4 OUT_FSV16`、`small_concat4 canOutFsv16`、
-  `nodeFamily`/`smallKernelFor` 的 concat4 支持、`INFVINO_NO_FUSE_CAT4`、**链感知定价**。
+  `nodeFamily`/`smallKernelFor` 的 concat4 支持、`INFVINO_NO_FUSE_CAT4`、**链感知定价**、
+  **融合 blocked-cat4**（`conv1x1_blk -DCAT4=1` + `conv1x1_cat4_blk` 族 + 多输入槽，`INFVINO_CAT4_BLK=1`
+  开启；默认关，见 §2.4 负结果）。
   默认路径 `model_check` 逐位不变（y8 4.114e-04 / y11 7.908e-04 / mb 1.320e-02）、`ctest` 6/6；
-  实验路径（`INFVINO_NO_FUSE_CAT4=1` + unfused 缓存）三模型 `model_check` PASS。
-* **未做（已定位，需专门一轮）**：融合 blocked-cat4（§2.4）、多消费者/整分量链（§3.3）、
-  `conv_blk` OBH（§4）。
+  实验路径（`INFVINO_NO_FUSE_CAT4=1` 或 `INFVINO_CAT4_BLK=1` + 对应缓存）三模型 `model_check` PASS。
+* **未做（已定位，需专门一轮）**：**多消费者/整分量链**（§3.3，是 §2.4 的前置）、`conv_blk` OBH（§4）。
 
 ### 复现
 ```bash
