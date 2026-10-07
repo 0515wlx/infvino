@@ -52,6 +52,7 @@ int main(int argc, char ** argv)
   double gMargin = 0.0;
   int  gBudget = 0;
   std::string planTuning;
+  std::string residualPath;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -78,6 +79,7 @@ int main(int argc, char ** argv)
     else if (a == "--global-margin") gMargin = std::atof(next().c_str());
     else if (a == "--global-budget") gBudget = std::atoi(next().c_str());
     else if (a == "--plan-tuning") planTuning = next();
+    else if (a == "--residual") residualPath = next();
     else if (a == "--bake") { bake = true; bake_out = next(); }
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -102,6 +104,8 @@ int main(int argc, char ** argv)
         "                     ⚠️ 隔离名次不预测整网名次，>0 可能剪掉流水线更快的候选）\n"
         "  --global-budget N  整网**执行次数**总预算（0=不限；抗组合爆炸/GPU 风险）\n"
         "  --plan-tuning <f>  per-plan 选择覆盖的输出路径（默认 <plan>.tuning.json）\n"
+        "  --residual <f>     R47 §7.1: 把整网回验的 (sig, family, iso_pred, net_measured) 残差\n"
+        "                     数据集写成 JSONL（供学习型残差模型训练；默认关）\n"
         "  环境 INFVINO_GLOBAL_MODEL=1: 模型驱动选择（predictNet argmin 主导，不做端到端坐标下降）；\n"
         "        INFVINO_GLOBAL_MODEL_CONFIRM=1 再叠加一次外部稳态确认门\n"
         "  --report           打印每个节点的候选扫描明细\n"
@@ -121,6 +125,7 @@ int main(int argc, char ** argv)
   {
     // --cache 必须在 PlanModel 构造前设入环境（构造时加载缓存）。
     if (!cache_path.empty()) setenv("INFVINO_TUNING_CACHE", cache_path.c_str(), 1);
+    if (!residualPath.empty()) setenv("INFVINO_GLOBAL_RESIDUAL", residualPath.c_str(), 1);
 
     const std::string kdir = kernel_dir.empty() ? INFVINO_KERNEL_DIR : kernel_dir;
     infvino::PlanModel model(plan_path, kdir, -1, 0, /*profiling=*/true);
@@ -190,30 +195,54 @@ int main(int argc, char ** argv)
     {
       // R44：把目标函数从「单节点隔离 min」换成「整网 busy」，对隔离 top-K 做坐标下降回验。
       // 必须在同一次进程里先跑完隔离扫描（本进程的 cand_short_ 才有内容）。
+      // R70: `-1` 表示**未执行**——显式区分「跑了但无净收益」（0），避免静默空操作（R44 #12）。
       const int nchg = model.globalRetune(ops, gIters, gTopK, gRounds, gLimit, gMargin, gBudget);
-      std::printf("global-retune: %d signature(s) reselected by whole-net busy\n", nchg);
-      // 回验后缓存里的选择已变；把本次调过的签名同步回 done，便于 --expected 打印。
-      const auto & ents = model.tuning().entries();
-      for (auto & d : done)
+      if (nchg < 0)
       {
-        auto it = ents.find(d.first);
-        if (it != ents.end()) d.second = it->second;
+        std::printf("global-retune: NO-OP (not executed)\n");
+        // 区分两种情况：本批 `autotune` 没调任何签名（`done` 为空）= op 已扫完的自然收尾，
+        // 安全驱动的 `(0 entries this run` 检查会据此结束该 op；
+        // 只有当本批**确实调了签名、却无法整网回验**时才是 R44 #12 要抓的空操作。
+        if (done.empty())
+        {
+          std::fprintf(stderr,
+                       "[kernel_autotune] --global NO-OP after empty isolation scan (op exhausted; "
+                       "not an error)\n");
+        }
+        else if (!std::getenv("INFVINO_GLOBAL_ALLOW_NOOP"))
+        {
+          std::fprintf(stderr,
+                       "[kernel_autotune] refusing to report success for a NO-OP --global "
+                       "(set INFVINO_GLOBAL_ALLOW_NOOP=1 to tolerate)\n");
+          return 3;
+        }
       }
-      // R45 P0#4: 把 per-plan 选择覆盖落盘（默认 <plan>.tuning.json）。
-      std::string pt = planTuning;
-      if (pt.empty())
+      else
       {
-        const char * e = std::getenv("INFVINO_PLAN_TUNING");
-        if (e) pt = e;
-      }
-      if (pt.empty()) pt = plan_path + ".tuning.json";
-      if (pt != "none")
-      {
-        if (model.savePlanOverrides(pt))
-          std::printf("wrote plan overrides %s (%zu entries)\n", pt.c_str(),
-                      model.planOverrideCount());
-        else
-          std::fprintf(stderr, "failed to write plan overrides %s\n", pt.c_str());
+        std::printf("global-retune: %d signature(s) reselected by whole-net busy\n", nchg);
+        // 回验后缓存里的选择已变；把本次调过的签名同步回 done，便于 --expected 打印。
+        const auto & ents = model.tuning().entries();
+        for (auto & d : done)
+        {
+          auto it = ents.find(d.first);
+          if (it != ents.end()) d.second = it->second;
+        }
+        // R45 P0#4: 把 per-plan 选择覆盖落盘（默认 <plan>.tuning.json）。
+        std::string pt = planTuning;
+        if (pt.empty())
+        {
+          const char * e = std::getenv("INFVINO_PLAN_TUNING");
+          if (e) pt = e;
+        }
+        if (pt.empty()) pt = plan_path + ".tuning.json";
+        if (pt != "none")
+        {
+          if (model.savePlanOverrides(pt))
+            std::printf("wrote plan overrides %s (%zu entries)\n", pt.c_str(),
+                        model.planOverrideCount());
+          else
+            std::fprintf(stderr, "failed to write plan overrides %s\n", pt.c_str());
+        }
       }
     }
 

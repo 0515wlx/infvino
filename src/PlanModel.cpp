@@ -1722,6 +1722,36 @@ void PlanModel::resolveLayoutChoices()
     std::fprintf(stderr,
                  "[layout] model score: kernel=%.4f reorder=%.4f spill=%.4f total=%.4f ms\n",
                  ls.kernel, ls.reorder, ls.spill, ls.total());
+    // R69 §6.3 / R70: **逐节点 spill 归因视图**。`L3Model` 早就能算精确逐出归因
+    // （`L3Result::node_evict_ms` = 「某节点把张量逐出、之后真 miss」的字节折算 ms），
+    // 但此前只在测试/离线段可见，生产路径没暴露——导致「谁是 spill 大户」无从下手。
+    // 与 `layoutModelBreakdown` 同源（同一 `buildL3Access` + 同一默认 L3 配置，不参与选择），
+    // `INFVINO_LAYOUT_SPILL=1`（或 `INFVINO_LAYOUT_DEBUG=1`）时打印 top-N。
+    if (std::getenv("INFVINO_LAYOUT_SPILL") || std::getenv("INFVINO_LAYOUT_DEBUG"))
+    {
+      L3ModelConfig l3c;
+      l3c.compute_prices = false;
+      const L3Result l3r = evaluateL3(buildL3Access(), l3c);
+      std::vector<std::pair<double, size_t>> rows;
+      for (size_t i = 0; i < l3r.node_evict_ms.size(); ++i)
+        if (l3r.node_evict_ms[i] > 0.0) rows.push_back({l3r.node_evict_ms[i], i});
+      std::sort(rows.begin(), rows.end(),
+                [](const std::pair<double, size_t> & a, const std::pair<double, size_t> & b) {
+                  return a.first > b.first;
+                });
+      std::fprintf(stderr, "[layout] spill by node: total %.4f ms, %zu node(s) with evictions\n",
+                   l3r.spill_ms, rows.size());
+      const size_t topN = std::min<size_t>(rows.size(), 20);
+      for (size_t k = 0; k < topN; ++k)
+      {
+        const size_t i = rows[k].second;
+        const std::string nm =
+          nodes_[i].outs.empty() ? ("#" + std::to_string(i)) : nodes_[i].outs[0];
+        std::fprintf(stderr, "  %-42s %-18s %8.4f ms %5.1f%%\n", nm.c_str(),
+                     nodes_[i].op.c_str(), rows[k].first,
+                     l3r.spill_ms > 0.0 ? rows[k].first / l3r.spill_ms * 100.0 : 0.0);
+      }
+    }
   }
   // R52: 池/布局一致性守卫。任何被标记 fsv16 的张量都必须有放得下补齐布局的缓冲，
   // 且其生产者确实直写 fsv16 —— 否则会在整网静默产生错误激活（R51 §5.1 的根因）。
@@ -5182,15 +5212,20 @@ std::map<std::string, TuningEntry> PlanModel::autotune(
 int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int topK, int rounds,
                             int limit, double margin, int budget)
 {
+  // R70: 返回 `-1` 表示**未执行**（NO-OP）——区别于「执行了但没有净收益」（0）。
+  // 此前两种情况都返回 0，`kernel_autotune --global` 打印「0 signature(s) reselected」，
+  // CI/调用方无法分辨「真的没选出更好配置」与「--global 根本没跑」（R44 #12）。
   if (!profiling_)
   {
-    std::fprintf(stderr, "[global-retune] needs profiling=true; skipped\n");
-    return 0;
+    std::fprintf(stderr, "[global-retune] NO-OP: needs profiling=true; skipped\n");
+    return -1;
   }
   if (cand_short_.empty())
   {
-    std::fprintf(stderr, "[global-retune] no candidate shortlist; run isolated autotune first\n");
-    return 0;
+    std::fprintf(stderr,
+                 "[global-retune] NO-OP: no candidate shortlist (run isolated autotune in the same "
+                 "process first, or use --retune)\n");
+    return -1;
   }
   if (topK < 1) topK = 1;
   if (rounds < 1) rounds = 1;
@@ -5205,6 +5240,31 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     // R45：所有 autotune 处理的族在 run() 里都已统一走 choiceEntry（per-node 覆盖），
     // 因此整网回验对全部可调算子生效，不再限定 conv3x3/conv1x1/depthwise。
     return ops.empty() || std::find(ops.begin(), ops.end(), op) != ops.end();
+  };
+
+  // R47 §7.1 / R70: **整网回验残差数据集**（opt-in）。每次候选评估记录
+  //   (sig, kernel, iso_pred = 可加目标预测 ms, net_measured = 整网 median ms, accepted)
+  // 作为学习型残差模型（iso→net）的训练集——此前只在文档里列为待办，数据从未落盘。
+  // 默认关；`INFVINO_GLOBAL_RESIDUAL=<path>`（或 CLI `--residual`）开启，JSONL 追加。
+  const char * residual_env = std::getenv("INFVINO_GLOBAL_RESIDUAL");
+  auto residualTap = [&](const std::string & sig, const std::string & kernel, double iso_pred,
+                         double net_measured, bool accepted) {
+    if (!residual_env) return;
+    std::ofstream f(residual_env, std::ios::app);
+    if (!f) return;
+    auto esc = [](const std::string & s) {
+      std::string o;
+      o.reserve(s.size());
+      for (char ch : s)
+      {
+        if (ch == '"' || ch == '\\') o.push_back('\\');
+        o.push_back(ch);
+      }
+      return o;
+    };
+    f << "{\"sig\":\"" << esc(sig) << "\",\"kernel\":\"" << esc(kernel)
+      << "\",\"iso_pred\":" << iso_pred << ",\"net_measured\":" << net_measured
+      << ",\"accepted\":" << (accepted ? "true" : "false") << "}\n";
   };
 
   // 目标签名 = 短名单里能在本 plan 里找到节点的签名（按隔离 ms 取 top-K）。
@@ -5267,7 +5327,13 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
     targets.push_back(std::move(t));
     if (limit > 0 && static_cast<int>(targets.size()) >= limit) break;
   }
-  if (targets.empty()) return 0;
+  if (targets.empty())
+  {
+    std::fprintf(stderr,
+                 "[global-retune] NO-OP: no shortlist signature matches this plan (ops filter / plan "
+                 "mismatch)\n");
+    return -1;
+  }
 
   // 整网输入：零填充（卷积耗时对数值不敏感；只为给 run() 一个确定输入）。
   if (!input_name_.empty() && inputNumel() > 0)
@@ -5720,6 +5786,8 @@ int PlanModel::globalRetune(const std::vector<std::string> & ops, int iters, int
         // R47: 改善必须在 **median**（典型口径）成立；min 仅做地板守卫。
         const bool medBetter = cs.med < bestStat.med * (1.0 - kMinGain);
         const bool floorOk = (bs.mn >= 1e299) || (cs.mn <= bs.mn * (1.0 + 0.02));
+        // R70: 残差数据集 (iso_pred, net_measured) —— 不论接受与否都记，负样本同样有信息。
+        residualTap(t.cs.sig.str(), c.kernel, candPred, cs.med, medBetter && floorOk);
         if (medBetter && floorOk) { bestStat = cs; bestE = c; }
       }
       if (bestE.kernel != base.kernel || bestE.options != base.options)

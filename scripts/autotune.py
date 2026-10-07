@@ -143,6 +143,7 @@ def main() -> int:
             f"    echo \"$out\"; echo '[autotune] batch failed; stop'; exit 1; }}\n"
             f"  echo \"$out\" | grep -E 'expected vs|ratio|wrote|global-retune|WARN' || true\n"
             f"  echo \"$out\" | grep -q '(0 entries this run' && {{ echo '[autotune] op done'; break; }}\n"
+            f"  echo \"$out\" | grep -q 'global-retune: NO-OP' && {{ echo \"$out\"; echo '[autotune] --global NO-OP; stop'; exit 4; }}\n"
             f"  if tail -n 300 /var/log/kern.log /var/log/syslog 2>/dev/null | grep -qE 'GPU HANG|engine reset'; then echo '[autotune] GPU HANG'; exit 3; fi\n"
             f"done")
     loop.append("echo '[autotune] all batches complete'")

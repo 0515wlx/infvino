@@ -184,7 +184,28 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 | [`docs/round47-full-flow-findings.md`](docs/round47-full-flow-findings.md) | **R47 三模型全流程实测**：mb −2.2%（仅布局耦合型模型有收益）、yolo ≈0；逐节点归因（收益全在 blk 族、reorder 反升）；倒查 8 项 bug/设计缺陷；判定 blocked chain 是 mb 的主矛盾、非 yolo |
 | [`docs/round47-l3-model.md`](docs/round47-l3-model.md) | **R47 把 L3/DRAM 显式建模进标尺**：锁频重测 BW-足迹曲线（膝点 3→4MB）、通用内存 roofline、conv/gemm 软 expected 取 min；内存受限层从假余量纠正为贴墙 |
 | [`docs/round48-candidate-expansion-plan.md`](docs/round48-candidate-expansion-plan.md) | **R48 系统性扩充算子候选集计划**：按物理瓶颈×契约分 6 维（输出 tiling/split-K/数据通路/布局守护/小算子融合/全核内建）+ 基础设施前置 + M0–M6 里程碑 + 风险边界 |
+| [`docs/round49-layout-mincut-pilot.md`](docs/round49-layout-mincut-pilot.md) | **R49 布局最小割试点**：mincut 提案 + 验收门；逐节点 L3 定价的负结果（正确形态是整网模拟/评分器） |
+| [`docs/round50-depthwise-yblock-and-mincut-fix.md`](docs/round50-depthwise-yblock-and-mincut-fix.md) | **R50 depthwise `Y_BLOCK` + mincut 正确性修复**：`C%16` 门 + `model_check` env 透传 + `--verify` 激活码修复 |
+| [`docs/round51-cat4-registry-and-non16-fsv16.md`](docs/round51-cat4-registry-and-non16-fsv16.md) | **R51 cat4 进注册表 + 非 16 通道 fsv16 持久化**：`gemm_cat4_f16` 族；mb 默认 −2.7%；SE Mul→conv1x1 融合（opt-in，整网中性） |
+| [`docs/round52-planner-graph-bug-and-gap-fsv16.md`](docs/round52-planner-graph-bug-and-gap-fsv16.md) | **R52 planner 图级 bug**：`gap` fsv16 分配/标记漂移修复 + 池/布局探针 |
+| [`docs/round53-conv3x3-route-shape-layout.md`](docs/round53-conv3x3-route-shape-layout.md) | **R53 conv3x3 路线×shape×layout 系统分析**：fsv16 输出成本 + mincut 3x3 opt-in |
+| [`docs/round54-chain-layout-default-and-ov-reorder.md`](docs/round54-chain-layout-default-and-ov-reorder.md) | **R54 链布局进 plan 期默认 + 移植 OV SLM-transpose reorder**（用户决策 A） |
+| [`docs/round55-l3-coupling-calibration.md`](docs/round55-l3-coupling-calibration.md) | **R55 L3 occupancy↔miss 标定 + 可加定价主问题**（collective/pernode 负结果） |
+| [`docs/round56-opset-completion-and-fusions.md`](docs/round56-opset-completion-and-fusions.md) | **R56 算子集收尾**：契约修复 + N=1 多输出候选；depthwise 向量 store / SPPF 融合负结果 |
+| [`docs/round57-mincut-localize-and-reorder-objective.md`](docs/round57-mincut-localize-and-reorder-objective.md) | **R57 min-cut 回退局部化 + reorder 级结构价**：提案生成与接受分离 |
+| [`docs/round58-component-localized-layout-gate.md`](docs/round58-component-localized-layout-gate.md) | **R58 布局验收门分量级局部化**（默认开） |
+| [`docs/round59-l3-spill-calibration.md`](docs/round59-l3-spill-calibration.md) | **R59 L3 spill 实测重标定 + 建模验证** |
+| [`docs/round60-l3-exact-spill-plru-and-reorder.md`](docs/round60-l3-exact-spill-plru-and-reorder.md) | **R60 精确 spill（复用/栈距离）+ pLRU 等价模型自标定 + reorder 可加性** |
+| [`docs/round61-l3-line-granular-model-and-complexity.md`](docs/round61-l3-line-granular-model-and-complexity.md) | **R61 行粒度 1b-NRU 精确模型（公开 PRM）+ 成本函数复杂度分析** |
+| [`docs/round62-l3-fidelity-geometry-correction.md`](docs/round62-l3-fidelity-geometry-correction.md) | **R62 硬件 L3 保真度/几何纠正**：GPU 私有 L3 = 3.75 MiB、膝点 ~4MB、周期 512 行 |
+| [`docs/round63-address-mapping-reverse-engineering.md`](docs/round63-address-mapping-reverse-engineering.md) | **R63 地址→bank/set 逆向 + 两级层次澄清**：GPU 私有 L3 + 共享 LLC |
+| [`docs/round65-l3-isolation-and-geometry-conclusion.md`](docs/round65-l3-isolation-and-geometry-conclusion.md) | **R65 L3 隔离尝试与几何结论**：地址→bank/set 只能逆到周期 512，正式接受近似 + 整网 A/B |
+| [`docs/round66-two-dim-roofline-and-selection.md`](docs/round66-two-dim-roofline-and-selection.md) | **R66 二维有效带宽接进内核级内存 roofline**（诊断）+ 与选择的关系澄清 |
+| [`docs/round67-capacity-term-in-layout-objective-negative.md`](docs/round67-capacity-term-in-layout-objective-negative.md) | **R67 容量项加进布局目标函数**（负结果，默认关） |
+| [`docs/round68-l3-model-final-form.md`](docs/round68-l3-model-final-form.md) | **R68 L3 成本建模最终形态（收敛总结）**：可加主问题 + 全局非可加 spill |
 | [`docs/round69-occupancy-contract-and-spill-interface.md`](docs/round69-occupancy-contract-and-spill-interface.md) | **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选几何收进注册表，`occupancyPressure`/`buildL3Access` 注册表优先；选择逐位不变、`mean_rel` 与 R68 相同 |
+| [`docs/open-items.md`](docs/open-items.md) | **开放项登记表**：系统「未完成/未决/暂缓/负结果」的单一权威清单（R70 起维护） |
+| [`docs/round70-status.md`](docs/round70-status.md) | **R70 统一收尾**：逐节点 spill 归因 + `--global` NO-OP 硬信号 + 残差落盘；三模型 `model_check`/`reuse_check` 回归；全量 retune 激活 fixpoint 的负结果 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方（OpenVINO）代码归属与 Apache-2.0 合规 |
 
 > **kernel 效率结论（R18–R21，已被 R24 部分更正）**：本机（Iris Xe 80EU / 128 GRF / 无通用 L1）上，
@@ -365,6 +386,5 @@ python3 scripts/reuse_check.py    --model yolov8n-pose --repo $PWD --image infvi
 - [x] **R45 P0–P2**：`choiceEntry` 统一所有可调族；**per-plan 选择覆盖**（`<plan>.tuning.json`，两级缓存让位置相关全局最优不被跨模型覆盖）；kernel 源指纹守卫（`INFVINO_TUNING_STRICT` 可强制作废）；候选跳过率/离散度告警；隔离 top-K 复测、整网短名单 = **top-K ∪ 每族代表**（隔离 top-K 可能整体漏掉某族）、噪声地板、`--global-budget`；`autotune.py --global --lock` 安全驱动（`docs/round45-perplan-and-search.md`）
 - [x] **R46 整网调优全流程实测**：跑通三模型（锁频/分批/无 HANG），暴露并修复 3 个基础设施 bug（`--global` 在有条目缓存时空操作 + `--retune` 分批不推进、P0#6 漏掉 N==1 GEMV、缺最终验收门）；加门后 mb 回归 +5.8%→−0.2%、y8 +0.5%（均噪声内），但**暂无可靠正收益**；实证 in-situ `min` 与稳态口径错配（同改动 in-situ −3~5% vs 稳态 +12%）；给出 **blocked chain 前置条件**（`docs/round46-global-flow-findings.md`）
 - [x] **R69 占用/访存契约声明化**：`KernelFamily::mem`（`MemContract`）把候选占用几何收进注册表（补全 conv3x3 四 kernel / gemm_sk / GEMV / 非 blk depthwise），`occupancyPressure` 与 `buildL3Access` 注册表优先（R48 §10.6-B 缺口）；三模型选择逐位不变、`model_check`/`reuse_check` PASS、`mean_rel` 与 R68 相同；`INFVINO_LEGACY_OCCUPANCY`/`INFVINO_NO_MEM` 可回退/逐族消融（`docs/round69-occupancy-contract-and-spill-interface.md`）
-- [ ] 算子融合（epilogue 可组合化）、内存复用（byte-offset 子分配）、降低 launch 开销（减少 dispatch / 参数缓存）
-- [ ] seg / obb 解码；多 Session 并行缓冲
-- [ ] 支持更多模型（detect 系列、其他 backbone）
+- [x] **R70 统一收尾**：逐节点 spill 归因暴露（`INFVINO_LAYOUT_REPORT=1` + `INFVINO_LAYOUT_SPILL=1`）；`--global` 空操作硬信号（`globalRetune` 返回 `-1` → `kernel_autotune` 退出码 3、`autotune.py` 检测停止）；整网回验残差数据集落盘（`--residual` / `INFVINO_GLOBAL_RESIDUAL`）；新增 [`docs/open-items.md`](docs/open-items.md) 开放项权威清单（`docs/round70-status.md`）
+- [ ] 其余开放/暂缓项见 [`docs/open-items.md`](docs/open-items.md)：`KernelFamily::launch` 声明化（A2）、完整 blocked chain（B1）、conv3x3 布局链（B3）、epilogue 可组合化（D6）、降低 launch 开销（E1）、多 Session 并行缓冲（E3）、seg/obb 解码（F1）、更多模型（F2）等
