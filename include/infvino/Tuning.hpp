@@ -143,9 +143,15 @@ private:
  * 这是 infvino 之前缺失的一层——在「物理极限（32/27/16/13/10）」与「实测」之间的
  * 可比较标尺。所有系数都标注了 docs/kernel.md 的出处，便于随实测修正。
  *
+ * R66: 可选传入候选 `TuningEntry`。带上时，内存 roofline 用**二维有效带宽**
+ * `effectiveBwGbps(bytes, occupancyThreads(e,s))`（R55：并发/MLP 因子 + 足迹容量因子），
+ * 使低并发候选的内存墙更低；不带时退回 `copyBwGbps(footprint)`（旧行为）。
+ *
  * @param dev 设备信息（EU 数等，用于网格占用修正）。
+ * @param e   候选（提供 options 以算并发线程数）；nullptr = 旧行为。
  */
-double expectedOps(const OpSignature & sig, const ClDeviceInfo & dev);
+double expectedOps(const OpSignature & sig, const ClDeviceInfo & dev,
+                   const TuningEntry * e = nullptr);
 
 /** @brief R47: 按足迹插值的 copy(read+write) 带宽（GB/s）。锁频实测曲线；
  *  用于内存 roofline 与小算子流式成本估计。 */

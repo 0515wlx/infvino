@@ -415,10 +415,12 @@ double copyBwGbpsImpl(double footprint)
 // R47-L3: 通用内存 roofline（ops/EU/cyc 量纲，flops/(EU·clk·t)）。把「足迹跨 L3 断崖」
 // 显式建模进上限：t = launch + bytes/BW(footprint)。比 single-BW roofline 更接近真实，
 // 且在 L3 断崖处自然给出更低的「可达上限」。
-double memRooflineOps(double flops, double bytes, int eu, double clkMhz, double launchUs)
+// R66: `bwGbps` 由调用方给出——可带并发/容量二维因子（`effectiveBwGbps`）。
+double memRooflineOps(double flops, double bytes, int eu, double clkMhz, double launchUs,
+                      double bwGbps)
 {
-  if (flops <= 0.0 || bytes <= 0.0) return 1e30;
-  const double bw = copyBwGbpsImpl(bytes) * 1e9;
+  if (flops <= 0.0 || bytes <= 0.0 || bwGbps <= 0.0) return 1e30;
+  const double bw = bwGbps * 1e9;
   const double t = launchUs * 1e-6 + bytes / bw;
   if (t <= 0.0) return 1e30;
   return flops / (static_cast<double>(eu) * clkMhz * 1e6 * t);
@@ -610,10 +612,20 @@ double effectiveBwGbps(double bytes, double threads)
 // R47: 导出的 launch 地板（供 PlanModel 的小算子外溢估计使用）。
 const double kSmallLaunchUs = 3.5;
 
-double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
+double expectedOps(const OpSignature & s, const ClDeviceInfo & dev, const TuningEntry * e)
 {
   const int eu = dev.eu > 0 ? static_cast<int>(dev.eu) : 80;
   const double clk = dev.clock_mhz > 0 ? static_cast<double>(dev.clock_mhz) : 1300.0;
+  // R66: 内存 roofline 的带宽——带候选时用二维有效带宽（并发 MLP × 足迹容量因子）；
+  // 否则退回 copy 曲线（旧行为，保证无候选的调用点不变）。并发为 0 的 op 也用 copy。
+  auto bwAt = [&](double bytes) -> double {
+    if (e && !std::getenv("INFVINO_NO_L3_ROOFLINE_2D"))
+    {
+      const double th = occupancyThreads(*e, s);
+      if (th > 0.0) return effectiveBwGbps(bytes, th);
+    }
+    return copyBwGbps(bytes);
+  };
 
   if (s.op == "conv3x3") {
     // R24 修正：**不再把上限定成实测**。移植的 OV 内循环 ISA 是 288 packed mad /
@@ -640,7 +652,8 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
       const double inBytes = 2.0 * s.Cin * (s.H * span) * (s.W * span);
       const double outBytes = 2.0 * s.Cout * s.H * s.W;
       const double wBytes = 2.0 * s.Cout * s.Cin * 9.0;
-      e = std::min(e, memRooflineOps(flops, inBytes + outBytes + wBytes, eu, clk, 0.0));
+      const double memBytes = inBytes + outBytes + wBytes;
+      e = std::min(e, memRooflineOps(flops, memBytes, eu, clk, 0.0, bwAt(memBytes)));
     }
     return std::max(1.0, e);
   }
@@ -661,14 +674,14 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
       const double flops = 2.0 * s.M * s.N * s.K;
       const double bytes = 2.0 * (static_cast<double>(s.M) * s.K + static_cast<double>(s.K) * s.N +
                                   static_cast<double>(s.M) * s.N);
-      e = std::min(e, memRooflineOps(flops, bytes, eu, clk, 0.0));
+      e = std::min(e, memRooflineOps(flops, bytes, eu, clk, 0.0, bwAt(bytes)));
     }
     return std::max(0.5, e);
   }
 
   if (s.op == "conv1x1_cat4") {
     // R30c: 融合 concat；计算仍是 M=Cout,N=HW,K=Cin 的 GEMM（另省 concat 物化）。
-    return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev);
+    return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev, e);
   }
 
   if (s.op == "conv1x1") {
@@ -677,7 +690,7 @@ double expectedOps(const OpSignature & s, const ClDeviceInfo & dev)
       // 实测 5–27× 于旧 gemm；期望取「每 EU 一条 sub-group 归约链」的保守值。
       return std::max(1.0, 8.0 * gridFactor(static_cast<long>(s.Cout), eu));
     }
-    return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev);
+    return expectedOps(OpSignature::gemm(s.Cout, s.N, s.Cin, s.act), dev, e);
   }
 
   if (s.op == "depthwise" || s.op == "conv_general") {

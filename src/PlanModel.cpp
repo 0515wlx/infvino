@@ -4198,7 +4198,7 @@ int PlanModel::refreshExpected(const std::vector<std::string> & ops)
     if (!have) continue;
     // Prefer the winner family's own ceiling (matches autotuneOp); fall back to the
     // global middle standard for families without one.
-    e.expected = expectedOps(sig, rt_.info());
+    e.expected = expectedOps(sig, rt_.info(), &e);
     const KernelFamily * fam = familyByName(e.kernel);
     if (fam && fam->ceiling)
     {

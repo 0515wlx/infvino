@@ -50,7 +50,7 @@ TuningEntry autotuneOp(
   double flops, int iters, std::vector<TuningEntry> * measured)
 {
   TuningEntry best;
-  best.expected = expectedOps(sig, rt.info());
+  best.expected = expectedOps(sig, rt.info(), &best);
   best.device_id = TuningCache::deviceKey(rt.info());
   best.iters = iters;
   best.source = "tuned";
@@ -59,7 +59,7 @@ TuningEntry autotuneOp(
   // 上限模型（修 R33 的口径失真），硬上限只取 ISA 配额/roofline 下界（R43）。
   auto applyStandard = [&](TuningEntry & e) {
     const KernelFamily * f = familyByName(e.kernel);
-    e.expected = expectedOps(sig, rt.info());
+    e.expected = expectedOps(sig, rt.info(), &e);
     if (f && f->ceiling)
     {
       const double famCeil = f->ceiling(sig, rt.info());

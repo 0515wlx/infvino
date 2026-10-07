@@ -227,6 +227,21 @@ static void run_tests()
     CHECK(l3DefaultPolicy() == L3Policy::LRU, "R60: back to LRU after unset");
   }
 
+  // --- R66: 二维内存 roofline（并发因子）只降不升，且无候选时退化为旧行为 ---
+  {
+    const OpSignature s = OpSignature::conv3x3(20, 20, 1, 1, 64, 64, 1);
+    TuningEntry e; e.kernel = "conv3x3_ov"; e.options = "";
+    const double oneD = expectedOps(s, dev());
+    // 关闭 2D（env）应等于旧行为；开启（默认，带候选）应 ≤ 旧行为。
+    setenv("INFVINO_NO_L3_ROOFLINE_2D", "1", 1);
+    const double off2d = expectedOps(s, dev(), &e);
+    unsetenv("INFVINO_NO_L3_ROOFLINE_2D");
+    const double on2d = expectedOps(s, dev(), &e);
+    CHECK_NEAR(off2d, oneD, 1e-9, "R66: 2D-off == 1D (copy BW)");
+    CHECK(on2d <= oneD + 1e-9, "R66: 2D roofline never raises expected");
+    CHECK(on2d > 0.0, "R66: 2D expected positive");
+  }
+
   // --- R55: occupancyThreads 与 occupancyPressure 同源 ---
   {
     TuningEntry e;
