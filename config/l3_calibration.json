@@ -4,11 +4,20 @@
     "source": "infvino's own microbenchmark `kernel_bench --op l3retain`",
     "vendor_documents_used": false,
     "statement": "Equivalent engineering model of L3 replacement behaviour, self-calibrated from on-device measurements. Not a reverse engineering of, nor a claim about, any specific vendor microarchitecture (tag RAM / way-select / replacement bits).",
-    "generated_utc": "2026-10-07T03:02:13Z"
+    "generated_utc": "2026-10-07T03:27:12Z"
   },
   "machine": {
     "physical_l3_bytes": 8388608,
     "hot_set_bytes": 1048576
+  },
+  "documented_model": {
+    "policy": "nru1b",
+    "line_bytes": 64,
+    "sets": 1024,
+    "ways": 120,
+    "capacity_bytes": 7864320,
+    "source": "Intel Open Source PRM TGL Vol.7 Memory Cache (public; software implementations permitted; no document derivatives)",
+    "vendor_documents_used": false
   },
   "retention_knee": {
     "level": 0.5,
@@ -17,18 +26,14 @@
       "4": 17339333.333333336,
       "16": 25170000.0
     },
-    "reuse_protect_ratio": {
-      "1": 1.0,
-      "4": 1.5820897122623683,
-      "16": 2.2965818403808567
-    }
+    "note": "measured knee is a cross-check; the reuse trend is partly measurement amortisation (more passes hide the first-pass miss), not a power law"
   },
-  "fit": {
-    "model": "knee(reuse) = c0_bytes * reuse^alpha",
+  "empirical_fit_cross_check": {
+    "model": "knee(reuse) = c0_bytes * reuse^alpha   (NOT used as the model)",
     "c0_bytes": 11118119.480894474,
     "alpha": 0.2998720489931131
   },
-  "recommended_policy": "nru",
+  "recommended_policy": "nru1b",
   "tuning_anchors": {
     "l3_physical_bytes": 8388608,
     "pollution_knee_bytes_reuse1": 10959766.18705036

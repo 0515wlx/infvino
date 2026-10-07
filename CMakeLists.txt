@@ -47,6 +47,7 @@ add_library(infvino SHARED
   src/KernelFamilies.cpp
   src/LayoutSolver.cpp
   src/L3Model.cpp
+  src/L3LineModel.cpp
   src/PlanModel.cpp
   src/ClBackend.cpp
   src/InferenceEngine.cpp
@@ -86,6 +87,10 @@ target_link_libraries(kernel_numtest PRIVATE infvino)
 
 add_executable(kernel_autotune src/tools/kernel_autotune.cpp)
 target_link_libraries(kernel_autotune PRIVATE infvino)
+
+# R61: host-only line-granular L3 replacement simulator (probe replication + complexity).
+add_executable(l3linesim src/tools/l3linesim.cpp)
+target_link_libraries(l3linesim PRIVATE infvino)
 
 add_executable(tuning_test src/tools/tuning_test.cpp)
 target_link_libraries(tuning_test PRIVATE infvino)
@@ -130,7 +135,7 @@ else()
   message(STATUS "gpu_metrics skipped: libigdmd / metrics_discovery_api.h not found")
 endif()
 
-install(TARGETS infvino infvino_bench infvino_numtest reuse_check kernel_run kernel_bench kernel_numtest kernel_autotune tuning_test
+install(TARGETS infvino infvino_bench infvino_numtest reuse_check kernel_run kernel_bench kernel_numtest kernel_autotune l3linesim tuning_test
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin

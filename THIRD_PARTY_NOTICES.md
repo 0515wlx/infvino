@@ -100,3 +100,22 @@ infvino's cost model contains an **L3 cache replacement model** (`include/infvin
 
 No third-party license applies to this model; this section exists to document that it is
 original work derived from self-collected measurements.
+
+---
+
+## Intel Open Source PRM (public documentation) — algorithm facts only
+
+The line-granular L3 replacement model (`include/infvino/L3LineModel.hpp`,
+`src/L3LineModel.cpp`, tool `src/tools/l3linesim.cpp`) implements the **1-bit LRU** replacement
+described in the **public** *Intel Iris Xe / UHD Graphics Open Source PRM, Volume 7: Memory Cache*
+(Doc Ref `IHD-OS-TGL-Vol 7-12.21`).
+
+- No Intel source code is vendored or linked; the implementation is **original**.
+- The document's own notice permits publishing an **unmodified copy** and permits
+  **software implementations based on the document**, while granting **no rights to create
+  modifications or derivatives of the document**. infvino therefore reproduces only the verbatim
+  notice text and otherwise uses only a short factual summary (with attribution).
+- Full compliance statement, the verbatim notice, and the list of encoded facts:
+  [`third_party/intel-prm/NOTICE.md`](third_party/intel-prm/NOTICE.md).
+- A rigorous complexity analysis of the LRU cost function (and line-granular feasibility) is in
+  [`docs/round61-l3-line-granular-model-and-complexity.md`](docs/round61-l3-line-granular-model-and-complexity.md).

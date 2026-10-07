@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "infvino/L3Model.hpp"
+#include "infvino/L3LineModel.hpp"
 #include "test_util.hpp"
 
 using namespace infvino;
@@ -252,6 +253,38 @@ static void run_tests()
     const double sn = evaluateL3(n, nru).spill_bytes;
     CHECK(sl > 0.0, "R60: strict LRU evicts the hot tensor under streaming pressure");
     CHECK(sn < sl, "R60: NRU (evict-first insert) protects the reused hot tensor");
+  }
+
+  // ================= R61: 行粒度 1b-NRU（公开文档算法）=================
+  {
+    // 容量：1 set × 4 way，填满 4 行后重复访问全部命中。
+    {
+      L3LineConfig c; c.sets = 1; c.ways = 4; c.policy = L3LinePolicy::NRU1B;
+      L3LineSim s(c);
+      for (int i = 0; i < 4; ++i) CHECK(!s.access((uint64_t)i), "R61: cold line misses");
+      for (int i = 0; i < 4; ++i) CHECK(s.access((uint64_t)i), "R61: resident line hits");
+      CHECK_NEAR(s.stats().hitRate(), 0.5, 1e-12, "R61: 4/8 hit rate");
+    }
+    // 文档规则：命中把 way 置 1；全 1 时清空；下一次 fill 取 way 0（first-zero）。
+    {
+      L3LineConfig c; c.sets = 1; c.ways = 2; c.policy = L3LinePolicy::NRU1B;
+      L3LineSim s(c);
+      s.access(0); s.access(1);           // way0=t0, way1=t1, bits=11
+      CHECK(s.access(0), "R61: tag0 hit");
+      CHECK(s.stats().agings >= 1, "R61: all-recent hit clears the vector (aging)");
+      s.access(2);                        // first 0 = way0 → evicts tag0
+      CHECK(!s.contains(0), "R61: 1b-NRU evicts way 0 after aging");
+      CHECK(s.contains(1), "R61: way 1 (tag1) survives");
+    }
+    // 对照：严格 LRU 在同序列下淘汰最久未用者（tag1），与 1b-NRU 不同。
+    {
+      L3LineConfig c; c.sets = 1; c.ways = 2; c.policy = L3LinePolicy::LRU;
+      L3LineSim s(c);
+      s.access(0); s.access(1); s.access(0);   // tag0 最近使用
+      s.access(2);                              // 淘汰 LRU = tag1
+      CHECK(s.contains(0), "R61: strict LRU keeps the most-recent tag0");
+      CHECK(!s.contains(1), "R61: strict LRU evicts the least-recently-used (tag1)");
+    }
   }
 }
 

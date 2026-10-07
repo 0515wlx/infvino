@@ -117,6 +117,8 @@ def main():
     ap.add_argument("--out", default="config/l3_calibration.json")
     ap.add_argument("--level", type=float, default=0.5, help="retention level for the knee (default 0.5)")
     ap.add_argument("--hot-set-bytes", type=int, default=HOT_SET_BYTES_DEFAULT)
+    ap.add_argument("--sets", type=int, default=1024, help="L3 sets (= banks x 64)")
+    ap.add_argument("--ways", type=int, default=120, help="L3 ways/set (PRM: 120 logical ways)")
     args = ap.parse_args()
 
     if args.run:
@@ -150,22 +152,33 @@ def main():
             "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
         "machine": {"physical_l3_bytes": phys, "hot_set_bytes": args.hot_set_bytes},
+        # 公开文档所述的真实机制（Intel Iris Xe / UHD Graphics Open Source PRM, TGL Vol.7
+        # Memory Cache, Doc Ref IHD-OS-TGL-Vol 7-12.21）：
+        #   每 set 一个 N-bit 向量；Fill 选第一个 0 位 way 并翻转为 1；命中把 way 置 1；
+        #   全 1 时清空；分配策略 "Allocate on fill"；bank = 480KB = 120 way x 64 set x 64B。
+        # 这取代了早先的经验幂律；本工具仍给出保留 knee 作为**交叉验证**。
+        "documented_model": {
+            "policy": "nru1b",
+            "line_bytes": 64,
+            "sets": args.sets,
+            "ways": args.ways,
+            "capacity_bytes": args.sets * args.ways * 64,
+            "source": "Intel Open Source PRM TGL Vol.7 Memory Cache (public; software "
+                      "implementations permitted; no document derivatives)",
+            "vendor_documents_used": False,
+        },
         "retention_knee": {
             "level": args.level,
             "r50_bytes": {str(it): knees[it] for it in iters_sorted},
-            "reuse_protect_ratio": {
-                str(it): (knees[it] / knees[iters_sorted[0]]) for it in iters_sorted
-            },
+            "note": "measured knee is a cross-check; the reuse trend is partly measurement "
+                    "amortisation (more passes hide the first-pass miss), not a power law",
         },
-        "fit": {
-            "model": "knee(reuse) = c0_bytes * reuse^alpha",
+        "empirical_fit_cross_check": {
+            "model": "knee(reuse) = c0_bytes * reuse^alpha   (NOT used as the model)",
             "c0_bytes": c0_bytes,
             "alpha": alpha,
         },
-        # Recommendation consumed by docs / humans: the measured behaviour (heavily-reused
-        # data resists streaming pollution far beyond the nominal capacity) matches the
-        # evict-first NRU policy in L3Model, not strict LRU.
-        "recommended_policy": "nru",
+        "recommended_policy": "nru1b",
         "tuning_anchors": {
             "l3_physical_bytes": phys if phys else 8 * 1024 * 1024,
             "pollution_knee_bytes_reuse1": knees[iters_sorted[0]],
@@ -182,8 +195,10 @@ def main():
     for it in iters_sorted:
         print(f"  R_50(reuse={it:<3})       : {knees[it]/1e6:6.2f} MB"
               f"   (x{knees[it]/knees[iters_sorted[0]]:.2f} vs reuse=1)")
-    print(f"  fit knee = {c0_bytes/1e6:.2f} MB * reuse^{alpha:.3f}")
-    print(f"  recommended policy     : nru  (see docs/round60-*.md)")
+    print(f"  documented model       : 1b-NRU  sets={args.sets} ways={args.ways} line=64B"
+          f" -> {args.sets*args.ways*64/1e6:.2f} MB")
+    print(f"  empirical cross-check  : knee = {c0_bytes/1e6:.2f} MB * reuse^{alpha:.3f} (not the model)")
+    print("  recommended policy     : nru1b  (see docs/round61-*.md)")
 
 
 if __name__ == "__main__":

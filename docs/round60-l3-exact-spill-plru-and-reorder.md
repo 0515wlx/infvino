@@ -135,6 +135,11 @@ fit: knee ≈ 11.12 MB · reuse^0.30
 `vendor_documents_used=false`；模型为「行为等价的工程近似」。这就是「我们自行标定出来的」
 基础设施证据链。
 
+> ⚠️ **R61 更正**：上述 `reuse^0.30` 只是**经验交叉验证**，**不是模型**。公开 PRM 给出的真实
+> 机制是「每 set 一个 N-bit 向量的 1b LRU」（行粒度、组相联），已实现为 `L3LineModel`；
+> reuse 上升**主要来自测量摊销**。见
+> [`round61-l3-line-granular-model-and-complexity.md`](round61-l3-line-granular-model-and-complexity.md)。
+
 ---
 
 ## 3. reorder 精确建模（可加性）
